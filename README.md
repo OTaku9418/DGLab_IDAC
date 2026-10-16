@@ -1,9 +1,25 @@
+# 安全与免责声明
+
+项目大量使用DeepSeek V4.1 Flash辅助开发，可能存在未查出的bug，不保证完全稳定运行，使用前请在配置文件中配置好软件下发的主机最大强度。
+
+本项目的用途是把自己游戏设备的力反馈信号转发到郊狼主机上，仅供学习交流用途使用，使用前请自行衡量风险并恰当配置强度。
+
+仓库所有人不对任何使用本仓库带来的后果负责。 
+
+**⚠Use at your own risk⚠**
+
+**输出会真实作用于人体**,
+且 `[link] mode=ble` + `[safety] dry_run=0` 时没有任何软件层面的"不会电到人"保证。
+第一次接电极前请先读第 7 节, 并考虑先用 `tools\bleprobe.exe <ini> 20` (不加 `--live`,
+会强制把两个通道强度压到 0) 确认链路, 再上人。
+
 # DGLab_IDAC
 
-把《Initial D THE ARCADE》(dump/模拟版) 的方向盘**力反馈**实时转换成
-**郊狼 (DG-LAB Coyote)** 主机的输出波形。
+把《Initial D THE ARCADE》的方向盘**力反馈**实时转换成
+**郊狼3.0 (DG-LAB Coyote v3)** 主机的输出波形。
 
 游戏由 Unreal Engine 4.24 驱动, 本模块以 **UE4SS C++ mod** 的形式接入,
+基于ArcadeZone.cn服务器所提供的3.21游戏版本（启动器V2.11）+自定义BGM Mod（引用自定义BGM Mod自带的UE4SS版本）
 和 `.../Win64/ue4ss/Mods/` 下已有的 mod 一起由 UE4SS 统一加载管理。
 
 ---
@@ -27,7 +43,7 @@
 | 进程 | 与 UE4SS **同进程** → 天然满足"接入 UE4SS 统一 hook 管理" | AMDaemon 是独立进程, 得另做注入 |
 | 与本游戏的关系 | 直接相关 | 游戏进程里**没有** idachook.dll; EXE 里 `idac`/`IDAC`/`idachook` 字符串出现 **0** 次 |
 
-`idachook.dll` 只存在于 `D:\INDAC\MODAC321\AMDaemon\`, 是 SegaTools 的魔改打包版
+`idachook.dll` 只存在于 `\AMDaemon\`, 是 SegaTools 的魔改打包版
 (把 `common/board/ffb.c` 的串口 FFB 板钩子 + `games/idachook` 反盗版补丁 +
 `games/idacio` 方向盘输入 + aimeio 全塞进一个 DLL)。它确实导出 5 个干净的
 `idac_io_ffb_*` 函数, **保留为备选/交叉验证的第二个观测点**, 但不在本模块的主路径上。
@@ -163,7 +179,7 @@ glaze/ImGui/zydis/PolyHook2/raw_pdb 走 `FetchContent`, 其中多个用 `git@git
 
 ### 手动等价命令
 ```cmd
-call "E:\VS\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+call "<VS构建工具路径>\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
       -DDGLAB_DEPLOY_DIR="<游戏>\...\ue4ss\Mods\DGLab_IDAC"
 cmake --build build --config Release
@@ -281,6 +297,8 @@ servo on/off = 1/1, state=1
   它**不是 BLE 的替代品**: 走那条路时手机 APP 仍是 BLE 中枢, PC 只是通过服务器把排好队的
   数据交给 APP 转发, 且必须扫码配对。本项目选 BLE 直连的理由见 `docs/research-dglab-transport.md` 第 1.1 节
 
+  项目后续可能会提供使用Socket连接方案的替代版本
+
 ---
 
 ## 9. 许可与署名
@@ -300,10 +318,3 @@ servo on/off = 1/1, state=1
 > 上游没有 LICENSE 文件, 所以 `re/reference/dglab-bluetooth-protocol/` 里那四份官方文档的
 > 授权条件**不适用**本仓库根目录的 MIT LICENSE。它们的来源、提交号与 sha256 记在
 > 该目录的 `PROVENANCE.md` 里; `docs/` 下的分析文字则是我们自己写的。
-
-### 安全声明
-
-本项目的用途是把自己游戏设备的力反馈信号转发到郊狼主机上。**输出会真实作用于人体**,
-且 `[link] mode=ble` + `[safety] dry_run=0` 时没有任何软件层面的"不会电到人"保证。
-第一次接电极前请先读第 7 节, 并考虑先用 `tools\bleprobe.exe <ini> 20` (不加 `--live`,
-我会强制把两个通道强度压到 0) 确认链路, 再上人。
