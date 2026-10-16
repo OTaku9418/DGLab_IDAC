@@ -26,7 +26,9 @@
 #include <Mod/CppUserModBase.hpp>
 
 #include <windows.h>
+#include <psapi.h>   // EnumProcessModules / GetModuleBaseNameA
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -166,6 +168,39 @@ public:
         dglab_idac::log_info("on_unreal_init: UE4 引擎已就绪");
     }
 
+    // -----------------------------------------------------------------------
+    // IndRun.dll 迟到加载的补救路径
+    //
+    // UE4SS 会给 LoadLibraryA/W 和 LoadLibraryExA/W 挂钩, 每次加载都回调到这里
+    // (它**不**挂 LdrLoadDll, 但 UE4 插件走的正是 LoadLibraryW)。
+    // 所以即使前面 10 秒的重试窗口错过了, 这里还能补挂上。
+    // -----------------------------------------------------------------------
+    auto on_dll_load(std::wstring_view dll_name) -> void override {
+        // 只在还没挂上、且名字里带 "indrun" 时才做事(不区分大小写)。
+        if (!source_ || source_->installed()) return;
+
+        auto lower = [](wchar_t c) -> wchar_t {
+            return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c + 32) : c;
+        };
+        bool is_indrun = false;
+        constexpr wchar_t kNeedle[] = L"indrun";
+        if (dll_name.size() >= 6) {
+            for (size_t i = 0; i + 6 <= dll_name.size() && !is_indrun; ++i) {
+                bool hit = true;
+                for (size_t k = 0; k < 6; ++k) {
+                    if (lower(dll_name[i + k]) != kNeedle[k]) { hit = false; break; }
+                }
+                is_indrun = hit;
+            }
+        }
+        if (!is_indrun) return;
+
+        dglab_idac::log_info("on_dll_load: 看到 IndRun, 尝试补挂");
+        if (source_->install()) {
+            dglab_idac::log_info("补挂成功: %s", source_->status_report().c_str());
+        }
+    }
+
     auto on_update() -> void override {
         // 每次 tick 都被调用, 频率很高。除了记账什么都不做。
         ++game_ticks_;
@@ -191,6 +226,25 @@ private:
                     dglab_idac::log_info("延迟挂钩成功: %s", source_->status_report().c_str());
                 }
             }
+        }
+
+        // 还是没挂上? 把进程里所有模块名倒出来, 免得只能靠猜。
+        // UE4 插件不一定叫 IndRun.dll —— 名字一变, 特征码校验也救不了。
+        if (source_ && !source_->installed()) {
+            dglab_idac::log_error("重试窗口结束仍未挂上 IndRun.dll —— 已加载模块清单:");
+            HMODULE mods[512];
+            DWORD needed = 0;
+            if (::EnumProcessModules(::GetCurrentProcess(), mods, sizeof(mods), &needed)) {
+                const size_t n = needed / sizeof(HMODULE);
+                for (size_t i = 0; i < n && i < 512; ++i) {
+                    char name[MAX_PATH] = {0};
+                    if (::GetModuleBaseNameA(::GetCurrentProcess(), mods[i], name, sizeof(name))) {
+                        dglab_idac::log_error("    [%3zu] %s", i, name);
+                    }
+                }
+            }
+            dglab_idac::log_error("如果清单里根本没有 IndRun.dll, 说明这个游戏构建"
+                                  "没走 UE4 插件路径 —— 需要换挂钩目标");
         }
 
         const auto period = std::chrono::milliseconds(

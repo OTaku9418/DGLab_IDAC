@@ -173,6 +173,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ole32.lib
     setupapi.lib
     bcrypt.lib
+    psapi.lib           # EnumProcessModules / GetModuleBaseNameA (挂不上时倒模块清单)
 )
 
 # 输出名: UE4SS 只找 <mod>/dlls/main.dll, 所以交付时改名。
