@@ -57,6 +57,29 @@ struct SafetyState {
     double applied_strength = 0.0;   // 经斜率限制后的当前强度
 };
 
+// ---------------------------------------------------------------------------
+// 自动增益: 把"当前的输入峰值"当作动态 in_max
+//
+// 包络是快起慢落 —— 峰值上去立刻跟上, 回落时按 release 时间常数慢慢降。
+// 这样做的原因见 config.hpp 里 [output] 自动增益那段注释。
+//
+// active 标志用来区分"没信号"和"信号很小": 没信号时不衰减峰值, 免得
+// 菜单里挂机几十秒后增益被磨到 floor, 一发车就糊成平线。
+// ---------------------------------------------------------------------------
+struct GainTracker {
+    double  gain        = 0.0;    // 当前动态 in_max
+    double  peak        = 0.0;    // 已观测到的峰值(未衰减)
+    double  last_active = -1e9;   // 最近一次收到 >= floor 的信号的时刻(秒)
+    bool    primed      = false;  // 是否已经用第一个采样初始化过
+
+    void reset(double start_gain) {
+        gain = start_gain;
+        peak = start_gain;
+        last_active = -1e9;
+        primed = false;
+    }
+};
+
 class Pipeline {
 public:
     explicit Pipeline(const Config& cfg);
@@ -76,18 +99,38 @@ public:
     // 诊断: 一帧的映射结果摘要
     std::string describe(const Frame& f) const;
 
+    // 诊断: 当前各通道的动态增益, 形如 "peakA=18 gainA=24 peakB=40 gainB=40"
+    std::string gain_summary() const;
+
 private:
     // 单通道: 把原始信号映射成 0..1
     double map_input(const ChannelMapping& m, const FfbState& ffb) const;
-    // 单通道: 生成 4 个槽
-    void fill_channel(const ChannelMapping& m, const FfbState& ffb,
-                      double dt_slot, ChannelFrame& out);
+    // 单通道: 把原始信号映射成帧
+    void fill_channel(const ChannelMapping& m, double v, ChannelFrame& out);
+    // 单通道: 本帧的目标强度(static = 固定 base_strength, level = 按 v 缩放)
+    int  effective_strength(const ChannelMapping& m, double v) const;
     // 安全: 静音判定 + 斜率限制
     bool evaluate_safety(double now, const FfbState& ffb, std::string& reason);
     int  clamp_strength(int want) const;
 
+    // 本帧该用的归一化上界: auto_gain 关闭时就是 m.in_max
+    double effective_in_max(const ChannelMapping& m, const FfbState& ffb) const;
+
+    // 自动增益: 每个 tick 用当前原始值推进一次包络, 返回本帧的有效 in_max
+    double update_gain(GainTracker& t, const ChannelMapping& m,
+                       const FfbState& ffb, double now);
+
     Config cfg_;
     SafetyState safety_{};
+
+    // 自动增益状态(通道级)
+    GainTracker gain_a_{};
+    GainTracker gain_b_{};
+    double      last_gain_t_ = 0.0;
+
+    // 本帧映射结果(0..1), 供 strength_source=level 与诊断使用
+    double last_v_a_ = 0.0;
+    double last_v_b_ = 0.0;
 
     // 斜率限制状态(通道级) —— 这里是"通道强度"的斜率, 不是脉冲强度的
     double applied_strength_ = 0.0;

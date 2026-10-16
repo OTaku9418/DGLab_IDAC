@@ -17,6 +17,15 @@ inline double clamp01(double v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); }
 
 inline int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+inline double clamp_d(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// 一阶趋近: 把 cur 朝 target 推 dt/tau 的比例。tau<=0 时直接跳到 target。
+inline double smooth(double cur, double target, double dt, double tau) {
+    return cur + (target - cur) * ((tau > 0.0) ? clamp01(dt / tau) : 1.0);
+}
+
 // 从 FfbState 里按名字取一个原始整数。取不到时返回 0 并把 ok 置 false。
 int32_t pick_source(const std::string& src, const FfbState& f, bool& ok,
                     bool neg_is_pos, int32_t* out_signed = nullptr) {
@@ -28,11 +37,13 @@ int32_t pick_source(const std::string& src, const FfbState& f, bool& ok,
         return f.torque_magnitude;
     }
     if (src == "torque_signed") {
-        // 按方向恢复符号。这是唯一会用到 direction 的源 —— 用于"回正力"
-        // 这类需要区分左右手感的映射。
+        // ★ 这个名字有误导性: 它恢复出来的**不是左右方向**。
+        // 逆向已证实 (re/indrun_hook_mechanics.md 第 4.1/5 节): torque 的 direction
+        // 参数取 0xFFFFFFFF(-1) 只表示"算出的扭矩为正", 其余情况装的是
+        // (uint8_t)device[0x1678] —— 一个齿轮/档位索引, 域 0..255。
+        // 所以下面这个"非 -1 即负"的判据只有在 direction 恰好是 ±1 时才成立,
+        // 拿到档位值时符号是任意的。保留它只为兼容既有配置, 新配置请用 torque。
         int32_t m = f.torque_magnitude;
-        // 已证实: -1 = 计算出的扭矩为正(IndRun RVA 0x2BCD1)
-        // 强推断: 其它值 = 反方向
         bool positive = (f.torque_dir == static_cast<int32_t>(TorqueDirection::Zero));
         if (neg_is_pos) positive = !positive;
         const int32_t signed_m = positive ? m : -m;
@@ -77,14 +88,79 @@ double apply_map_mode(MapMode mode, double normalized, double level) {
 Pipeline::Pipeline(const Config& cfg) : cfg_(cfg) {
     boot_time_ = 0.0;
     started_ = false;
+    // 增益从 in_max 起步而不是从 floor 起步: 起步瞬间如果有大信号,
+    // 用 in_max 归一化得到的输出是"按静态标定应当给出的力度", 不会突刺。
+    // 0.4 秒后包络自己会滑到真实峰值那一档。
+    gain_a_.reset(static_cast<double>(cfg_.channel_a.in_max));
+    gain_b_.reset(static_cast<double>(cfg_.channel_b.in_max));
 }
 
 void Pipeline::reconfigure(const Config& cfg) {
+    const int32_t old_a_max = cfg_.channel_a.in_max;
+    const int32_t old_b_max = cfg_.channel_b.in_max;
     cfg_ = cfg;
     log_info("管线已重新配置: frame=%dms A=%s B=%s max_strength=%d clamp=%d",
              cfg_.frame_ms,
              cfg_.channel_a.source.c_str(), cfg_.channel_b.source.c_str(),
              cfg_.max_strength, cfg_.clamp_strength);
+    // 标定变了就把包络重置到新的起点, 否则会拿旧工况的峰值去归一化新标定。
+    if (cfg_.channel_a.in_max != old_a_max || !cfg_.auto_gain) {
+        gain_a_.reset(static_cast<double>(cfg_.channel_a.in_max));
+    }
+    if (cfg_.channel_b.in_max != old_b_max || !cfg_.auto_gain) {
+        gain_b_.reset(static_cast<double>(cfg_.channel_b.in_max));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 自动增益: 用当前原始值推进一次包络, 返回本帧的有效 in_max。
+//
+// 为什么不是"整个会话的最大值": 一次会话里既有发车时的低速轻手感, 也有
+// 高速弯的重手感; 取全局最大值会让前半段全部糊在底部。所以要让它落回来。
+// ---------------------------------------------------------------------------
+double Pipeline::update_gain(GainTracker& t, const ChannelMapping& m,
+                             const FfbState& ffb, double now) {
+    // 关闭时直接返回静态 in_max —— 自动增益完全不介入, 行为与加它之前一致。
+    if (!cfg_.auto_gain) return static_cast<double>(m.in_max);
+
+    bool ok = false;
+    const int32_t raw = pick_source(m.source, ffb, ok, cfg_.torque_negative_is_positive);
+    const double v = ok ? static_cast<double>(raw < 0 ? -raw : raw) : 0.0;
+
+    double hi = static_cast<double>(cfg_.gain_ceiling);
+    if (static_cast<double>(m.in_max) > hi) hi = static_cast<double>(m.in_max);
+    // 下限不能超过上限, 否则区间是负的
+    const double lo = (std::min)(static_cast<double>((std::max)(1, cfg_.gain_floor)), hi);
+
+    const double dt = (last_gain_t_ > 0.0) ? (now - last_gain_t_) : 0.0;
+    const bool active = (v >= lo);
+
+    if (active) t.last_active = now;
+
+    if (active && v > t.peak) {
+        // 快起: 峰值上去时按 attack 时间跟上
+        t.peak = smooth(t.peak, v, dt, cfg_.gain_attack_sec);
+    } else if (now - t.last_active > cfg_.gain_idle_reset_sec) {
+        // 没信号(菜单/暂停): 把峰值收回到它的下限, 下次发车重新观察。
+        // 不这么做的话, 一次高速弯的大峰值会跟一整天, 之后的低速段全被压扁。
+        t.peak = smooth(t.peak, lo, dt, cfg_.gain_release_sec);
+    } else if (v < t.peak) {
+        // 慢落: 信号回来但比峰值小, 缓慢释放, 免得松手瞬间增益暴涨
+        t.peak = smooth(t.peak, v, dt, cfg_.gain_release_sec);
+    }
+
+    t.primed = true;
+    t.gain = clamp_d(t.peak, lo, hi);
+    return t.gain;
+}
+
+// ---------------------------------------------------------------------------
+double Pipeline::effective_in_max(const ChannelMapping& m,
+                                  const FfbState& ffb) const {
+    const bool is_a = (&m == &cfg_.channel_a);
+    const GainTracker& t = is_a ? gain_a_ : gain_b_;
+    if (!cfg_.auto_gain) return static_cast<double>(m.in_max);
+    return t.gain;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +175,7 @@ double Pipeline::map_input(const ChannelMapping& m, const FfbState& ffb) const {
         return 0.0;
     }
 
-    const double span = static_cast<double>(m.in_max) - static_cast<double>(m.in_min);
+    const double span = effective_in_max(m, ffb) - static_cast<double>(m.in_min);
     if (span <= 0.0) return clamp01(m.level);
 
     double norm = (static_cast<double>(raw) - static_cast<double>(m.in_min)) / span;
@@ -111,13 +187,27 @@ double Pipeline::map_input(const ChannelMapping& m, const FfbState& ffb) const {
 }
 
 // ---------------------------------------------------------------------------
-void Pipeline::fill_channel(const ChannelMapping& m, const FfbState& ffb,
-                            double /*dt_slot*/, ChannelFrame& out) {
-    const double v = map_input(m, ffb);
+// 该通道本帧的目标强度。
+//
+// static(默认): 只要通道启用就固定输出 base_strength —— 它扮演的是设备上的
+//   "音量", 由用户配置决定, 不跟游戏信号抖动。全部动态交给脉冲振幅。
+// level: 用映射值缩放 base_strength, 叠加 strength_margin 消除零信号死区。
+//   这是早期行为, 保留下来做 A/B 对照。
+// ---------------------------------------------------------------------------
+int Pipeline::effective_strength(const ChannelMapping& m, double v) const {
+    if (!m.enable) return 0;
+    if (m.strength_source == "level") {
+        const double margin = clamp01(m.strength_margin);
+        const double f = margin + (1.0 - margin) * clamp01(v);
+        return static_cast<int>(std::lround(f * static_cast<double>(m.base_strength)));
+    }
+    return m.base_strength;
+}
 
-    // 脉冲强度(0..100): 直接就是映射出来的比例。
-    // 这里不乘通道强度 —— 通道强度是"音量", 脉冲强度是"波形振幅", 两者在
-    // 郊狼上是独立的两个量, 分开调才有意义。
+// ---------------------------------------------------------------------------
+void Pipeline::fill_channel(const ChannelMapping& m, double v, ChannelFrame& out) {
+    // 脉冲强度(0..100): 这里承载**全部**的游戏动态。
+    // 通道强度是音量、脉冲强度是波形振幅, 两者在郊狼上是独立的量。
     const int intensity = clamp_int(static_cast<int>(std::lround(v * 100.0)), 0, 100);
 
     // 脉冲频率(10..240): 数值越大 = 单元越长 = 电气频率越低 = 越"敦实"。
@@ -195,27 +285,29 @@ bool Pipeline::tick(double now, const FfbState& ffb, Frame& out) {
     std::string reason;
     const bool muted = evaluate_safety(now, ffb, reason);
 
+    // ---- 自动增益: 每 tick 推进一次包络, 供本帧的 A/B 两路归一化使用 ----
+    // 必须在 map_input 之前, 因为 map_input 读的是本帧算出来的增益。
+    update_gain(gain_a_, cfg_.channel_a, ffb, now);
+    update_gain(gain_b_, cfg_.channel_b, ffb, now);
+    last_gain_t_ = now;
+
     // ---- 目标通道强度 ----
-    // 设计原则(见 docs/research-coyote-protocol.md §波形设计):
     // 通道强度是慢变量, 每 100 ms 最多动 slew 允许的量; 快变化全部走
-    // 脉冲强度(波形振幅)。绝对不让游戏数据直接把通道强度打到满。
+    // 脉冲强度(波形振幅)。默认 strength_source=static, 强度只由配置决定,
+    // 游戏数据完全不参与 —— 见 config.hpp 里那个字段的注释。
     const double v_a = map_input(cfg_.channel_a, ffb);
     const double v_b = map_input(cfg_.channel_b, ffb);
+    last_v_a_ = v_a;
+    last_v_b_ = v_b;
 
-    int want_a = cfg_.channel_a.enable
-                     ? static_cast<int>(std::lround(v_a * cfg_.channel_a.base_strength))
-                     : 0;
-    int want_b = cfg_.channel_b.enable
-                     ? static_cast<int>(std::lround(v_b * cfg_.channel_b.base_strength))
-                     : 0;
-
+    // 先过配置钳制, 再交给斜率。静音时目标就是 0 —— 让斜率把它平滑带下去,
+    // 而不是硬切。
+    int want_a = clamp_strength(effective_strength(cfg_.channel_a, v_a));
+    int want_b = clamp_strength(effective_strength(cfg_.channel_b, v_b));
     if (muted) {
         want_a = 0;
         want_b = 0;
     }
-
-    want_a = clamp_strength(want_a);
-    want_b = clamp_strength(want_b);
 
     // ---- 斜率限制(每秒允许的变化量) ----
     const double limit = (cfg_.slew_per_second > 0.0)
@@ -257,9 +349,8 @@ bool Pipeline::tick(double now, const FfbState& ffb, Frame& out) {
                 clamp_int(cfg_.pulse_freq_min, 10, 240));
         }
     } else {
-        const double dt_slot = (static_cast<double>(cfg_.frame_ms) / 1000.0) / kSlotsPerFrame;
-        fill_channel(cfg_.channel_a, ffb, dt_slot, out.a);
-        fill_channel(cfg_.channel_b, ffb, dt_slot, out.b);
+        fill_channel(cfg_.channel_a, v_a, out.a);
+        fill_channel(cfg_.channel_b, v_b, out.b);
     }
 
     // 返回值: 静音状态发生变化时必须返回 true(让传输层知道要改强度),
@@ -282,6 +373,21 @@ std::string Pipeline::describe(const Frame& f) const {
                 static_cast<unsigned>(f.b.slots[0].pulse_frequency),
                 f.muted ? "MUTED " : "",
                 f.mute_reason ? f.mute_reason : "");
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+std::string Pipeline::gain_summary() const {
+    char buf[192];
+    if (!cfg_.auto_gain) {
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "auto=off A(in_max=%d) B(in_max=%d)",
+                    cfg_.channel_a.in_max, cfg_.channel_b.in_max);
+        return buf;
+    }
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "auto=on peakA=%.0f gainA=%.0f | peakB=%.0f gainB=%.0f",
+                gain_a_.peak, gain_a_.gain, gain_b_.peak, gain_b_.gain);
     return buf;
 }
 

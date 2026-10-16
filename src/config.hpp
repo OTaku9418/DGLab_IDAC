@@ -47,6 +47,19 @@ struct ChannelMapping {
     // 上限还会被 [safety] max_strength 和 BF 软限位双重压住。
     int32_t     base_strength = 60;
 
+    // 通道强度的来源:
+    //   "static" = 固定用 base_strength, 全部动态走脉冲振幅(默认, 见下)
+    //   "level"  = 用映射值缩放 base_strength(旧行为, 留作 A/B)
+    //
+    // 为什么默认 static: 通道强度是"音量", 脉冲强度是"波形振幅", 两者独立。
+    // 游戏每 ~10ms 就推一次力反馈(实测 viscosity 一段赛道 10913 次), 把它
+    // 接到通道强度上就等于让强度跟着游戏抖, 既过不了斜率也毫无层次; 而脉冲
+    // 振幅本来就能 100ms 内自由变化。所以动态全部交给脉冲, 强度只作音量。
+    std::string strength_source = "static";
+    // strength_source=level 时, 映射值到通道强度的下限比例。
+    // 例如 0.2 表示信号为 0 时强度也有 base_strength 的 20%(手感连续, 不留死区)。
+    double      strength_margin = 0.0;
+
     // 该通道映射哪个信号源
     std::string source      = "torque";   // torque | viscosity | vibration | const
 };
@@ -95,6 +108,24 @@ struct Config {
     // 频率是否跟随振动信号调制(0 = 恒定)
     double      pulse_freq_track    = 0.0;
 
+    // ---- [output] 自动增益 ----
+    // 为什么需要它: 力反馈原始值(IndRun 侧 clamp 到 ±127)的实际取值范围
+    // 随车/赛道/工况变化极大 —— 实测某次计时赛 torque 只落在 12..18,
+    // 而满量程是 127。固定 in_max 要么把小信号压成平线, 要么在大信号上削顶。
+    //
+    // 规律: 输入幅值直接就是物理力的大小, 所以需要保留线性、随工况平移;
+    // 开方/平方那些曲线反而会扭曲力度层次。自动增益把当前的"峰值"当作
+    // 动态 in_max, 于是幅值归一化后总是铺满 0..1。
+    //
+    // 包络用快起慢落(attack / release), 只影响标定不影响手感延迟:
+    // 峰值上去立刻跟上, 下来时慢慢回, 避免松手瞬间增益暴涨。
+    bool        auto_gain           = true;
+    double      gain_attack_sec     = 0.7;   // 峰值上升时, 增益跟到峰值所需的时间
+    double      gain_release_sec    = 8.0;   // 峰值回落时, 增益衰减的时间常数
+    int32_t     gain_floor          = 24;    // 动态 in_max 的下限
+    int32_t     gain_ceiling        = 127;   // 动态 in_max 的上限(不得超过物理满量程)
+    double      gain_idle_reset_sec = 3.0;   // 无信号多久后放弃当前峰值重新起步
+
     // ---- [safety] ----
     // ★ 用户要的"最大强度"接口 ★
     // 写进 BF 命令的通道软限位(0..200), 设备侧持久生效, 且每次重连后必须重发。
@@ -103,7 +134,12 @@ struct Config {
     int         clamp_strength      = 40;
     // 每秒允许的强度变化量(0 = 不限制)。避免阶跃冲击。
     double      slew_per_second     = 40.0;
-    // 力反馈静默超过这个毫秒数就把输出拉到 0(游戏卡死/退出/挂载失效)
+    // ★ 目前**没有实现**, 配了不会生效 —— 保留键位是为了兼容既有 INI。
+    // 原意是"力反馈静默超过这个毫秒数就把输出拉到 0", 实际没有任何代码读它。
+    // 现有的静默保护只到"超过 20 秒没有任何回调就打一条 WARN 日志"为止
+    // (见 src/dllmain.cpp 的心跳分支), 那是一句告警, 不是归零动作。
+    // 真要做需要: 在 worker loop 里记录 last_callback_at, 超时后强制
+    // clamp_strength(0) 并 skip 后续 submit —— 尚未实现。
     int         watchdog_ms         = 500;
     // servo off / 未就绪时是否强制归零
     bool        zero_when_servo_off = true;
@@ -116,6 +152,11 @@ struct Config {
     // 上面 ChannelMapping 里的 in_min/in_max 覆盖了标定; 这里额外给
     // 扭矩方向的符号约定留个开关。
     bool        torque_negative_is_positive = false;
+
+    // ---- [debug] ----
+    // 关掉 IndRun.dll 挂钩, 只留日志/管线 —— 出问题时用来做 A/B 对照:
+    //   hook=0 还能崩 -> 问题不在挂钩;  hook=0 就不崩 -> 问题在挂钩。
+    bool        hook                = true;
 };
 
 // 从 INI 读; 文件不存在时返回默认值并写日志

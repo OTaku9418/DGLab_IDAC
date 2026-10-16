@@ -31,6 +31,36 @@
 *.ini  text eol=lf
 *.json text eol=lf
 *.py   text eol=lf
+*.sh   text eol=lf
+
+# ---- 无扩展名的配置文件: 必须显式声明 ----
+# 为什么不能省: 没有规则时, 行尾由各人的 core.autocrlf 决定。本机是 true,
+# 于是 `git status` 会反复警告 "LF will be replaced by CRLF the next time
+# Git touches it", 而 Linux/Mac 贡献者拿到的是 LF —— 同一份文件两种结果。
+# .gitattributes 自己也在里面: 它要是被检出成 CRLF, 上面所有规则的行为就
+# 不再可复现。
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+.gitmodules    text eol=lf
+
+# ---- 上游文件的逐字节副本: 一个字节都不许动 ----
+# 为什么必须把 text 和 eol 都 unset 掉:
+#   上游 (dungeonlab-open/dglab-bluetooth-protocol) 发布的是 **CRLF**。
+#   上面那条 `*.md text eol=lf` 会在检出时把行尾换成 LF, 结果
+#       diff -r <上游> <我们的副本>
+#   会报"每一行都不同", 把真正的语义改动彻底淹掉 —— 我们留这份副本的
+#   全部意义就是能一眼看出上游改了什么。
+#   只写 `-text` 不够: `-text` 关掉的是"按文本归一化", 但上面 `*.md` 规则
+#   设的 `eol=lf` 仍然生效, 检出时照样改写行尾。必须两个一起 unset。
+#   校验和写在 re/reference/dglab-bluetooth-protocol/PROVENANCE.md。
+re/reference/dglab-bluetooth-protocol/** -text -eol
+
+# 同理: _ue4ss_ref/ 下提交进仓库的那两份 ABI 对齐头文件也是**上游的逐字节副本**。
+# 上游 (RE-UE4SS @ 0196ef29) 发布的是 CRLF; 上面的 `*.hpp text eol=lf` 会把它们
+# 改写成 LF, 导致工作区永远显示为"已修改"(core.autocrlf 又会改回 CRLF), 而且
+# 无法再用 diff 和上游比对。这两份头文件的作用是"逐 commit 对齐", 保持原样才
+# 有比对价值。
+_ue4ss_ref/** -text -eol
 
 # ---- 二进制: 永不转换 ----
 *.dll  binary

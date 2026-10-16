@@ -1,7 +1,12 @@
-# DG-LAB transport options — extracted from the local `dglab-bluetooth-protocol` repo
+# DG-LAB transport options — extracted from the official `dglab-bluetooth-protocol` repo
 
-**Scope.** Everything below is extracted from files on disk under `D:\INDAC\dglab-bluetooth-protocol\`.
-No web search was used and no external repository is cited. Where a fact is not in these files, it says so.
+**Scope.** Everything below is extracted from the official protocol repository,
+[`dungeonlab-open/dglab-bluetooth-protocol`](https://github.com/dungeonlab-open/dglab-bluetooth-protocol).
+The exact files this analysis was performed on are vendored byte-for-byte under
+`re/reference/dglab-bluetooth-protocol/` (with upstream commit hash and sha256 sums recorded in the
+`PROVENANCE.md` next to them), so every `path#Lnnn` citation below can be resolved offline.
+No web search was used for the protocol facts themselves. Where a fact is not in the upstream files,
+it says so.
 
 **Evidence tags used throughout:**
 
@@ -38,7 +43,7 @@ field order in the Chinese V3 doc (both below). Treat "corrected" as "was edited
 | # | Transport | Documented in this repo? | What it needs |
 |---|---|---|---|
 | 1 | **BLE GATT direct** (your PC is the BLE central, no phone) | **Yes** — fully. V2 at `coyote/v2/README.md#L5-L17`, V3 at `coyote/v3/README.md#L5-L19` | A BLE 4.0+ adapter and a GATT client. Device must be free (not held by the phone app). |
-| 2 | **WebSocket / "socket" / relay / terminal / app protocol** | **No. Not one word.** | — |
+| 2 | **WebSocket / "socket" / relay / terminal / app protocol** | **No — not in this repo.** It **is** officially documented, in a *different* repo (see the correction below). | A running WebSocket server, the phone running the official APP, the APP scannable via QR code. |
 
 **No WebSocket transport is documented in this repo.** This is a negative result obtained by searching
 every Markdown file in the repository (all 20) for `websocket`, `ws://`, `wss://`, `socket`, `relay`,
@@ -68,6 +73,53 @@ or approach of your choice to integrate these devices into your own projects."* 
 > repository is BLE-direct. A WebSocket transport would have to be designed by you (or sourced elsewhere);
 > this repo supplies no wire format for it. Architect the transport interface around the BLE role, and treat
 > any relay/phone path as an additional implementation you must specify yourself.
+
+### 1.1 Correction (added later): the SOCKET path *is* official — just documented elsewhere
+
+Everything above is still a true statement **about this repository**, but the conclusion "no WebSocket
+transport exists" was wrong. The vendor publishes two further, separate repositories for it:
+
+- [`dungeonlab-open/dglab-websocket-simple`](https://github.com/dungeonlab-open/dglab-websocket-simple) —
+  the SOCKET protocol spec itself, under `socket/`. **This repo is archived** (upstream's default branch
+  is still `main`; the spec is frozen at `socket/v2/README.md`). It also carries the vendor's QA file,
+  which is where the decisive quote below comes from.
+- [`dungeonlab-open/dglab-websocket-server`](https://github.com/dungeonlab-open/dglab-websocket-server) —
+  the reference relay server (not archived).
+
+> An earlier revision of this section cited `DG-LAB-OPENSOURCE/DG-LAB-OPENSOURCE`, `socket/` directory.
+> That repository name does not exist: the `dungeonlab-open` organisation contains exactly six repos
+> (`dglab-bluetooth-protocol`, `dglab-kit`, `dglab-kit-python`, `dglab-websocket-simple`,
+> `dglab-websocket-server`, `.github`) and no `DG-LAB-OPENSOURCE`. The protocol facts below were
+> re-checked against `dglab-websocket-simple` and hold; only the citation was wrong.
+
+- It speaks JSON over WebSocket, `{"type","clientId","targetId","message"}`; `type` ∈
+  `heartbeat|bind|msg|break|error`; max message length **1950 chars**.
+- Pairing is by QR code whose payload is
+  `https://www.dungeon-lab.com/app-download.php#DGLAB-SOCKET#<ws-url>/<clientId>` — the APP must scan it.
+- Commands: `strength-{ch}+{mode}+{value}` (mode 0=decrease/1=increase/2=set-to, value 0–200),
+  `pulse-{A|B}:["<16 hex chars>",...]` (array ≤100 entries = 10 s), `clear-{1|2}`.
+- Upstream reports: `strength-{A}+{B}+{A_limit}+{B_limit}`, `feedback-{0..9}` (5 buttons per channel).
+
+The single most important sentences are in that repo's QA file
+(`socket/QA/Websocket_open_source_QA_English.txt`, questions 1 and 29), and they settle the
+architecture question:
+
+> *"the Coyote V3 can only connect to the mobile APP via Bluetooth. ... waveforms cannot be sent via
+> methods other than the APP (even with remote control)."*
+
+i.e. the SOCKET path does **not** replace BLE — it is an *app-mediated* path. The APP remains the BLE
+central and the owner of the intensity ceiling; the third-party program just hands the APP queued data.
+Consequences for us (racing FFB, streaming real-time signal):
+
+1. It adds a mandatory phone + WS server (LAN or public) to the loop, plus network RTT, on top of the
+   device's own 100 ms frame quantum. For real-time streaming that is strictly worse than BLE-direct.
+2. Its model is *queued batches* (`pulse-A:[...]` up to 10 s per send, 50 s queue), i.e. designed for
+   **playlists**, not for a signal that changes every frame. `clear-{ch}` before re-sending is the
+   documented way to interrupt, which means an interrupt-then-refill cycle per update.
+3. It *does* have one genuine advantage: the phone's native intensity dial and limit remain available to
+   the user, and `feedback-{index}` gives 10 hardware buttons we could bind to game functions.
+
+**Decision: stay on BLE-direct** (`[link] mode=ble`). This is what is already implemented.
 
 ---
 

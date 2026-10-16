@@ -36,13 +36,31 @@ namespace dglab_idac {
 inline constexpr int kB0Size = 20;
 inline constexpr int kBfSize = 7;
 
-// byte[1] 位 3-2 / 位 1-0
+// byte[1] 位 3-2 = A 通道模式, 位 1-0 = B 通道模式。
+//
+// ⚠⚠ 这四个值曾经**全部反了**, 2026-10-17 照官方文档
+//    (dungeonlab-open/dglab-bluetooth-protocol, coyote/v3/README.md,
+//     逐字节副本存于 re/reference/dglab-bluetooth-protocol/coyote-v3-README.md)
+//    逐个核对后改正:
+//
+//       0b00  不变 —— **忽略本通道的强度字节**, 维持设备当前值
+//       0b01  相对增加 (在当前值上加)
+//       0b10  相对减少
+//       0b11  绝对设置 (把通道设为给定值)
+//
+//    官方表格(起始 A=10): 0b0000→A 仍 10 / 0b0100→15 / 0b1000→0 / 0b1100→0。
+//    可见"绝对设置"是 0b11 而**不是** 0b00, "不变"是 0b00 而不是 0b11 ——
+//    改之前正好写成了相反的对应关系, 后果见下面 encode_b0 的注释。
 enum class StrengthMode : uint8_t {
-    Absolute = 0b00,   // 绝对设置
+    Unchanged   = 0b00,   // 不改强度(忽略强度字节, 保留设备原值)
     RelativeAdd = 0b01,   // 相对加
     RelativeSub = 0b10,   // 相对减
-    Discard = 0b11,   // 不改强度(保留原值)
+    Absolute    = 0b11,   // 绝对设置(把通道设为给定值)
 };
+
+// 旧名字, 保留以免漏改的调用点变成编译错误之外的东西。
+// ★ 新代码请用 Unchanged。下一轮清理时删掉它。
+inline constexpr StrengthMode Discard = StrengthMode::Unchanged;
 
 struct B0 {
     uint8_t bytes[kB0Size]{};

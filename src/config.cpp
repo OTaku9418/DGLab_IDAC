@@ -19,6 +19,70 @@ namespace dglab_idac {
 namespace {
 
 // ---------------------------------------------------------------------------
+// INI 行尾归一化: 把裸 LF 全部转成 CRLF。
+//
+// Win32 的 INI API 只认 CRLF。一个 LF-only 的 INI 会被读成"什么都没有" ——
+// 每个键都回落到默认值, 而且不报任何错。这个坑真的发生过(见 load_config
+// 里的长注释), 所以放在这里做成一个不可绕过的动作。
+//
+// 返回 true 表示确实改写了文件。
+// ---------------------------------------------------------------------------
+bool normalize_ini_line_endings(const std::string& path) {
+    HANDLE h = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER sz{};
+    if (!::GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (16 * 1024 * 1024)) {
+        ::CloseHandle(h);
+        return false;
+    }
+
+    std::string data(static_cast<size_t>(sz.QuadPart), '\0');
+    DWORD got = 0;
+    const BOOL ok = ::ReadFile(h, &data[0], static_cast<DWORD>(data.size()), &got, nullptr);
+    ::CloseHandle(h);
+    if (!ok) return false;
+    data.resize(got);
+
+    // 统计裸 LF(前面不是 CR 的 LF)
+    size_t bare = 0;
+    for (size_t i = 0; i < data.size(); ++i) {
+        if (data[i] == '\n' && (i == 0 || data[i - 1] != '\r')) ++bare;
+    }
+    if (bare == 0) return false;   // 已经是 CRLF, 不动
+
+    std::string out;
+    out.reserve(data.size() + bare);
+    for (size_t i = 0; i < data.size(); ++i) {
+        if (data[i] == '\n' && (i == 0 || data[i - 1] != '\r')) out.push_back('\r');
+        out.push_back(data[i]);
+    }
+
+    HANDLE w = ::CreateFileA(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (w == INVALID_HANDLE_VALUE) {
+        log_warn("配置 %s 是 LF 行尾(Win32 INI API 会读不到内容), 但改写失败 —— 本次仍按默认值运行",
+                 path.c_str());
+        return false;
+    }
+    DWORD wrote = 0;
+    const BOOL wok = ::WriteFile(w, out.data(), static_cast<DWORD>(out.size()), &wrote, nullptr);
+    ::CloseHandle(w);
+
+    if (!wok || wrote != out.size()) {
+        log_error("配置 %s 行尾归一化写入不完整 (%lu/%zu)", path.c_str(),
+                  static_cast<unsigned long>(wrote), out.size());
+        return false;
+    }
+
+    log_warn("配置 %s 原本是 LF 行尾 —— Win32 的 INI API 只认 CRLF, 那样会让**所有**配置项"
+             "静默回落成内置默认值。已自动改写成 CRLF(%zu 处)。",
+             path.c_str(), bare);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // 大小写不敏感的字符串比较(两个来源都是我们自己的字面量/INI 值)
 // ---------------------------------------------------------------------------
 bool ieq(const std::string& a, const char* b) {
@@ -81,6 +145,18 @@ void read_channel(const std::string& file, const char* section, ChannelMapping& 
     c.in_max        = read_int(file, section, "in_max", c.in_max);
     c.level         = read_double(file, section, "level", c.level);
     c.base_strength = read_int(file, section, "base_strength", c.base_strength);
+    c.strength_source = read_str(file, section, "strength_source", c.strength_source);
+    c.strength_margin = read_double(file, section, "strength_margin", c.strength_margin);
+
+    if (c.strength_source != "static" && c.strength_source != "level") {
+        log_warn("[%s] strength_source=\"%s\" 不是 static/level, 按 static 处理",
+                 section, c.strength_source.c_str());
+        c.strength_source = "static";
+    }
+    if (c.strength_margin < 0.0 || c.strength_margin > 1.0) {
+        log_warn("[%s] strength_margin=%.3f 超出 [0,1], 已钳制", section, c.strength_margin);
+        c.strength_margin = (c.strength_margin < 0.0) ? 0.0 : 1.0;
+    }
 
     if (c.in_max <= c.in_min) {
         log_warn("[%s] in_max(%d) <= in_min(%d), 该通道映射会退化为恒定最大值",
@@ -138,6 +214,20 @@ Config load_config(const std::string& ini_path) {
         return cfg;
     }
 
+    // -----------------------------------------------------------------------
+    // ★ 行尾归一化: 纯 LF 的 INI 会被 Win32 的 GetPrivateProfileString 整个读空 ★
+    //
+    // 这不是假设, 是踩过的坑: 部署目录里的 INI 被写成了 LF 行尾, 于是**每一个**
+    // 配置项都静默回落到内置默认值。表现是"代码全绿、日志无错、设备却毫无反应",
+    // 而默认值里 base_strength=60 会让强度比配置值高好几倍 —— 既是功能 bug
+    // 也是安全问题。GetPrivateProfileStringA 对 LF-only 文件返回的与"文件不
+    // 存在"完全一致, 所以调用方根本分不出这两种情况。
+    //
+    // 这里直接就地改写成 CRLF。用户手写的 LF 文件在第一次加载时被自动修正,
+    // 之后一切正常。只在确实存在裸 LF 时才重写, 避免无谓改动 mtime。
+    // -----------------------------------------------------------------------
+    normalize_ini_line_endings(ini_path);
+
     // ---- [general] ----
     cfg.enabled  = read_bool(ini_path, "general", "enable", cfg.enabled);
     cfg.verbose  = read_bool(ini_path, "general", "verbose", cfg.verbose);
@@ -192,6 +282,15 @@ Config load_config(const std::string& ini_path) {
     cfg.pulse_freq_max   = read_int(ini_path, "output", "pulse_freq_max", cfg.pulse_freq_max);
     cfg.pulse_freq_track = read_double(ini_path, "output", "pulse_freq_track", cfg.pulse_freq_track);
 
+    // ---- [output] 自动增益 ----
+    cfg.auto_gain           = read_bool(ini_path, "output", "auto_gain", cfg.auto_gain);
+    cfg.gain_attack_sec     = read_double(ini_path, "output", "gain_attack_sec", cfg.gain_attack_sec);
+    cfg.gain_release_sec    = read_double(ini_path, "output", "gain_release_sec", cfg.gain_release_sec);
+    cfg.gain_floor          = read_int(ini_path, "output", "gain_floor", cfg.gain_floor);
+    cfg.gain_ceiling        = read_int(ini_path, "output", "gain_ceiling", cfg.gain_ceiling);
+    cfg.gain_idle_reset_sec = read_double(ini_path, "output", "gain_idle_reset_sec",
+                                          cfg.gain_idle_reset_sec);
+
     read_channel(ini_path, "channel_a", cfg.channel_a);
     read_channel(ini_path, "channel_b", cfg.channel_b);
 
@@ -210,6 +309,9 @@ Config load_config(const std::string& ini_path) {
         read_bool(ini_path, "ranges", "torque_negative_is_positive",
                   cfg.torque_negative_is_positive);
 
+    // ---- [debug] ----
+    cfg.hook = read_bool(ini_path, "debug", "hook", cfg.hook);
+
     // ---- 一致性钳制: 安全相关的值先自纠, 免得把非法值送进协议编码 ----
     auto clamp_int = [](int& v, int lo, int hi, const char* what) {
         if (v < lo || v > hi) {
@@ -226,6 +328,29 @@ Config load_config(const std::string& ini_path) {
     clamp_int(cfg.pulse_freq_max, 10, 240, "[output] pulse_freq_max");
     clamp_int(cfg.warmup_ms, 0, 60000, "[safety] warmup_ms");
     clamp_int(cfg.watchdog_ms, 50, 60000, "[safety] watchdog_ms");
+    // 自动增益: floor 不能超过 ceiling, 否则归一化区间是负的, 会整体归零。
+    clamp_int(cfg.gain_floor, 1, 200, "[output] gain_floor");
+    clamp_int(cfg.gain_ceiling, 1, 200, "[output] gain_ceiling");
+    if (cfg.gain_ceiling < cfg.gain_floor) {
+        log_warn("[output] gain_ceiling(%d) < gain_floor(%d), 已把 ceiling 抬到 floor",
+                 cfg.gain_ceiling, cfg.gain_floor);
+        cfg.gain_ceiling = cfg.gain_floor;
+    }
+    // 静态标定比 ceiling 还大时, 以静态标定为准 —— 那说明用户知道满量程更大。
+    // 自动增益只会在这个上限之内浮动, 绝不会凭空放大到超过物理满量程。
+    if (cfg.channel_a.in_max > cfg.gain_ceiling) {
+        log_info("[output] channel_a.in_max(%d) > gain_ceiling(%d), 自动增益上限抬到 %d",
+                 cfg.channel_a.in_max, cfg.gain_ceiling, cfg.channel_a.in_max);
+        cfg.gain_ceiling = cfg.channel_a.in_max;
+    }
+    if (cfg.channel_b.in_max > cfg.gain_ceiling) {
+        log_info("[output] channel_b.in_max(%d) > gain_ceiling(%d), 自动增益上限抬到 %d",
+                 cfg.channel_b.in_max, cfg.gain_ceiling, cfg.channel_b.in_max);
+        cfg.gain_ceiling = cfg.channel_b.in_max;
+    }
+    if (cfg.gain_attack_sec < 0.0) cfg.gain_attack_sec = 0.0;
+    if (cfg.gain_release_sec < 0.0) cfg.gain_release_sec = 0.0;
+    if (cfg.gain_idle_reset_sec < 0.0) cfg.gain_idle_reset_sec = 0.0;
     if (cfg.pulse_freq_min > cfg.pulse_freq_max) {
         log_warn("[output] pulse_freq_min(%d) > pulse_freq_max(%d), 已交换",
                  cfg.pulse_freq_min, cfg.pulse_freq_max);
@@ -243,6 +368,23 @@ Config load_config(const std::string& ini_path) {
         cfg.clamp_strength = cfg.max_strength;
     }
 
+    // -----------------------------------------------------------------------
+    // ★ 无条件回显"实际生效"的关键值 ★
+    //
+    // 上面那个 LF 事故里, 配置整份被忽略、全部用内置默认值, 日志里**一条错误
+    // 都没有** —— 唯一能看出问题的方法就是"把生效值和 INI 里写的对一遍"。
+    // 所以这一行不是调试信息, 是判据: 每次加载都把生效值原样打出来, 任何人
+    // 拿它跟 INI 比一下就知道配置有没有被吃进去。
+    // -----------------------------------------------------------------------
+    log_info("配置生效值: %s | link=%s protocol=%s dry_run=%d hook=%d | "
+             "A(str=%d src=%s) B(str=%d src=%s) | clamp=%d max=%d frame_ms=%d",
+             ini_path.c_str(), to_string(cfg.link), to_string(cfg.protocol), cfg.dry_run ? 1 : 0,
+             cfg.hook ? 1 : 0, cfg.channel_a.base_strength, cfg.channel_a.strength_source.c_str(),
+             cfg.channel_b.base_strength, cfg.channel_b.strength_source.c_str(), cfg.clamp_strength,
+             cfg.max_strength, cfg.frame_ms);
+    if (!cfg.enabled) {
+        log_warn("[general] enable=0 —— mod 已按配置停用, 后面什么都不会做");
+    }
     return cfg;
 }
 
@@ -302,7 +444,8 @@ bool write_default_config(const std::string& ini_path) {
     }
 
     // 用 WritePrivateProfileStringA 逐键写 —— 这样注释虽然会丢, 但格式一定
-    // 是 Windows 认的。真正带注释的模板由 tools/ 部署脚本铺。
+    // 是 Windows 认的。带注释的权威模板在 tools/DGLab_IDAC.ini.template
+    // (含通道对应关系与每个数值的含义), 要改配置请从它拷。
     // 这里只保证"能跑起来"。
     auto w = [&](const char* sec, const char* key, const char* val) {
         ::WritePrivateProfileStringA(sec, key, val, ini_path.c_str());
@@ -319,6 +462,28 @@ bool write_default_config(const std::string& ini_path) {
     w("output", "pulse_freq_base", "30");
     w("output", "pulse_freq_min", "10");
     w("output", "pulse_freq_max", "60");
+    // 自动增益: 力反馈原始值的实际范围随车/赛道/工况变化很大, 用动态峰值
+    // 当归一化上界, 幅值才能铺满 0..1。关闭时退回各通道自己的 in_max。
+    w("output", "auto_gain", "1");
+    w("output", "gain_attack_sec", "0.7");
+    w("output", "gain_release_sec", "8.0");
+    w("output", "gain_floor", "24");
+    w("output", "gain_ceiling", "127");
+    w("output", "gain_idle_reset_sec", "3.0");
+    // 通道对应关系: A = 郊狼主机 A 通道(左侧电极), B = B 通道(右侧电极)。
+    // 每个通道的 source 决定它接哪个游戏数据:
+    //   torque    方向盘回正扭矩的幅值(= abs(游戏扭矩), 域 0..127), 实测最活跃。
+    //             左转与右转都输出力, 但取的是幅值, 本程序不区分左右。
+    //   viscosity 转向阻尼, 几乎全程有值
+    //   vibration 振动/路肩, 只在事件发生时给一次
+    //   static    恒定输出, 不看游戏数据
+    // 另有 torque_signed(按 direction 恢复符号): 逆向证实该参数是齿轮/档位索引
+    // (域 0..255), 不是左右方向, 当前不要用 —— 见 re/indrun_hook_mechanics.md 4.1/5。
+    // 建议 A 用 torque 或 viscosity。
+    // 字段范围: enable 0/1; map_mode {abs_linear,linear,abs_sqrt,sqrt};
+    // in_min 0~200; in_max 1~200(auto_gain=1 时只当启动初值);
+    // level 0.0~1.0; base_strength 0~200(再受 [safety] max_strength 钳制);
+    // strength_source {static,level}; level 模式下 strength_margin 为 0.0~1.0。
     w("channel_a", "enable", "1");
     w("channel_a", "source", "torque");
     w("channel_a", "map_mode", "abs_linear");
@@ -326,21 +491,34 @@ bool write_default_config(const std::string& ini_path) {
     w("channel_a", "in_max", "127");
     w("channel_a", "level", "1.0");
     w("channel_a", "base_strength", "40");
+    // static = 强度恒为 base_strength, 游戏动态全部体现在脉冲振幅上(推荐);
+    // level  = 强度跟着映射值走(旧行为, 做 A/B 用)。
+    w("channel_a", "strength_source", "static");
     w("channel_b", "enable", "1");
+    // B 当前接 vibration, 它是事件型信号: 只在压路肩/碰撞等判定发生时给一次
+    // 短促输出, 其余时间安静。希望 B 也有持续可感的东西就改成 viscosity。
+    // 想分辨"是哪个通道在动", 让两个通道 base_strength 不同即可。
     w("channel_b", "source", "vibration");
     w("channel_b", "map_mode", "abs_linear");
     w("channel_b", "in_min", "0");
     w("channel_b", "in_max", "127");
     w("channel_b", "level", "0.6");
     w("channel_b", "base_strength", "30");
+    w("channel_b", "strength_source", "static");
     w("safety", "max_strength", "40");
     w("safety", "clamp_strength", "40");
     w("safety", "slew_per_second", "40");
+    // ★ watchdog_ms 目前未实现, 配了不生效 —— 没有任何代码读它。
+    // 参见 src/config.hpp 的说明; 别把它当安全保证。
     w("safety", "watchdog_ms", "500");
     w("safety", "zero_when_servo_off", "1");
     w("safety", "warmup_ms", "1500");
+    // dry_run=1 是硬开关: 不管 [link] mode 写什么, 一律走空输出, 绝不碰设备。
+    // 想真实输出必须显式改成 0 —— 别把"干跑"和"接真机"混在一次改动里。
     w("safety", "dry_run", "1");
-
+    // [debug] hook=0 是排障开关: 关掉 IndRun.dll 挂钩, 只留日志与管线。
+    // 崩溃时先试这个 —— 不崩就说明问题在挂钩, 还崩就说明在别处。
+    w("debug", "hook", "1");
     log_info("已写出默认配置: %s", ini_path.c_str());
     return true;
 }

@@ -24,6 +24,8 @@
 //   而不是随机崩溃。
 // ---------------------------------------------------------------------------
 #include <Mod/CppUserModBase.hpp>
+#include <DynamicOutput/DynamicOutput.hpp>
+#include <DynamicOutput/OutputDevice.hpp>
 
 #include <windows.h>
 #include <psapi.h>   // EnumProcessModules / GetModuleBaseNameA
@@ -33,15 +35,34 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <thread>
 
+#include "bisect_logger.hpp"
 #include "config.hpp"
 #include "logger.hpp"
 #include "pipeline.hpp"
 #include "source/indrun_hook_source.hpp"
 #include "transport/transport.hpp"
+
+// ===========================================================================
+// DllMain —— 整个 mod 里最早能跑我们自己代码的地方
+//
+// 只做一件事: 注册 Vectored Exception Handler。这样无论后面在哪一步崩,
+// 我们都能把**原始异常记录**先写进 bisect.log, 而不是只能看 LocalRadio 那个
+// 自己也被踩坏的报告器吐出来的假地址 (它报的 0x6575 / 0x6700610069 其实是
+// UTF-16 字符串 "ue" / "gai", 即 CPU 在执行数据 —— 那是栈被踩坏的产物)。
+//
+// 不做任何其它事: DllMain 里持有 loader lock, 分配内存/建线程都可能死锁。
+// ===========================================================================
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        dglab_idac::bisect_install_veh();
+    }
+    return TRUE;
+}
 
 namespace dglab_idac {
 namespace {
@@ -59,6 +80,57 @@ constexpr double kProbeDetailSeconds = 10.0;   // 前 10 秒每次都打原始�
 double now_seconds() {
     using clock = std::chrono::steady_clock;
     return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
+// ---------------------------------------------------------------------------
+// 启动分级 (bisect)
+//
+// 症状: 禁用本 mod -> 游戏一路跑完正常退出; 启用 -> UE4SS 初始化早期就
+//       0xC0000005, 而且 LocalRadio 的报告器给出的 fault 地址是字符串数据。
+// 也就是**我们做的某件具体的事**把 UE4SS 的状态踩坏了。
+//
+// 所以把 on_program_start() 拆成可以逐级打开的阶梯, 用 bisect.txt 里的
+// 一个数字控制。这样不用反复重编译就能定位到"从哪一级开始崩"。
+//
+//    0  = 什么都不做 (只写检查点), 验证"光加载这个 DLL"是否安全
+//    1  = 只用我们自己的 bisect 日志
+//    2  = 额外调一次 UE4SS 的 Output::send (验证跨 DLL 的日志设施)
+//    3  = 额外开 logger.cpp 的文件日志 (验证 fwrite/路径推导)
+//    4  = 额外读/写 INI 配置 (验证 GetPrivateProfile*)
+//    5  = 额外起一个什么都不做的后台线程 (验证 std::thread)
+//   10  = 加传输层 (干跑 NullTransport)
+//   11  = 全部打开 (挂钩 + 传输 + 管线线程)
+//
+// 改法: 编辑 <mod>\dlls\bisect.txt, 里面只写一个数字。
+// 不想分级调试就把 bisect.txt 删掉 —— 缺省按全开(kStageFull)跑, 不是按 0 跑。
+// ---------------------------------------------------------------------------
+constexpr int kStageFull = 11;
+
+int read_bisect_stage() {
+    // 先看环境变量 (调试时更方便), 再看文件。
+    if (const char* e = std::getenv("DGLAB_BISECT_STAGE")) {
+        return std::atoi(e);
+    }
+
+    // 文件在 DLL 自己的目录里, 跟 bisect.log / DGLab_IDAC.ini 放一起。
+    // 路径由 DLL 地址反查, 不依赖工作目录。
+    HMODULE self = nullptr;
+    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCWSTR>(&read_bisect_stage), &self)) {
+        return -1;
+    }
+    wchar_t path[MAX_PATH]{};
+    if (!::GetModuleFileNameW(self, path, MAX_PATH)) return -1;
+    if (wchar_t* slash = wcsrchr(path, L'\\')) *(slash + 1) = L'\0';
+    wcscat_s(path, L"bisect.txt");
+
+    FILE* f = nullptr;
+    if (::_wfopen_s(&f, path, L"rb") != 0 || !f) return -1;
+    char buf[64]{};
+    fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    return std::atoi(buf);
 }
 
 }  // namespace
@@ -93,76 +165,154 @@ public:
     }
 
     auto on_program_start() -> void override {
-        // ---- 日志先起来, 后面所有失败都要能看到 ----
-        // 路径不写死: UE4SS 的工作目录随启动方式变, 所以按 DLL 位置推导。
+        // ===================================================================
+        // 分级启动 —— 每跨一级都写一条检查点, 崩溃时 bisect.log 的最后一条
+        // 就是"已经成功走到了这一步"。
+        //
+        // 全部包在 try/catch 里: 这个函数跑在 UE4SS 的初始化路径上, 任何
+        // 异常逃出去都会连带毁掉整个初始化流程。
+        // ===================================================================
+        try {
+            start_staged();
+        } catch (const std::exception& e) {
+            dglab_idac::bisect_note("!!! on_program_start 抛异常: %s", e.what());
+        } catch (...) {
+            dglab_idac::bisect_note("!!! on_program_start 抛了未知异常");
+        }
+        dglab_idac::bisect_note("ZZ  on_program_start 返回 (stage=%d)", stage_);
+    }
+
+private:
+    void start_staged() {
+        const int stage_raw = dglab_idac::read_bisect_stage();
+        dglab_idac::bisect_init();
+
+        // ★ 缺省即全开, **不能**缺省即"什么都不做"。
+        //
+        // 2026-10-17 踩的坑: bisect.txt 被当成日志文件一起归档掉了, 于是
+        // read_bisect_stage() 返回 0, mod 加载成功、检查点齐全、零崩溃 ——
+        // 却什么都初始化了(transport_ 根本没建), 整轮真机测试白跑。
+        // 静默降级成"不工作"是最坏的默认值: 表面上一切正常, 没有任何报错。
+        // 所以文件/环境变量都不在时, 明确按全开跑, 并在两个日志里各留一条。
+        if (stage_raw < 0) {
+            stage_ = kStageFull;
+            stage_inferred_ = true;
+            dglab_idac::bisect_note("!!  没有找到 bisect.txt / DGLAB_BISECT_STAGE, "
+                                    "按全开运行 (stage=%d)", stage_);
+        } else {
+            stage_ = stage_raw;
+        }
+
+        dglab_idac::bisect_note("A0  进入 on_program_start, stage=%d", stage_);
+        dglab_idac::bisect_note("A0  bisect.log = %s", dglab_idac::bisect_log_path());
+
         const std::string ini = dglab_idac::resolve_config_path();
+        dglab_idac::bisect_note("A1  resolve_config_path -> %s", ini.c_str());
+
+        if (stage_ < 1) {
+            dglab_idac::bisect_note("A9  stage<1: 什么都不做, 直接返回");
+            return;
+        }
+
+        // ---- stage>=1: 我们自己的文件日志 ----
         dglab_idac::log_init();
-        dglab_idac::log_info("==== DGLab_IDAC %s 启动 ====", "0.1.0");
+        // 这条要等 log_init() 之后才能写 —— 之前调 log_* 时文件还没打开,
+        // 消息会被直接丢掉(见 logger.cpp 的 emit(): g_file 为空就 no-op)。
+        if (stage_inferred_) {
+            dglab_idac::log_warn("没有找到 bisect.txt / DGLAB_BISECT_STAGE —— 按全开运行 "
+                                 "(stage=%d)。想分级调试就放一个只写数字的 bisect.txt。",
+                                 stage_);
+        }
+        dglab_idac::bisect_note("A2  logger.cpp 文件日志已开");
+
+        if (stage_ < 2) { dglab_idac::bisect_note("A9  stage<2: 到此为止"); return; }
+
+        // ---- stage>=2: 跨 DLL 调一次 UE4SS 自己的日志设施 ----
+        // 这一步验证的是"从我们的 DLL 调进 UE4SS.dll 导出的 Output::send"
+        // 是否安全。C++ mod 的 ABI 隐患主要就在这里。
+        RC::Output::send<RC::LogLevel::Normal>(
+            STR("[DGLab_IDAC] bisect stage=%d, 正在验证跨 DLL 日志调用\n"), stage_);
+        dglab_idac::bisect_note("A3  UE4SS Output::send 调用成功");
+
+        if (stage_ < 3) { dglab_idac::bisect_note("A9  stage<3: 到此为止"); return; }
+
+        dglab_idac::log_info("==== DGLab_IDAC %s 启动 (bisect stage=%d) ====", "0.1.0", stage_);
         dglab_idac::log_info("日志文件: %s", dglab_idac::log_path());
         dglab_idac::log_info("配置文件: %s", ini.c_str());
+        dglab_idac::bisect_note("A4  logger 头几行已写");
 
-        // ---- 配置 ----
+        if (stage_ < 4) { dglab_idac::bisect_note("A9  stage<4: 到此为止"); return; }
+
+        // ---- stage>=4: INI 读写 ----
         if (ini.empty()) {
             dglab_idac::log_warn("无法推导配置路径, 全部使用内置默认值");
         } else if (::GetFileAttributesA(ini.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            // 首次运行: 铺一份能跑的默认配置, 然后照默认值跑
             dglab_idac::write_default_config(ini);
+            dglab_idac::bisect_note("A5  写了一份默认配置");
         }
         cfg_ = dglab_idac::load_config(ini);
+        dglab_idac::bisect_note("A6  配置读完: enable=%d hook=%d link=%s dry_run=%d",
+                                cfg_.enabled ? 1 : 0, cfg_.hook ? 1 : 0,
+                                dglab_idac::to_string(cfg_.link), cfg_.dry_run ? 1 : 0);
         dglab_idac::log_info("配置: enable=%d verbose=%d link=%s protocol=%s dry_run=%d",
                              cfg_.enabled ? 1 : 0, cfg_.verbose ? 1 : 0,
                              dglab_idac::to_string(cfg_.link),
                              dglab_idac::to_string(cfg_.protocol),
                              cfg_.dry_run ? 1 : 0);
-        dglab_idac::log_info("安全: max_strength=%d clamp_strength=%d slew=%.1f/s "
-                             "watchdog=%dms warmup=%dms",
-                             cfg_.max_strength, cfg_.clamp_strength, cfg_.slew_per_second,
-                             cfg_.watchdog_ms, cfg_.warmup_ms);
-        dglab_idac::log_info("通道A: source=%s %s in=[%d,%d] level=%.2f base=%d",
-                             cfg_.channel_a.source.c_str(),
-                             dglab_idac::to_string(cfg_.channel_a.mode),
-                             cfg_.channel_a.in_min, cfg_.channel_a.in_max,
-                             cfg_.channel_a.level, cfg_.channel_a.base_strength);
-        dglab_idac::log_info("通道B: source=%s %s in=[%d,%d] level=%.2f base=%d",
-                             cfg_.channel_b.source.c_str(),
-                             dglab_idac::to_string(cfg_.channel_b.mode),
-                             cfg_.channel_b.in_min, cfg_.channel_b.in_max,
-                             cfg_.channel_b.level, cfg_.channel_b.base_strength);
 
-        if (!cfg_.enabled) {
-            dglab_idac::log_warn("[general] enable=0 —— 不挂任何 hook, mod 空转");
-            return;
+        if (stage_ < 5) { dglab_idac::bisect_note("A9  stage<5: 到此为止"); return; }
+
+        // ---- stage>=10: 传输层 (必须在启动后台线程之前!) ----
+        //
+        // ⚠ 顺序很关键。2026-10-16 在这里踩过一次坑:
+        //   原先的次序是 [起线程] -> [建传输层] -> [建 source_]。
+        //   而 thread_main() 开头有一句 `if (!source_) break;`, 工作线程
+        //   在 source_ 被赋值之前(实测早 15ms)就检查了它, 于是整个循环
+        //   直接跳出 —— install() 一次都没被调用过, 日志表现为
+        //   `hooks=FAIL base=0` 但模块清单里 IndRun.dll 明明在。
+        //   现在改成"启动阶段需要的对象全部建好, 最后一步才起线程"。
+        if (stage_ >= 10) {
+            transport_ = dglab_idac::create_transport(cfg_);
+            if (transport_ && !transport_->start()) {
+                dglab_idac::log_error("传输启动失败, 降级到空输出");
+                dglab_idac::destroy_transport(transport_);
+                transport_ = nullptr;
+            }
+            dglab_idac::bisect_note("A8  传输层就绪: %s", transport_ ? transport_->name() : "none");
         }
 
-        // ---- 力反馈源: 挂 IndRun.dll ----
-        source_ = std::make_unique<dglab_idac::IndRunHookSource>();
-        if (!source_->install()) {
-            // 挂不上不代表世界末日 —— IndRun.dll 可能还没被 UE4 加载。
-            // 交给线程里重试, 而不是在这里失败退出(退出就没人再试了)。
-            dglab_idac::log_warn("首次挂钩失败, 后台线程会继续重试");
-        } else {
-            dglab_idac::log_info("力反馈源就绪: %s", source_->status_report().c_str());
+        // ---- stage>=11: 挂钩源 (同样必须在起线程之前) ----
+        // ★ 这里只是"建对象", 绝不在本函数里做任何等待 ★
+        //
+        // 血的教训: on_program_start() 跑在**游戏主线程**上。上一版在 install()
+        // 里放了一句 wait_for_module(15000) —— 主线程被硬等 15 秒, 游戏看门狗
+        // 超时、UE4SS 自己的初始化卡死, 最后整个进程 0xC0000005 崩掉。
+        // 挂钩(包括那句 15 秒等待)是后台线程的事, 主线程一步都不能停。
+        if (stage_ >= 11) {
+            if (cfg_.hook) {
+                source_ = std::make_unique<dglab_idac::IndRunHookSource>();
+            } else {
+                dglab_idac::log_warn("[debug] hook=0 —— 故意不挂 IndRun.dll（诊断用）");
+            }
+            pipeline_ = std::make_unique<dglab_idac::Pipeline>(cfg_);
+            dglab_idac::bisect_note("A9  stage=11 全部就绪, 即将起线程");
         }
 
-        // ---- 传输 ----
-        transport_ = dglab_idac::create_transport(cfg_);
-        if (transport_ && !transport_->start()) {
-            dglab_idac::log_error("传输启动失败, 降级到空输出");
-            dglab_idac::destroy_transport(transport_);
-            transport_ = nullptr;
-        }
-
-        // ---- 管线 ----
-        pipeline_ = std::make_unique<dglab_idac::Pipeline>(cfg_);
-
+        // ---- stage>=5: 后台线程 (整个启动流程的最后一步) ----
         running_ = true;
         worker_ = std::thread([this] { thread_main(); });
+        dglab_idac::bisect_note("A7  后台线程已创建");
 
-        dglab_idac::log_info("已启动。输出=干跑(%s) 探头日志=%s",
+        if (stage_ < 10) { dglab_idac::bisect_note("A9  stage<10: 到此为止"); return; }
+        if (stage_ < 11) { dglab_idac::bisect_note("A9  stage<11: 到此为止"); return; }
+
+        dglab_idac::log_info("已启动。输出=%s  真实输出=%s",
                              transport_ ? transport_->name() : "none",
-                             cfg_.dry_run ? "on" : "off");
+                             cfg_.dry_run ? "否(dry_run=1 硬开关)" : "是");
         dglab_idac::log_info("提示: 进游戏后方向盘一动, 日志里就该出现 torque/vibration 计数增长");
     }
+
+public:
 
     auto on_unreal_init() -> void override {
         dglab_idac::log_info("on_unreal_init: UE4 引擎已就绪");
@@ -176,7 +326,12 @@ public:
     // 所以即使前面 10 秒的重试窗口错过了, 这里还能补挂上。
     // -----------------------------------------------------------------------
     auto on_dll_load(std::wstring_view dll_name) -> void override {
-        // 只在还没挂上、且名字里带 "indrun" 时才做事(不区分大小写)。
+        // ★ 这里**只举手, 不干活** ★
+        //
+        // on_dll_load 是从 UE4SS 的 LoadLibrary 钩子里回调出来的 —— 那一刻
+        // 进程正握着 loader lock。在这种情况下调 MinHook、建线程、或任何
+        // 分配内存的操作都可能死锁或崩掉。所以这里只置一个标志位, 真正的
+        // 挂钩交给后台线程在 loader lock 释放之后去做。
         if (!source_ || source_->installed()) return;
 
         auto lower = [](wchar_t c) -> wchar_t {
@@ -195,10 +350,7 @@ public:
         }
         if (!is_indrun) return;
 
-        dglab_idac::log_info("on_dll_load: 看到 IndRun, 尝试补挂");
-        if (source_->install()) {
-            dglab_idac::log_info("补挂成功: %s", source_->status_report().c_str());
-        }
+        indrun_seen_ = true;   // 后台线程会看到并接手
     }
 
     auto on_update() -> void override {
@@ -217,20 +369,67 @@ private:
     void thread_main() {
         using clock = std::chrono::steady_clock;
 
-        // 给 IndRun.dll 一点加载时间 —— 它是 UE4 插件, 可能晚于本 mod 加载。
-        for (int i = 0; i < 100 && running_; ++i) {
-            if (source_ && source_->installed()) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            if (source_ && !source_->installed()) {
-                if (source_->install()) {
-                    dglab_idac::log_info("延迟挂钩成功: %s", source_->status_report().c_str());
-                }
+        // -------------------------------------------------------------------
+        // [bisect stage 5] 轻量线程存活测试
+        //
+        // 为什么需要这一段: stage 5 以下 source_ 还是空的, 直接走下面的循环会
+        // 立刻 break —— 那样"stage 5 通过"其实什么都没验证, 白跑一次游戏。
+        //
+        // 这里真的让线程活几秒: 打心跳、sleep、再打心跳, 覆盖
+        //   * std::thread 能正常起
+        //   * <chrono> sleep_for 正常
+        //   * 跨线程调用 bisect_note()/log_info() 不炸
+        //    * running_ 置 false 后线程能自然退出、join 不卡
+        // 只读 running_, 不碰任何游戏/UE4SS 对象, 所以不会引入新的崩溃面。
+        // -------------------------------------------------------------------
+        if (stage_ == 5) {
+            dglab_idac::bisect_note("B0  后台线程启动, 本线程 tid=%lu",
+                                    static_cast<unsigned long>(::GetCurrentThreadId()));
+            for (int i = 0; i < 5 && running_; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                if (!running_) break;
+                dglab_idac::bisect_note("B1  心跳 %d/5 (tid=%lu)", i + 1,
+                                        static_cast<unsigned long>(::GetCurrentThreadId()));
             }
+            dglab_idac::bisect_note("B2  线程存活测试结束 (running_=%d)", running_ ? 1 : 0);
+            return;
+        }
+
+        // -------------------------------------------------------------------
+        // 等 IndRun.dll 出现 —— **只在这个后台线程里等**
+        //
+        // IndRun.dll 是 UE4 插件, 加载得比本 mod 晚。上一版把这个等待放在
+        // on_program_start()(游戏主线程)里, 直接等崩了整个进程。
+        //
+        // 现在: 本线程自查 GetModuleHandleW, 看到模块才调 install(); install()
+        // 自己那句 15 秒等待因此几乎不会真的用满。整个过程中游戏主线程没有任何
+        // 阻塞, UE4SS 的启动流程也不会被拖住。
+        // -------------------------------------------------------------------
+        for (int i = 0; i < 300 && running_; ++i) {
+            if (!source_) break;                       // [debug] hook=0 或已放弃
+            if (source_->installed()) break;
+            // on_dll_load 举了旗, 或者模块已经在了 —— 两种都算"可以挂了"
+            if (indrun_seen_ || ::GetModuleHandleW(L"IndRun.dll")) {
+                if (source_->install()) {
+                    dglab_idac::log_info("力反馈源就绪: %s", source_->status_report().c_str());
+                    dglab_idac::bisect_note("H1  挂钩成功: %s",
+                                            source_->status_report().c_str());
+                    break;
+                }
+                // install() 失败(例如特征码不匹配)时不要死循环重试:
+                // 换个构建的 IndRun.dll 不会因为我们多试几次就变得匹配。
+                dglab_idac::bisect_note("H1  挂钩失败: %s",
+                                        source_->status_report().c_str());
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         // 还是没挂上? 把进程里所有模块名倒出来, 免得只能靠猜。
         // UE4 插件不一定叫 IndRun.dll —— 名字一变, 特征码校验也救不了。
-        if (source_ && !source_->installed()) {
+        if (!source_) {
+            // [debug] hook=0 —— 用户故意关掉挂钩做 A/B 对照
+        } else if (!source_->installed()) {
             dglab_idac::log_error("重试窗口结束仍未挂上 IndRun.dll —— 已加载模块清单:");
             HMODULE mods[512];
             DWORD needed = 0;
@@ -297,7 +496,8 @@ private:
                     const dglab_idac::FfbState s = source_->snapshot();
                     dglab_idac::log_info(
                         "[hb] t=%.0fs frames=%llu | torque=%llu mag[%d..%d] dir[%d..%d] | "
-                        "visc=%llu b[%d..%d] | vib=%llu b[%d..%d] | servo on/off=%llu/%llu=%d | %s",
+                        "visc=%llu b[%d..%d] | vib=%llu b[%d..%d] | servo on/off=%llu/%llu=%d | "
+                        "%s | %s",
                         t - start_time,
                         static_cast<unsigned long long>(frames),
                         static_cast<unsigned long long>(s.torque_calls),
@@ -314,7 +514,8 @@ private:
                         static_cast<unsigned long long>(s.servo_on_calls),
                         static_cast<unsigned long long>(s.servo_off_calls),
                         s.servo_on ? 1 : 0,
-                        source_->status_report().c_str());
+                        source_->status_report().c_str(),
+                        pipeline_ ? pipeline_->gain_summary().c_str() : "pipeline=null");
 
                     // 明确告警: 挂了 hook 但一次回调都没有 —— 说明要么还没进
                     // 游戏, 要么力反馈通路在 mode=xinput 下根本不走。
@@ -360,11 +561,15 @@ private:
     }
 
     dglab_idac::Config cfg_{};
+    int stage_ = 0;                        // bisect 分级, 见 read_bisect_stage()
+    bool stage_inferred_ = false;          // stage 不是从 bisect.txt 读来的, 而是缺省补的
     std::unique_ptr<dglab_idac::IndRunHookSource> source_;
     std::unique_ptr<dglab_idac::Pipeline> pipeline_;
     dglab_idac::ITransport* transport_ = nullptr;
 
     std::atomic<bool> running_{false};
+    // on_dll_load 里只置这个标志, 由后台线程接手挂钩（loader lock 里不能挂钩）
+    std::atomic<bool> indrun_seen_{false};
     std::thread worker_;
     std::atomic<uint64_t> game_ticks_{0};
 };

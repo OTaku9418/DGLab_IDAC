@@ -124,6 +124,7 @@ using ABI::Windows::Devices::Bluetooth::Advertisement::IBluetoothLEAdvertisement
 using ABI::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristic;
 using ABI::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristicsResult;
 using ABI::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCommunicationStatus;
+using ABI::Windows::Devices::Bluetooth::GenericAttributeProfile::GattClientCharacteristicConfigurationDescriptorValue;
 using ABI::Windows::Devices::Bluetooth::GenericAttributeProfile::GattDeviceService;
 using ABI::Windows::Devices::Bluetooth::GenericAttributeProfile::GattDeviceServicesResult;
 using ABI::Windows::Devices::Bluetooth::GenericAttributeProfile::GattValueChangedEventArgs;
@@ -190,8 +191,18 @@ std::wstring utf8_to_wide(const std::string& s) {
 // 需要激活的运行时类。
 bool parse_guid(const std::string& s, GUID* out) {
     if (s.empty() || out == nullptr) return false;
-    const std::wstring w = utf8_to_wide(s);
+    std::wstring w = utf8_to_wide(s);
     if (w.empty()) return false;
+
+    // IIDFromString 要求串带花括号: 不带时它返回 E_INVALIDARG(0x80070057),
+    // 而不是像大家以为的那样容忍裸 UUID。我们的协议默认值都是裸的, 所以这里
+    // 自己补一对 —— 两种写法都接受。
+    // (踩过: 这一条让 create_ble_transport 从写下来那天起就一直返回 nullptr,
+    //  BLE 从来没真正跑起来过, 而且报错文案把锅推给了"配置里的 UUID 不合法"。)
+    if (w.front() != L'{') {
+        w.insert(w.begin(), L'{');
+        w.push_back(L'}');
+    }
     return SUCCEEDED(::IIDFromString(w.c_str(), out));
 }
 
@@ -207,6 +218,34 @@ HRESULT activate_factory(const wchar_t* runtime_class, REFIID iid, void** out) {
 
     hr = ::RoGetActivationFactory(h, iid, out);
     ::WindowsDeleteString(h);
+    return hr;
+}
+
+// 激活一个普通实例类(有构造函数), 然后 QI 到目标接口。
+//
+// 为什么需要这个而不是 activate_factory: 对
+// BluetoothLEAdvertisementWatcher 这类"普通实例类", RoGetActivationFactory
+// 直接要实例接口会返回 E_NOINTERFACE(0x80004002) —— 实测如此, 即使该类在
+// 本机完全可用、RoActivateInstance 一秒就成功。原因是激活工厂那层只保证
+// 暴露静态接口, 实例接口要通过实例去 QI。
+//
+// 踩过: 可用性探测(probe_winrt_ble_once)当初就卡在这里, 于是本机明明有蓝牙、
+// Watcher 明明能建, 却被判成"本机 WinRT BLE 不可用", 传输层直接不给创建。
+HRESULT activate_instance_and_qi(const wchar_t* runtime_class, REFIID iid, void** out) {
+    if (runtime_class == nullptr || out == nullptr) return E_POINTER;
+    *out = nullptr;
+
+    HSTRING h = nullptr;
+    HRESULT hr = ::WindowsCreateString(runtime_class, static_cast<UINT32>(std::wcslen(runtime_class)), &h);
+    if (FAILED(hr) || h == nullptr) return FAILED(hr) ? hr : E_FAIL;
+
+    IInspectable* inst = nullptr;
+    hr = ::RoActivateInstance(h, &inst);
+    ::WindowsDeleteString(h);
+    if (FAILED(hr) || inst == nullptr) return FAILED(hr) ? hr : E_FAIL;
+
+    hr = inst->QueryInterface(iid, out);
+    inst->Release();
     return hr;
 }
 // "静默帧": 全 0 强度 + 10 频率。绝不发未初始化的字节。
@@ -271,6 +310,9 @@ struct SharedState {
     uint16_t acked_mask = 0;  // 位 i = 收到过 seq==i 的应答
     int acked_a = -1;
     int acked_b = -1;
+    // 收到过、但不像 B1 的通知条数。用来区分"设备没应"和"设备应了我们没认出来" ——
+    // 只看 B1 计数的话这两种情况在日志里长得一模一样。
+    uint32_t other_notify_count = 0;
 
     // ---- 链路 ----
     std::atomic<bool> link_down{false};
@@ -322,6 +364,32 @@ HRESULT await_operation(IAsyncOperation<TResultLogical>* op, DWORD timeout_ms, T
     return hr;
 }
 
+// 同步写一次 CCCD(0x2902), 也就是真正意义上的"订阅通知"。
+//
+// 为什么单独抽出来: notify_char_->add_ValueChanged() 只挂本地回调, 设备侧
+// 一无所知。少了这一步, B0 全部写得成功、强度也真的会变, 但 B1 一条都收不到。
+//
+// 为什么要同步等: 异步发出去就走, 会在 CCCD 尚未写入时开始发 B0。CCCD 没生效
+// 的那几十毫秒里设备不会回 B1, 于是握手从第一帧就错位。
+HRESULT write_cccd_sync(IGattCharacteristic* ch, GattClientCharacteristicConfigurationDescriptorValue v) {
+    if (ch == nullptr) return E_POINTER;
+
+    Microsoft::WRL::ComPtr<IAsyncOperation<GattCommunicationStatus>> op;
+    const HRESULT hr = ch->WriteClientCharacteristicConfigurationDescriptorAsync(
+        v, op.ReleaseAndGetAddressOf());
+    if (FAILED(hr) || !op) return FAILED(hr) ? hr : E_FAIL;
+
+    GattCommunicationStatus status = GattCommunicationStatus_Unreachable;
+    const HRESULT hr_wait = await_operation(op.Get(), 5000, &status);
+    if (FAILED(hr_wait)) return hr_wait;
+    if (status != GattCommunicationStatus_Success) {
+        // Unreachable / ProtocolError / AccessDenied 都归成一个 HRESULT,
+        // 让调用方能靠 HRESULT 判断并降级到 Indicate。
+        return E_FAIL;
+    }
+    return S_OK;
+}
+
 // 一次性的"本机有没有 WinRT BLE"探测。必须在自己起的线程上做 ——
 // 绝不能在调用方(游戏)线程上初始化套间。
 HRESULT probe_winrt_ble_once() {
@@ -341,7 +409,7 @@ HRESULT probe_winrt_ble_once() {
     }
 
     Microsoft::WRL::ComPtr<IBluetoothLEAdvertisementWatcher> watcher;
-    const HRESULT hr = activate_factory(
+    const HRESULT hr = activate_instance_and_qi(
         RuntimeClass_Windows_Devices_Bluetooth_Advertisement_BluetoothLEAdvertisementWatcher,
         IID_PPV_ARGS(watcher.ReleaseAndGetAddressOf()));
     watcher.Reset();
@@ -442,6 +510,8 @@ private:
     int actual_b_ = -1;
     uint64_t seen_b1_ = 0;
     bool bf_sent_ = false;
+    bool mode_semantics_logged_ = false;   // 一次性线上语义自证, 见发送循环里的说明
+    bool first_frame_dumped_ = false;      // 一次性把首条改强度的 B0 原始字节打出来
 };
 
 // ---------------------------------------------------------------------------
@@ -545,9 +615,16 @@ void BleWinRtTransport::submit(const Frame& f) {
 
 std::string BleWinRtTransport::status() const {
     std::lock_guard<std::mutex> lk(stat_mu_);
-    char buf[256]{};
-    std::snprintf(buf, sizeof(buf), "BLE state=%s rssi=%d writes=%llu errors=%llu", state_.c_str(), last_rssi_,
-                  static_cast<unsigned long long>(writes_), static_cast<unsigned long long>(errors_));
+    char buf[320]{};
+    // 把 B1 计数放进 status: "设备到底会不会发 B1" 是判链路语义的关键问题,
+    // 而它只能靠这个数字回答 —— 只写日志的话得等跑完翻文件才能看见。
+    const uint64_t b1c = shared_ ? shared_->b1_count : 0;
+    const int b1a = shared_ ? shared_->b1_last_a : -1;
+    const int b1b = shared_ ? shared_->b1_last_b : -1;
+    std::snprintf(buf, sizeof(buf),
+                  "BLE state=%s rssi=%d writes=%llu errors=%llu b1=%llu lastA=%d lastB=%d", state_.c_str(),
+                  last_rssi_, static_cast<unsigned long long>(writes_), static_cast<unsigned long long>(errors_),
+                  static_cast<unsigned long long>(b1c), b1a, b1b);
     return std::string(buf);
 }
 
@@ -702,8 +779,9 @@ void BleWinRtTransport::worker_entry() {
                         inflight_frames_ = 0;
                     }
 
-                    StrengthMode mode_a = StrengthMode::Discard;
-                    StrengthMode mode_b = StrengthMode::Discard;
+                    // 默认不改强度(0b00): 本帧只是想刷脉冲波形, 不想动设备强度
+                    StrengthMode mode_a = StrengthMode::Unchanged;
+                    StrengthMode mode_b = StrengthMode::Unchanged;
                     uint8_t seq = 0;
                     uint8_t sent_a = static_cast<uint8_t>(-1);
                     uint8_t sent_b = static_cast<uint8_t>(-1);
@@ -725,6 +803,28 @@ void BleWinRtTransport::worker_entry() {
                     bool valid_b = false;
                     const B0 cmd = encode_b0(f, mode_a, mode_b, seq, &valid_a, &valid_b);
 
+                    // --- 一次性"线上语义自证" ---
+                    // 强度模式的位语义曾经整个反过来(Absolute 写成 0b00), 后果是
+                    // 设备完全不动, 而本地一切正常、日志全绿 —— 没有任何一处会报错。
+                    // 所以这里在**第一条真正改强度的 B0 上线前**把解出来的模式位打进
+                    // 日志: 以后拿到日志的人能直接看出"绝对设置"到底编成了几。
+                    if (seq != 0 && !mode_semantics_logged_) {
+                        mode_semantics_logged_ = true;
+                        const int ma = (cmd.bytes[1] >> 2) & 0x03;
+                        const int mb = cmd.bytes[1] & 0x03;
+                        log_info("BLE: 线上语义核对 byte[1]=0x%02X -> A模式=0b%02d%s B模式=0b%02d%s | "
+                                 "绝对设置应为 0b11",
+                                 static_cast<unsigned>(cmd.bytes[1]), ma,
+                                 ma == 0x03 ? "(绝对设置)" : "(非绝对!)", mb,
+                                 mb == 0x03 ? "(绝对设置)" : "(非绝对!)");
+                        if (ma != 0x03 && mb != 0x03) {
+                            log_error("BLE: ★ 两条通道都不是绝对设置模式 —— 设备会忽略强度值, "
+                                      "强度永远不会变。检查 StrengthMode 的枚举取值是否与 "
+                                      "re/reference/dglab-bluetooth-protocol/coyote-v3-README.md "
+                                      "一致 (跑 protocol_check.exe)");
+                        }
+                    }
+
                     if (seq != 0 && !valid_a && !valid_b) {
                         // 两个通道都没被真正编码进 B0, 设备不会应答 —— 别干等
                         log_warn("BLE: 第 %u 号强度变更未通过编码校验, 本帧不发强度(A=%d B=%d)",
@@ -734,6 +834,16 @@ void BleWinRtTransport::worker_entry() {
                     } else if (seq != 0) {
                         log_info("BLE: 请求强度 seq=%u A=%d B=%d (当前已知 A=%d B=%d)", static_cast<unsigned>(seq),
                                  sent_a, sent_b, actual_a_, actual_b_);
+                    }
+
+                    // --- 一次性把真正上线的 20 字节打出来 ---
+                    // "设备报了 A=0 B=0" 这种症状光看强度值查不出来: 得看字节。
+                    // 官方 v3 文档里的示例帧是
+                    //   0xB0 0b0000 0b0100 5 0 {10,10,10,10} {0,10,20,30} {0,0,0,0} {0,0,0,101}
+                    // 对着它逐字节比, 比对着"模式=0b11"这种二手结论有用得多。
+                    if (seq != 0 && !first_frame_dumped_) {
+                        first_frame_dumped_ = true;
+                        log_info("BLE: 首帧强度 B0 原始字节 = %s", cmd.to_hex().c_str());
                     }
 
                     const DWORD write_timeout = static_cast<DWORD>(frame_ms_cfg * 2);
@@ -810,9 +920,19 @@ bool BleWinRtTransport::init_apartment() {
 bool BleWinRtTransport::activate_watcher() {
     if (watcher_) return true;
 
-    const HRESULT hr = activate_factory(
+    // 实例类走 RoActivateInstance + QI; 直接用 RoGetActivationFactory 要实例
+    // 接口会拿到 E_NOINTERFACE(实测)。万一这条路径也失败, 退回工厂方式再试
+    // 一次 —— 不同 Windows 版本行为不一致, 两条都留着更稳。
+    HRESULT hr = activate_instance_and_qi(
         RuntimeClass_Windows_Devices_Bluetooth_Advertisement_BluetoothLEAdvertisementWatcher,
         IID_PPV_ARGS(watcher_.ReleaseAndGetAddressOf()));
+    if (FAILED(hr) || !watcher_) {
+        log_warn("BLE: RoActivateInstance 建 Watcher 失败 (HRESULT=0x%08lX), 改试激活工厂",
+                 static_cast<unsigned long>(hr));
+        hr = activate_factory(
+            RuntimeClass_Windows_Devices_Bluetooth_Advertisement_BluetoothLEAdvertisementWatcher,
+            IID_PPV_ARGS(watcher_.ReleaseAndGetAddressOf()));
+    }
     if (FAILED(hr) || !watcher_) {
         log_error("BLE: 激活 IBluetoothLEAdvertisementWatcher 失败 (HRESULT=0x%08lX)", static_cast<unsigned long>(hr));
         return false;
@@ -1172,11 +1292,34 @@ bool BleWinRtTransport::subscribe_notify_and_conn() {
                 if (FAILED(bytes_access->Buffer(&raw)) || raw == nullptr) return S_OK;
 
                 // 需要 4 个字节: [0]=0xB1 [1]=seq [2]=A 实际 [3]=B 实际
-                if (len < 4 || raw[0] != kNotifyB1) return S_OK;
+                if (len < 4 || raw[0] != kNotifyB1) {
+                    // 不是 B1 —— 但绝不静默丢弃。设备如果发的是别的东西,
+                    // 或者干脆什么都没发, 这两种情况必须能区分开, 否则
+                    // "等不到 B1" 这句话既可能是设备没应, 也可能是我们没认出来。
+                    std::lock_guard<std::mutex> lk(st->mu);
+                    ++st->other_notify_count;
+                    if (st->other_notify_count <= 4) {
+                        // 前几条原样记下来, 字节级
+                        char hex[3 * 32 + 1]{};
+                        const UINT32 n = len < 32 ? len : 32;
+                        for (UINT32 i = 0; i < n; ++i) {
+                            std::snprintf(hex + i * 3, 4, "%02X ", raw[i]);
+                        }
+                        log_info("BLE: 收到非 B1 通知 (len=%u): %s", len, hex);
+                    }
+                    return S_OK;
+                }
 
                 const uint8_t seq = raw[1];
                 const int a = static_cast<int>(raw[2]);
                 const int b = static_cast<int>(raw[3]);
+
+                // 前 5 条 B1 把原始字节打出来。"设备报了 A=0" 有两种可能:
+                // 设备真给了 0, 或者我们把 4 个字节认错了位置。不打出字节就分不开。
+                if (st->b1_count < 5) {
+                    log_info("BLE: B1 原始字节 (len=%u): %02X %02X %02X %02X -> seq=%u A=%d B=%d", len, raw[0],
+                             raw[1], raw[2], raw[3], static_cast<unsigned>(seq), a, b);
+                }
 
                 std::lock_guard<std::mutex> lk(st->mu);
                 ++st->b1_count;
@@ -1202,6 +1345,35 @@ bool BleWinRtTransport::subscribe_notify_and_conn() {
         return false;
     }
     notify_token_valid_ = true;
+
+    // ★ 注册本地回调**不等于**订阅。必须再写一次 CCCD(0x2902), 否则设备根本
+    //   不知道要发通知 —— B0 写会成功、强度也会真的变, 但 B1 永远收不到,
+    //   日志上表现成"等了 20 帧仍无 B1 应答", 看上去像设备不应答。
+    //
+    //   踩过: 这一段以前只有 add_ValueChanged, 所以从写下来那天起就没收到过
+    //   任何通知。官方 v3 文档: "Subscribe to this characteristic after
+    //   connecting." —— 那个 subscribe 指的就是写 CCCD。
+    {
+        HRESULT hr_cccd = write_cccd_sync(
+            notify_char_.Get(),
+            ABI::Windows::Devices::Bluetooth::GenericAttributeProfile::
+                GattClientCharacteristicConfigurationDescriptorValue_Notify);
+        if (FAILED(hr_cccd)) {
+            // 有些设备只声明 Indicate。两者都能收到 B1, 差别只在链路层是否要确认。
+            log_warn("BLE: 写 CCCD(Notify) 失败 (HRESULT=0x%08lX), 改试 Indicate",
+                     static_cast<unsigned long>(hr_cccd));
+            hr_cccd = write_cccd_sync(
+                notify_char_.Get(),
+                ABI::Windows::Devices::Bluetooth::GenericAttributeProfile::
+                    GattClientCharacteristicConfigurationDescriptorValue_Indicate);
+        }
+        if (FAILED(hr_cccd)) {
+            log_error("BLE: 订阅 CCCD 失败 (HRESULT=0x%08lX) —— 设备不会发任何通知",
+                      static_cast<unsigned long>(hr_cccd));
+            return false;
+        }
+        log_info("BLE: 已写入 CCCD, 设备侧通知已开启");
+    }
     log_info("BLE: 已订阅通知特征");
 
     // --- 设备连接状态: 掉了就断链 ---
@@ -1364,23 +1536,26 @@ void BleWinRtTransport::teardown_link() {
 // 工厂
 // ---------------------------------------------------------------------------
 ITransport* create_ble_transport(const Config& cfg) {
-    // 1) 配置校验: UUID 解析不了就没必要起线程了
+    // 1) 配置校验: UUID 解析不了就没必要起线程了。
     const std::string svc = cfg.ble_service_uuid.empty() ? std::string(kServiceUuidDefault) : cfg.ble_service_uuid;
     const std::string wr = cfg.ble_write_uuid.empty() ? std::string(kWriteUuidDefault) : cfg.ble_write_uuid;
     const std::string nt = cfg.ble_notify_uuid.empty() ? std::string(kNotifyUuidDefault) : cfg.ble_notify_uuid;
 
+    //    三条都要能定位到具体是哪一个 —— "service_uuid 不合法" 和
+    //    "write_uuid 不合法" 指向完全不同的配置错误。但三个默认值是同一族
+    //    GUID(只有第二段不同), 所以文案还必须把值本身打出来, 否则光看键名
+    //    仍然分不清是"配置写错了"还是"默认值本身解析不了"。
     GUID g{};
-    if (!parse_guid(svc, &g)) {
-        log_error("BLE: [ble] service_uuid 不是合法 GUID: \"%s\"", svc.c_str());
-        return nullptr;
-    }
-    if (!parse_guid(wr, &g)) {
-        log_error("BLE: [ble] write_uuid 不是合法 GUID: \"%s\"", wr.c_str());
-        return nullptr;
-    }
-    if (!parse_guid(nt, &g)) {
-        log_error("BLE: [ble] notify_uuid 不是合法 GUID: \"%s\"", nt.c_str());
-        return nullptr;
+    struct UuidCheck {
+        const char* key;
+        const std::string& value;
+    };
+    const UuidCheck checks[3] = {{"service_uuid", svc}, {"write_uuid", wr}, {"notify_uuid", nt}};
+    for (const UuidCheck& c : checks) {
+        if (!parse_guid(c.value, &g)) {
+            log_error("BLE: [ble] %s 不是合法 GUID: \"%s\"", c.key, c.value.c_str());
+            return nullptr;
+        }
     }
 
     // 2) 本机可用性探测。必须在我们自己起的线程上做 —— 调用方是游戏线程,

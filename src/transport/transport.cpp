@@ -56,9 +56,11 @@ uint8_t hz_to_pulse_value(double hz) {
     } else if (hz <= 1000.0) {
         v = (hz - 600.0) / 10.0 + 200.0;
     } else {
-        return 240;   // 超出定义域, 给最"慢"的那一端(240)而不是 10(最猛)
+        v = 240.0;   // 超出定义域, 给最"慢"的那一端(240)而不是 10(最猛的)
     }
 
+    // 注意钳位两端是不对称的: 高端的 240 是合法的(最慢), 低端的 10 也是
+    // 合法的(最快), 中间任何值都合法。clamp 只是防御 lround 的边界。
     const int i = static_cast<int>(std::lround(v));
     return clamp_u8(i, 10, 240);
 }
@@ -66,11 +68,19 @@ uint8_t hz_to_pulse_value(double hz) {
 // ---------------------------------------------------------------------------
 // B0 编码
 //
-// 模式语义(协议原文):
-//   00 绝对设置   01 相对加   10 相对减   11 不改强度(保留原值)
+// 模式语义(官方文档原文, 见 re/reference/dglab-bluetooth-protocol/
+// coyote-v3-README.md 的 "Intensity Interpretation Mode" 表):
+//   0b00 不变        —— 忽略本通道强度字节, 维持设备当前值
+//   0b01 相对增加
+//   0b10 相对减少
+//   0b11 绝对设置
 //
-// 关键细节: **只有模式不是 11 时, 字节 2/3 才会被解释**。模式为 11 时该
-// 通道的强度值不被使用。所以"不改强度"的帧里字节 2/3 写什么都可以 ——
+// ⚠ 这四行曾经写成 00=绝对/11=不变, 与文档正好相反, 而且枚举也是照这个
+//   反的对应关系写的 —— 于是两个方向一起错, 编译和自检都发现不了, 只有
+//   设备不动作。改这里之前先把官方表格再对一遍。
+//
+// 关键细节: **只有模式不是 0b00 时, 字节 2/3 才会被解释**。模式为 0b00
+// 时该通道的强度值不被使用。所以"不改强度"的帧里字节 2/3 写什么都可以 ——
 // 我们写 0, 但**绝不**指望它等于"强度归零"。这也正是文档里"只输出单通道
 // 时给另一通道塞一个非法值"的做法能成立的原因。
 // ---------------------------------------------------------------------------
@@ -85,15 +95,17 @@ B0 encode_b0(const Frame& f, StrengthMode mode_a, StrengthMode mode_b, uint8_t s
 
     // ---- 强度 ----
     // 强度模式由调用方(传输层的序列号状态机)决定, 这里只负责写值。
-    // servo 未开 / 静音时, 强度必须是精确 0, 且绝不能留在"不改强度"模式。
+    // servo 未开 / 静音 / 强度为 0 时, 强度必须是精确 0, 所以**绝不能留在
+    // "不变"模式** —— 0b00 会让设备忽略强度字节、维持上一个值, 那样静音就
+    // 静不掉(曾经就是这样: 枚举值写反, 于是每次静音都指令被忽略, 设备一直
+    // 停在旧强度上)。
     StrengthMode ma = mode_a;
     StrengthMode mb = mode_b;
     if (f.muted || f.a.strength <= 0) {
-        // 想降到 0 就必须真的写 0; Discard 会让设备保持上一个强度
-        if (ma == StrengthMode::Discard) ma = StrengthMode::Absolute;
+        if (ma == StrengthMode::Unchanged) ma = StrengthMode::Absolute;
     }
     if (f.muted || f.b.strength <= 0) {
-        if (mb == StrengthMode::Discard) mb = StrengthMode::Absolute;
+        if (mb == StrengthMode::Unchanged) mb = StrengthMode::Absolute;
     }
 
     cmd.set_seq(seq4);

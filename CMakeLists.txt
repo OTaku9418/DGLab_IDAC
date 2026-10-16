@@ -61,14 +61,53 @@ if(NOT EXISTS "${UE4SS_DIR}/UE4SS/include/Mod/CppUserModBase.hpp")
 endif()
 
 # 已构建的 UE4SS.dll。链接它而不是重编它。
+#
 # ⚠ 路径一律用正斜杠 —— CMake 里反斜杠是转义字符, "D:\INDAC\..." 里的 \I 会被吞掉。
-set(UE4SS_DLL "D:/INDAC/MODAC321/WindowsNoEditor/GameProject/Binaries/Win64/ue4ss/UE4SS.dll"
-    CACHE FILEPATH "游戏目录里的 UE4SS.dll")
+#
+# 解析顺序(先到先用):
+#   1. -DUE4SS_DLL=<绝对路径>          直接指定, 最高优先级
+#   2. -DDGLAB_DEPLOY_DIR=<...\Mods\DGLab_IDAC>   往上两级就是 ue4ss 目录
+#   3. -DDGLAB_GAME_UE4SS_DIR=<...\ue4ss>
+#   4. 下面那个默认值 —— 只是开发机上的路径, 别的机器上一定不对
+set(DGLAB_GAME_UE4SS_DIR ""
+    CACHE PATH "游戏的 ue4ss 目录(含 UE4SS.dll), 用于推导 UE4SS_DLL")
+
+set(UE4SS_DLL "" CACHE FILEPATH "游戏目录里的 UE4SS.dll(留空则自动推导)")
+
+if(NOT UE4SS_DLL)
+    if(DGLAB_DEPLOY_DIR)
+        cmake_path(GET DGLAB_DEPLOY_DIR PARENT_PATH _mods_dir)
+        cmake_path(GET _mods_dir PARENT_PATH _ue4ss_dir)
+        set(_cand "${_ue4ss_dir}/UE4SS.dll")
+        if(EXISTS "${_cand}")
+            set(UE4SS_DLL "${_cand}")
+        endif()
+    endif()
+endif()
+if(NOT UE4SS_DLL AND DGLAB_GAME_UE4SS_DIR)
+    set(_cand "${DGLAB_GAME_UE4SS_DIR}/UE4SS.dll")
+    if(EXISTS "${_cand}")
+        set(UE4SS_DLL "${_cand}")
+    endif()
+endif()
+if(NOT UE4SS_DLL)
+    # 开发机默认值。别人拿到这个仓库时上面几条都不成立, 会落到这里。
+    set(_dev_default
+        "D:/INDAC/MODAC321/WindowsNoEditor/GameProject/Binaries/Win64/ue4ss/UE4SS.dll")
+    if(EXISTS "${_dev_default}")
+        set(UE4SS_DLL "${_dev_default}")
+    endif()
+endif()
+
 if(NOT EXISTS "${UE4SS_DLL}")
     message(FATAL_ERROR
-        "找不到 UE4SS.dll。用 -DUE4SS_DLL=<路径> 指定, 或者\n"
-        "  cmake -S . -B build -DUE4SS_DLL=<path-to>/UE4SS.dll")
+        "找不到 UE4SS.dll。它是**从游戏目录**链接的, 不是从仓库里拿的。指定方式:\n"
+        "  cmake -S . -B build -DUE4SS_DLL=<path-to>/ue4ss/UE4SS.dll\n"
+        "或指向游戏 mod 目录让它自己推导:\n"
+        "  cmake -S . -B build -DDGLAB_DEPLOY_DIR=<path-to>/ue4ss/Mods/DGLab_IDAC\n"
+        "当前解析结果: \"${UE4SS_DLL}\"")
 endif()
+message(STATUS "DGLab_IDAC: UE4SS.dll = ${UE4SS_DLL}")
 
 # ---------------------------------------------------------------------------
 # mod 本体
@@ -84,34 +123,121 @@ else()
     message(WARNING "DGLab_IDAC: src/transport/ble_winrt.cpp 不存在, 使用占位实现(只能干跑)")
 endif()
 
-set(DGLAB_SOURCES
-    src/dllmain.cpp
-    src/logger.cpp
-    src/config.cpp
-    src/pipeline.cpp
-    src/source/indrun_hook_source.cpp
-    src/transport/transport.cpp
-    src/transport/transport_factory.cpp
-    src/transport/null_transport.cpp
-    ${DGLAB_BLE_SRC}
-)
+# ---------------------------------------------------------------------------
+# ★ 诊断构建 ★  -DDGLAB_DIAGNOSTIC=ON
+#
+# 单独一个“除了写日志什么都不做”的 mod，用来把游戏启动崩溃夹逼到单条语句:
+# 它不做 hook、不建工作线程、不解析配置, 只在每一步前面写一行
+# (CreateFileW + WriteFile + FlushFileBuffers, 崩溃也不丢尾巴)。
+# 与本体互斥 —— 两者都实现 start_mod/uninstall_mod, 同时编会重复定义。
+# ---------------------------------------------------------------------------
+option(DGLAB_DIAGNOSTIC "只构建诊断版 mod(逐句检查点日志, 无任何功能)" OFF)
+
+if(DGLAB_DIAGNOSTIC)
+    set(DGLAB_SOURCES src/diag_mod.cpp)
+    message(WARNING "DGLab_IDAC: ★ 诊断构建 —— 产物不挂钩、不输出波形, 只写 diag.log")
+else()
+    set(DGLAB_SOURCES
+        src/dllmain.cpp
+        src/bisect_logger.cpp
+        src/logger.cpp
+        src/config.cpp
+        src/pipeline.cpp
+        src/source/indrun_hook_source.cpp
+        src/transport/transport.cpp
+        src/transport/transport_factory.cpp
+        src/transport/null_transport.cpp
+        ${DGLAB_BLE_SRC}
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# fmt 实现 —— 必须编进来
+#
+# DynamicOutput/Output.hpp 里的 Output::send 是模板, 会在**我们的** TU 里
+# 展开成对 fmt::vformat / dragonbox 等非模板符号的调用。UE4SS.dll 静态链了
+# fmt 但**没有导出**它, 所以这些符号在我们这边无法解析:
+#     LNK2019: fmt::v11::report_error / dragonbox::to_decimal<float> 等 8 个
+# 因此把 fmt 11.2.0 的 format.cc + os.cc 直接编进本 DLL。
+#
+# ABI 一致性: UE4SS 用 fmt 11.2.0 (deps/third/CMakeLists.txt 的 FetchContent
+# GIT_TAG), 我们这里也是 11.2.0 —— 版本必须一致, 因为 `receive()` 的
+# std::string/std::wstring 参数跨了 DLL 边界, 而 fmt 对象是在我们这边构造、
+# 进到 UE4SS 的装置里被消费的。
+# ---------------------------------------------------------------------------
+set(DGLAB_FMT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt")
+if(IS_DIRECTORY "${DGLAB_FMT_DIR}/src")
+    list(APPEND DGLAB_SOURCES
+        "${DGLAB_FMT_DIR}/src/format.cc"
+        "${DGLAB_FMT_DIR}/src/os.cc")
+endif()
 
 add_library(${PROJECT_NAME} SHARED ${DGLAB_SOURCES})
+
+# ===========================================================================
+# ★★★ UE4SS 头文件必须与目标 UE4SS.dll **逐 commit 对齐** ★★★
+#
+# 为什么 (踩过的坑, 别重犯):
+#   本机装的 UE4SS.dll 自报 `v3.0.1 Beta #0 - Git SHA #0196ef29`, 对应官方
+#   experimental 分支持久化下来的
+#       UE4SS_v3.0.1-944-g0196ef29.zip   (commit 0196ef294f852)
+#   它不是 tag v3.0.1 (d935b5b, 2024-02-14), 两者相差 944 个提交。
+#
+#   一开始我们拿 v3.0.1 的头文件编, 虚表 ABI 完全对不上 —— 现象是
+#   `on_program_start` 竟然跑起来了, 函数返回后 15 ms 在 UE4SS 自己的
+#   mod 遍历里 `call qword ptr [rax+0x78]` 跳到垃圾地址 0x6575 崩掉。
+#   原因: 0196ef29 在 on_unreal_init 与 on_program_start 之间插入了
+#   on_ui_init, 且在末尾还有 4 个新的 on_lua_start/stop(Lua*) 重载,
+#   整个虚表从 on_program_start 起全体错位。
+#
+#   后来我又手工写过一版 shim "猜"顺序, 仍然崩 —— 因为真实顺序是
+#       on_update / on_unreal_init / on_ui_init / on_program_start /
+#       on_lua_start(弃用,vector&) x2 / on_lua_stop(弃用,vector&) x2 /
+#       on_dll_load / render_tab /
+#       on_lua_start(Lua*) x2 / on_lua_stop(Lua*) x2 / on_cpp_mods_loaded
+#   光靠导出序号是推不出来的。**结论: 不要猜, 直接逐个 commit 对齐头文件。**
+#
+# 因此: 默认优先使用 _ue4ss_ref/ue4ss_0196ef29 (从 0196ef29 检出固化的真头文件),
+#       回退到 UE4SS_DIR (旧的 v3.0.1 参考检出, 只在不关心 ABI 时用)。
+# 升级 UE4SS 时: 换掉 ue4ss_0196ef29/ 与 ue4ss_0196ef29_deps/, 重新生成导入库, 重编。
+# ===========================================================================
+set(DGLAB_HEADERS_PINNED
+    "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/ue4ss_0196ef29")
+set(DGLAB_DEPS_PINNED
+    "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/ue4ss_0196ef29_deps")
+
+if(IS_DIRECTORY "${DGLAB_HEADERS_PINNED}")
+    set(DGLAB_UE4SS_INCLUDES "${DGLAB_HEADERS_PINNED}")
+    file(GLOB DGLAB_DEP_INCLUDE_DIRS LIST_DIRECTORIES true
+        "${DGLAB_DEPS_PINNED}/*")
+    message(STATUS "DGLab_IDAC: 使用★已对齐★的 UE4SS 头文件 = ${DGLAB_HEADERS_PINNED}")
+else()
+    set(DGLAB_UE4SS_INCLUDES "${UE4SS_DIR}/UE4SS/include")
+    file(GLOB DGLAB_DEP_INCLUDE_DIRS LIST_DIRECTORIES true
+        "${UE4SS_DIR}/deps/first/*/include")
+    message(WARNING
+        "DGLab_IDAC: 未找到对齐的头文件 (${DGLAB_HEADERS_PINNED}), "
+        "回退到 ${UE4SS_DIR} —— 若不是刻意为之, ABI 很可能对不上!")
+endif()
 
 # UE4SS 是多个独立 CMake 子工程拼起来的, 每个子工程的头文件在
 # <dep>/include/<Dep>/... 下, 所以 include 根必须是各子工程的 include/ 目录
 # 本身, 而不是 deps/first。少一个就会报 “无法打开包括文件: File/Macros.hpp”。
-# 用 file(GLOB) 动态收齐, 避免以后 UE4SS 加新 deps 时手改。
-set(DGLAB_UE4SS_INCLUDES
-    "${UE4SS_DIR}/UE4SS/include"
-)
-file(GLOB DGLAB_DEP_INCLUDE_DIRS LIST_DIRECTORIES true
-    "${UE4SS_DIR}/deps/first/*/include")
 foreach(_inc IN LISTS DGLAB_DEP_INCLUDE_DIRS)
     if(IS_DIRECTORY "${_inc}")
         list(APPEND DGLAB_UE4SS_INCLUDES "${_inc}")
     endif()
 endforeach()
+
+# fmt —— DynamicOutput/Output.hpp 会 #include <fmt/core.h>.
+# 版本必须与 UE4SS 在 0196ef29 用的完全一致: fmt 11.2.0 (见 deps/third/CMakeLists.txt
+# 里的 FetchContent GIT_TAG)。UE4SS 会给它打一个 "check 宏冲突" 补丁
+# (cmake/modules/MacroPatch.cmake -> fmt/ranges.h), 我们已经在固化的头文件里打过。
+if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt/include")
+    list(APPEND DGLAB_UE4SS_INCLUDES
+        "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt/include")
+endif()
+
 list(REMOVE_DUPLICATES DGLAB_UE4SS_INCLUDES)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -174,6 +300,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     setupapi.lib
     bcrypt.lib
     psapi.lib           # EnumProcessModules / GetModuleBaseNameA (挂不上时倒模块清单)
+    shell32.lib         # CommandLineToArgvW / 杂项
 )
 
 # 输出名: UE4SS 只找 <mod>/dlls/main.dll, 所以交付时改名。
@@ -198,5 +325,81 @@ if(DGLAB_DEPLOY_DIR)
                 "$<TARGET_FILE:${PROJECT_NAME}>" "${DGLAB_DEPLOY_DIR}/dlls/main.dll"
         COMMAND ${CMAKE_COMMAND} -E touch "${DGLAB_DEPLOY_DIR}/enabled.txt"
         COMMENT "部署 -> ${DGLAB_DEPLOY_DIR}/dlls/main.dll"
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# abitest —— 最小 ABI 探针 mod (见 src/abitest.cpp 顶部的说明)
+#
+# 与主 target 共享**完全相同**的编译选项 / UE4SS 头文件 / 导入库 / CRT,
+# 但源代码里一个 UE4SS 符号都不主动调用, 生命周期函数全空。
+#
+# 用途: 判定"游戏启动崩溃"到底是我们代码的问题, 还是 UE4SS 头文件与
+# 已安装 UE4SS.dll 之间的 ABI 不匹配。
+#
+# 构建:  cmake --build build --config Release --target abitest
+# 部署:  拷到 <ue4ss>\Mods\AbiTest\dlls\main.dll + 建空 enabled.txt
+# ---------------------------------------------------------------------------
+add_library(abitest SHARED src/abitest.cpp)
+
+target_include_directories(abitest PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shim"
+    ${DGLAB_UE4SS_INCLUDES}
+)
+
+set_property(TARGET abitest PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+target_compile_options(abitest PRIVATE
+    /utf-8 /W4 /permissive- /Zc:__cplusplus /EHsc /MP /wd4100
+)
+target_compile_definitions(abitest PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
+)
+
+# 只链 UE4SS 导入库 —— 刻意不链 minhook / WinRT, 少一个变量。
+target_link_libraries(abitest PRIVATE "${UE4SS_IMPLIB}")
+
+set_target_properties(abitest PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "abitest"
+)
+
+# ---------------------------------------------------------------------------
+# protocol_check —— B0/BF 编码自检 (普通控制台程序, 不进游戏)
+#
+# 存在的理由: StrengthMode 的枚举值曾经与官方文档**完全相反** ——
+# Absolute 写成 0b00、Unchanged 写成 0b11。游戏正常运行、日志全绿、编码
+# 自检也通过, 唯一的表现是"设备完全不动", 因为设备把"绝对设置"当成
+# "不变"。这类错误只有逐位对着协议核对才能发现。
+#
+# 基准是官方文档的例子, 不是我们自己的实现 —— 详见 tools/protocol_check.cpp
+# 顶部。官方文档的逐字节副本在 re/reference/dglab-bluetooth-protocol/。
+#
+# 构建:  cmake --build build --config Release --target protocol_check
+# 运行:  build\Release\protocol_check.exe    (全通过返回 0)
+# ---------------------------------------------------------------------------
+set(DGLAB_PROTOCOL_SRC "src/transport/transport.cpp")
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${DGLAB_PROTOCOL_SRC}")
+    set(DGLAB_PROTOCOL_SRC "src/transport/transport_stub.cpp")
+endif()
+
+add_executable(protocol_check
+    tools/protocol_check.cpp
+    ${DGLAB_PROTOCOL_SRC}
+    src/logger.cpp          # transport.cpp 里的 log_error/log_warn 要用
+)
+
+target_include_directories(protocol_check PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+
+# 刻意不链 UE4SS / minhook / WinRT —— 这个工具必须能在任何机器上跑起来。
+set_property(TARGET protocol_check PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+if(MSVC)
+    target_compile_options(protocol_check PRIVATE
+        /utf-8 /W4 /permissive- /Zc:__cplusplus /EHsc /MP
+    )
+    target_compile_definitions(protocol_check PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
     )
 endif()

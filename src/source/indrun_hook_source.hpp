@@ -55,9 +55,6 @@ public:
     // 诊断: hook 是否就绪 / 各自被调用了多少次
     std::string status_report() const;
 
-    // 让调度器告诉它游戏当前的 tick(用于计算频率)
-    void note_tick(double now);
-
     bool installed() const { return installed_; }
 
 private:
@@ -136,8 +133,6 @@ private:
         std::atomic<bool>     ever{false};
     };
     Shared shared_{};
-
-    std::atomic<double> last_tick_{0.0};
 };
 
 }  // namespace dglab_idac

@@ -7,9 +7,14 @@
 // 手机参与, 与"PC 直连"的目标不符, 所以没有实现。
 //
 // 分派规则:
+//   dry_run = 1       -> Null, 且**优先于 link** (不管 link 写的是什么)
 //   link = ble        -> BleWinRtTransport (失败时降级到 Null 并告警)
 //   link = websocket  -> 未实现, 降级到 Null 并明确告知
 //   link = disabled   -> Null
+//
+// dry_run 放在最前面是有意的: 它是"绝对不要输出到设备"的硬开关。曾经它只
+// 出现在一行日志里, 于是 [link] mode=ble + dry_run=1 会真的去电人 —— 配置项
+// 写着"干跑"却在输出, 这种坑不能留。要真实输出必须显式把 dry_run 改成 0。
 // ---------------------------------------------------------------------------
 #include <string>
 
@@ -22,6 +27,13 @@ namespace dglab_idac {
 ITransport* create_transport(const Config& cfg) {
     if (!cfg.enabled) {
         log_warn("[general] enable=0 —— mod 被配置为禁用, 使用空输出");
+        return create_null_transport(cfg);
+    }
+
+    if (cfg.dry_run) {
+        log_warn("[safety] dry_run=1 —— 硬开关生效, 不会向任何设备输出"
+                 "(即使 [link] mode=%s 也走空输出)。要真实输出请改成 dry_run=0。",
+                 to_string(cfg.link));
         return create_null_transport(cfg);
     }
 
@@ -47,9 +59,13 @@ ITransport* create_transport(const Config& cfg) {
         }
 
         case LinkMode::WebSocket:
-            log_error("[link] mode=websocket 尚未实现。本地协议仓库里没有 WS 规范, "
-                      "那条路需要手机 APP 参与(见 docs/research-coyote-protocol.md 路径 B)。"
-                      "先降级到空输出。");
+            log_error("[link] mode=websocket 尚未实现。官方的 SOCKET 协议确实存在"
+                      "(dungeonlab-open/dglab-websocket-simple 仓库的 socket/ 目录, "
+                      "JSON over WebSocket, 该仓库已归档), "
+                      "但它必须由手机 APP 扫码参与: APP 仍是 BLE 中枢, 第三方只是把排好队的"
+                      "数据交给 APP 转发, 且波形是按批量队列(pulse-A:[...])下发的。"
+                      "对逐帧变化的力反馈信号来说它比 BLE 直连更差(多一跳网络 + 队列语义), "
+                      "所以本 mod 只走 BLE。详见 docs/research-dglab-transport.md 第 1.1 节。");
             return create_null_transport(cfg);
 
         case LinkMode::Disabled:

@@ -65,8 +65,20 @@ void emit(const char* tag, const char* fmt, va_list ap) {
     if (g_debug_output.load(std::memory_order_relaxed)) {
         ::OutputDebugStringA(line);
     }
-    std::fputs(line, stdout);
-    std::fflush(stdout);
+    // 写控制台 —— 但**只能用 Win32 句柄, 绝不能用 CRT 的 stdout**。
+    //
+    // 血的教训: 游戏是 /SUBSYSTEM:WINDOWS (GUI) 程序, 没有 stdio 初始化。
+    // 在注入进 GUI 进程的 DLL 里碰 `stdout`, 拿到的是未初始化的 FILE*,
+    // 一次 std::fputs 就是 0xC0000005 —— 而且崩在 CRT 内部, 栈上看不出是
+    // 谁干的。用 GetStdHandle 能安全地探测"到底有没有控制台"。
+    const HANDLE console = ::GetStdHandle(STD_OUTPUT_HANDLE);
+    if (console && console != INVALID_HANDLE_VALUE) {
+        DWORD is_console = 0;
+        if (::GetConsoleMode(console, &is_console)) {
+            DWORD written = 0;
+            ::WriteFile(console, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
+        }
+    }
 }
 
 }  // namespace

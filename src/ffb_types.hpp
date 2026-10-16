@@ -23,16 +23,22 @@ namespace dglab_idac {
 // 已证实 (RVA 0x6D19, FFB 拆除路径 `torque(-1, 0)`):
 //     同一常量 -1 用于把扭矩归零
 //
-// 强推断 (未证明): +1, 来自 `mov ecx, r13d` (RVA 0x2BCD8), 而 r13d 在
-// 整个 100 KB 巨函数里只被写过 3 次, 全是 `mov r13d,1`。因为对巨函数 CFG 的
-// 前向数据流分析因 3 个无法解析的间接跳转表而不完整, 所以这一点**没有证明**。
+// ★ 这个参数不是"左右方向", 尽管它的枚举类型名叫 eTrqueDirection。★
+// 已证实 (RVA 0x2BCD8 的 `mov ecx, r13d` + RVA 0x2C965):
+//     r13d = (uint8_t)device[0x1678], 即 movezx 读出的一个字节, 域 0..255。
+//     该字节由 RVA 0x2C95C 处的浮点表搜索结果写入, 是齿轮/档位一类的索引,
+//     且在同一函数的 0x2C96D 处被 `movzx edx, r13b` 消费。
+// 因此 direction 的两个来源语义完全不同: 常量 -1 表示"算出的扭矩为正",
+// r13d 路径装的是档位索引。把它当符号用只在恰好取到 ±1 时才碰对。
 //
-// 因此 hook 代码必须把 direction 当作一般的有符号 int 处理, 不能假设只有 ±1。
+// 结论: hook 代码必须把 direction 当作一般的有符号 int 记录下来, 既不能
+// 假设只有 ±1, 也不能拿它当左右方向。完整推导见 re/indrun_hook_mechanics.md
+// 第 4.1 与第 5 节。
 // ---------------------------------------------------------------------------
 enum class TorqueDirection : int32_t {
-    Zero   = -1,   // 已证实: 常量 0xFFFFFFFF。出现于 torque>0 以及 FFB 拆除
-    Plus   =  1,   // 强推断(未证明)
-    Other  =  0,   // 其它任何值都不该被假设成上面两者
+    Zero   = -1,   // 已证实: 常量 0xFFFFFFFF, 含义是"算出的扭矩为正", 不是"左"
+    Plus   =  1,   // 未证明。r13d 路径已证实装的是档位索引, 此值无实证来源
+    Other  =  0,   // 其它任何值(含 0..255 的档位索引)都不该被假设成上面两者
 };
 
 inline const char* to_string(TorqueDirection d) {

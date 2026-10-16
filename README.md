@@ -66,26 +66,41 @@ src/
   config.hpp/.cpp             INI 配置
   pipeline.hpp/.cpp           力反馈 → 波形映射 + 安全限流
   logger.hpp/.cpp             独立日志文件 + OutputDebugString
+  bisect_logger.hpp/.cpp      崩溃夹逼用的极简日志 (VEH 之前就落盘, 不依赖 CRT)
+  diag_mod.cpp                诊断构建的入口 (-DDGLAB_DIAGNOSTIC=ON, 与本体互斥)
+  abitest.cpp                 最小 ABI 探针 mod (判定崩溃是代码问题还是头文件 ABI 不匹配)
   source/
     indrun_hook_source.hpp/.cpp   ★ IndRun.dll 五跳板 MinHook 挂钩
   transport/
-    transport.hpp/.cpp        传输接口
+    transport.hpp/.cpp        传输接口 + B0/BF 协议编码
     transport_factory.cpp     按配置选传输
     null_transport.cpp        空实现 (干跑/探针用)
     ble_winrt.cpp             ★ BLE 直连郊狼 (WinRT, 无第三方依赖)
     ble_winrt_stub.cpp        占位; 与 ble_winrt.cpp 二选一 (同符号)
 tools/
-  bootstrap.cmd               ★ 一键重建全部依赖
-  build.cmd                   构建 (+ -Deploy 直接铺进游戏)
+  bootstrap.cmd               ★ 补齐依赖 (ABI 对齐头文件已在仓库里, 这一步只查它在不在)
+  build.cmd                   构建 (+ -Deploy 直接铺进游戏, + -Stage N 写 bisect.txt)
   make_ue4ss_implib.cmd       从 UE4SS.dll 生成导入库
   install_msvc.cmd            VS Build Tools 装到自定义盘
+  mod_on.cmd / mod_off.cmd    把 <mod>\dlls 改名成 dlls.off, 用于 A/B 排查
+  protocol_check.cpp          ★ 离线协议自检, 54 项, 基准是官方文档而非本项目实现
+  bleprobe.cpp                ★ 脱离游戏单独跑 BLE 链路 ([--live] 才真输出)
+  conftest.cpp                ★ 离线校验 INI: "会连真实设备吗 / 设备会有刺激吗"
+  DGLab_IDAC.ini.template     带注释的配置模板 (部署脚本铺的就是它)
 docs/
   research-overview.md        总览
   research-indrun-ffb.md      IndRun 力反馈数据链
   research-coyote-protocol.md 郊狼协议 (含 Socket API, 网络来源)
   research-dglab-transport.md 郊狼 BLE 传输 (来自本地协议仓库, 权威)
 re/                           逆向脚本与报告 (非构建产物)
+  indrun_hook_mechanics.md    ★ 挂钩点的完整逆向结论
+  indrun_ffb_report.md        ★ 参数语义 (torque/viscosity/vibration 各是什么)
+  verify_indrun_rva.py        离线校验 IndRun.dll 的 TimeDateStamp + 5 处特征码
+  disasm_indrun.py            capstone 反汇编 5 个 invoker
 ```
+
+> `_ue4ss_ref/ue4ss_0196ef29/` 与 `_ue4ss_ref/ue4ss_0196ef29_deps/` 是**提交进仓库**的
+> UE4SS 头文件 (约 330 KB), 见第 3 节"为什么头文件跟着仓库走"。
 
 ---
 
@@ -111,8 +126,35 @@ tools\bootstrap.cmd
 tools\build.cmd -Deploy
 ```
 
-`bootstrap.cmd` 做三件事: 拉 RE-UE4SS v3.0.1 的头文件 (稀疏检出, 约 11 MB)、
+`bootstrap.cmd` 做三件事: 确认 ABI 对齐的 UE4SS 头文件在位 (它们在仓库里, 正常跳过)、
 初始化 MinHook 子模块、从游戏自带的 `UE4SS.dll` 生成导入库。
+
+**在别的机器上**: 仓库里没有任何路径是通用的, 游戏目录需要你自己给。两种办法 ——
+
+```cmd
+set DLAB_DEPLOY_DIR=D:\你的游戏\WindowsNoEditor\GameProject\Binaries\Win64\ue4ss\Mods\DGLab_IDAC
+tools\bootstrap.cmd
+```
+
+或者直接 `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DDGLAB_DEPLOY_DIR="..."`。
+`UE4SS.dll` 的路径会从 mod 目录往上两级自动推导, 也可以用 `-DUE4SS_DLL=` 直接指定。
+不部署 (不加 `-Deploy`) 时产物就留在 `build\Release\DGLab_IDAC.dll`。
+
+**为什么头文件跟着仓库走**: `_ue4ss_ref\ue4ss_0196ef29\` 不是上游 tag `v3.0.1` 的头文件,
+而是 commit `0196ef294f8525d6a492ae0b41b0c18ad5ccd84b` (2026-03-27, `experimental-latest-695-g0196ef2`)
+那一版的。两者之间 `CppUserModBase` 的虚表布局**不同**:
+
+| 槽位 | v3.0.1 | 0196ef29 |
+|---|---|---|
+| `on_ui_init` | 无 | 有 |
+| `on_cpp_mods_loaded` | 无 | 有 |
+| 新旧 `on_lua_start`/`on_lua_stop` 重载 | 各 2 个 | 各 4 个 (新旧并存) |
+
+用 v3.0.1 的头文件编出来的 mod, UE4SS 调用虚函数时会跳到错误的位置 —— 表现为
+**游戏启动即崩, 崩在 `UE4SS.dll` 内部**, 而且日志干净得看不出我们参与了。
+本仓库历史上就是栽在这上面: 当时先怀疑是虚表错位, 手工写了一版 shim 去"猜"槽位顺序,
+结果崩得更早(`start_mod` 都没跑到)。教训是 **ABI 不能猜, 只能逐 commit 对齐头文件**。
+所以这两份头文件 (约 330 KB) 直接提交, 换 UE4SS 版本时必须换掉它们并重编。
 
 **不 `add_subdirectory(RE-UE4SS)` 的理由**: 那条路会连 UE4SS 本体一起重编 —— 要对
 glaze/ImGui/zydis/PolyHook2/raw_pdb 走 `FetchContent`, 其中多个用 `git@github.com:`
@@ -178,21 +220,33 @@ UE4SS **只认 `<mod>\dlls\main.dll`**, 所以部署时改名:
 
 | 阶段 | 状态 |
 |---|---|
-| 逆向: 定位挂钩点与 ABI | ✅ 完成 (`re/indrun_hook_mechanics.md`, 745 行) |
-| 逆向: 郊狼协议 | ✅ 完成 (`docs/research-*.md`) |
-| 构建: 编译 + 链接 + 部署 | ✅ 完成, 产物 161,792 字节 |
-| **阶段 1: 探针** | ⏳ **待跑** —— 需确认 `mode=xinput` 下游戏到底有没有发力反馈、值域、更新率 |
-| 阶段 2: 郊狼真输出 | 未验证 (BLE 代码已写完但从未连过真设备) |
+| 逆向: 定位挂钩点与 ABI | ✅ 完成 (`re/indrun_hook_mechanics.md`) |
+| 逆向: 郊狼协议 | ✅ 完成 (`docs/research-*.md`, 官方文档副本见 `re/reference/dglab-bluetooth-protocol/`) |
+| 构建: 编译 + 链接 + 部署 | ✅ 完成 |
+| ABI: 与本机 UE4SS `0196ef29` 对齐 | ✅ 完成 (曾因头文件版本不对而启动即崩) |
+| 阶段 1: 探针 | ✅ 完成 —— 5 个跳板**都有数据** |
+| 阶段 2: 郊狼真输出 | ✅ **A 通道已在真机上端到端验证通过**; B 通道待实测 |
 
-### 阶段 1 要回答的问题
+阶段 1 的结论是当年那两种可能里的 **A**: 即使 `segatools.ini` 里 `[io4] mode=xinput`,
+游戏照样按街机逻辑生成力反馈并经 FFB 板下发给 IndRun.dll。一次完整计时赛的实测计数:
 
-当前 `segatools.ini` 里 `[io4] mode=xinput` —— 方向盘输入走 XInput 手柄。存在两种可能:
+```
+torque=947 次   mag[0..18]   dir[-1..1]
+visc=10868 次   b[2..40]     (几乎每 tick 都有值)
+vib=136 次      b[0..29]     (只在事件发生时)
+servo on/off = 1/1, state=1
+```
 
-- **A**: 游戏仍按街机逻辑生成力反馈 (回正力/路感/打滑), 经 FFB 板往下发 → 跳板上有数据
-- **B**: 游戏检测到"不是方向盘"就不走力反馈分支 → 5 个跳板永远空转, 必须改从引擎侧取数
+阶段 2 的真机验证结果 (设备回的 B1 与请求逐字节一致):
 
-跑一次游戏记日志即可判定。日志里的 `n_torque` / `n_viscosity` / `n_vibration` 调用计数
-为 0 就是 B。
+```
+请求   B0 1F 0F 0A ...   ->  A=15 B=10
+设备回 B1 01 0F 0A       ->  A=15 B=10   ✓
+```
+
+**已知未实现**: `[safety] watchdog_ms` 配了不生效 —— 没有任何代码读它。当前唯一的
+静默保护是"超过 20 秒没有力反馈回调就打一条 WARN 日志", 那是告警不是归零。真正在
+起作用的闸门是 `clamp_strength` / `max_strength` / slew 限速 / 设备 BF 软上限。
 
 ---
 
@@ -218,11 +272,38 @@ UE4SS **只认 `<mod>\dlls\main.dll`**, 所以部署时改名:
 - **某通道 8 个值里只要有 1 个越界, 该通道 4 组全部丢弃**
 - 只输出单通道时给另一通道塞一个非法值 (例如波形强度 101)
 - 强度变化时序列号非 0, 且**要等 B1 回来**才能发下一次强度修改
-- 文档:**只有 BLE**。本仓库里**没有** WebSocket 传输; Socket API 那条路来自网络资料
+- 官方仓库 [`dungeonlab-open/dglab-bluetooth-protocol`](https://github.com/dungeonlab-open/dglab-bluetooth-protocol)
+  只有 **BLE** 规范 (`coyote/v3/README.md`)
+- 另有 **SOCKET (WebSocket) 控制协议**, 在另一个官方仓库
+  [`dungeonlab-open/dglab-websocket-simple`](https://github.com/dungeonlab-open/dglab-websocket-simple)
+  的 `socket/` 目录 (**该仓库已归档**), 中继服务器是
+  [`dungeonlab-open/dglab-websocket-server`](https://github.com/dungeonlab-open/dglab-websocket-server)。
+  它**不是 BLE 的替代品**: 走那条路时手机 APP 仍是 BLE 中枢, PC 只是通过服务器把排好队的
+  数据交给 APP 转发, 且必须扫码配对。本项目选 BLE 直连的理由见 `docs/research-dglab-transport.md` 第 1.1 节
 
 ---
 
 ## 9. 许可与署名
 
-郊狼协议文档对爱好者免费, 但**商用需事先授权**。
-本项目的第三方依赖: MinHook (MIT)、RE-UE4SS (MIT)、郊狼协议文档 (见原仓库说明)。
+本项目自身以 **MIT** 许可发布, 全文见 [LICENSE](LICENSE)。
+
+第三方依赖与资料:
+
+| | 许可 |
+|---|---|
+| [MinHook](https://github.com/TsudaKageyu/minhook) | MIT |
+| [RE-UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) | MIT |
+| `_ue4ss_ref/ue4ss_0196ef29*/` (UE4SS 头文件) | MIT (同 RE-UE4SS) |
+| [dglab-bluetooth-protocol](https://github.com/dungeonlab-open/dglab-bluetooth-protocol) | 上游无 LICENSE 文件, 见下方说明 |
+
+> ⚠ 郊狼协议文档对爱好者免费, 但**商用需事先授权**。
+> 上游没有 LICENSE 文件, 所以 `re/reference/dglab-bluetooth-protocol/` 里那四份官方文档的
+> 授权条件**不适用**本仓库根目录的 MIT LICENSE。它们的来源、提交号与 sha256 记在
+> 该目录的 `PROVENANCE.md` 里; `docs/` 下的分析文字则是我们自己写的。
+
+### 安全声明
+
+本项目的用途是把自己游戏设备的力反馈信号转发到郊狼主机上。**输出会真实作用于人体**,
+且 `[link] mode=ble` + `[safety] dry_run=0` 时没有任何软件层面的"不会电到人"保证。
+第一次接电极前请先读第 7 节, 并考虑先用 `tools\bleprobe.exe <ini> 20` (不加 `--live`,
+我会强制把两个通道强度压到 0) 确认链路, 再上人。

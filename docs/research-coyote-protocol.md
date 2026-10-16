@@ -1,8 +1,9 @@
 # 郊狼主机 (DG-LAB Coyote) 接入调研
 
-来源：`D:\INDAC\dglab-bluetooth-protocol\`（远端 `https://github.com/dungeonlab-open/dglab-bluetooth-protocol.git`）
+来源：官方仓库 [`dungeonlab-open/dglab-bluetooth-protocol`](https://github.com/dungeonlab-open/dglab-bluetooth-protocol)
+（本次分析的原始文件按字节副本存于 `re/reference/dglab-bluetooth-protocol/`，上游提交号与 sha256 见该目录 `PROVENANCE.md`）
 + 官方/社区实现 `hyperzlib/DG-Lab-Coyote-Game-Hub`、`dungeonlab-open/dglab-kit(-python)`、`Ljzd-PRO/PyDGLab-WS`。
-证据标注：**[L]** = 本地仓库原文事实，**[W]** = 网上确认，**[I]** = 推断/待硬件验证。
+证据标注：**[L]** = 官方仓库原文事实，**[W]** = 网上确认，**[I]** = 推断/待硬件验证。
 
 ---
 
@@ -189,6 +190,21 @@ Windows **无法**任意调 BLE 连接间隔：WinRT 只提供 `BluetoothLEDevic
 7. **V4 栈还在动**：V3 socket 规范仓库已归档，V4 协议藏在 `dglab-kit` 里。锁版本。
 8. **Windows BLE 不稳**（适配器相关的扫描/连接失败、GATT 服务缓存、某些设备必须断电重启才广播）是最可能的日常支持负担；Game Hub 的重连逻辑（5 s 重试、GATT 重连后等 1 s、120 s 轮询电量）是不错的模板。
 9. **电气安全**：电极绝不能跨过心脏/胸部或越过身体中线；社区安全建议是 500 Ω 下 r.m.s. 电流远低于 50 mA、单次 ~30 min、变换频率、插入休息期，并且"被控设置"里的舒适/强度上限必须在开启远程控制前配好。**无论游戏请求什么，自己再设一道硬上限。**
+
+### 6.1 硬件实测确认（2026-10-17，真机 + 电极）
+
+**通道输出指示灯是电流指示灯，不是状态灯。** 未接电极时，即使我们持续发送强度 15/10、脉冲强度 100/100 的 B0 帧且设备 B1 回执确认已接受，**指示灯依然不亮**；接上电极形成回路后同一个指示通道立即正常工作（A 通道实测有效）。
+
+这否定了此前提出的"无负载保护"假说。核对依据：
+
+| 假说 | 结论 | 依据 |
+|---|---|---|
+| 未接电极触发无负载保护，设备拒绝输出 | 不成立 | 官方 V3 协议文档（`coyote/v3/README.md`、`coyote/README.md`）中无 LED、负载、开路、保护相关条目；德国 e-stim 论坛多位 3.0 持有者回答电极脱离时 "hat die Kontaktlosigkeit keinen Einfluss auf den Stromfluss"、"Es schaltet nicht ab."。电极脱落数秒后关闭通道是旧型号行为 |
+| 指示灯不亮说明输出链路有故障 | 不成立 | 同一二进制、同一 INI 下，接上电极后通道即工作 |
+
+指示灯反映的是流经负载的电流，回路未闭合时读数为零。判断软件链路状态应看 B1 回执（`B1 <seq> <A实际> <B实际>`）与 `[hb]` 心跳里的 `hooks=OK`，两者在本轮测试中均正常。
+
+厂商页转载的硬件说明中唯一相关条目是 "Intelligent Self-Check At Startup"（开机自检，每通道脉冲模块带冗余备份电路），指自检与故障冗余，与负载检测无关。
 
 ---
 
