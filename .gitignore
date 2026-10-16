@@ -1,0 +1,40 @@
+# ---- 构建产物 ----
+build/
+out/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+
+# ---- 反汇编 / 逆向中间产物 ----
+re/*.json
+re/*.txt
+re/*.asm
+re/*.out
+re/__pycache__/
+__pycache__/
+*.pyc
+_*.py
+
+# ---- 运行期产物(日志/探针输出) ----
+*.log
+DGLab_IDAC.ini
+config.ini
+
+# ---- 依赖: 不进仓库, 用 tools\bootstrap.cmd 重建 ----
+# _ue4ss_ref/ 是一个 sparse checkout 出来的 RE-UE4SS v3.0.1 —— 11 MB 的第三方
+# 头文件, 全部可从 GitHub 重新拿到(见 tools\bootstrap.cmd)。
+_ue4ss_ref/
+# 导入库是从游戏自带的 UE4SS.dll 用 dumpbin+lib 现场生成的(2 MB),
+# 换 UE4SS 版本必须重跑 tools\make_ue4ss_implib.cmd, 所以没有提交价值。
+third_party/importlib/
+
+# ---- 编辑器 ----
+.vs/
+.vscode/
+*.user
+*.suo
+

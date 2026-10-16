@@ -1,0 +1,42 @@
+# ===========================================================================
+#  .gitattributes — 行尾是**功能性的**, 不是风格问题
+# ===========================================================================
+# 为什么 .cmd/.bat 必须 CRLF:
+#   cmd.exe 用 LF-only 的文件时无法定位 batch 标签。症状是
+#       The system cannot find the batch label specified - xxx
+#   然后 cmd 会**重新执行文件片段**, 满屏
+#       'xxx' is not recognized as an internal or external command
+#   而且真正要跑的代码一段也没跑成功。这个坑在本项目里踩了两次
+#   (tools\install_msvc.cmd 和 tools\bootstrap.cmd)。
+#   同时: `^` 续行符后面跟一个裸 LF 会和下一行合并。
+#
+# 为什么 .ps1 必须 CRLF: 同理, PowerShell 的 here-string 与续行对行尾敏感。
+# ===========================================================================
+
+# ---- Windows 脚本: 强制 CRLF, 且检出时不要被 core.autocrlf 改掉 ----
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# ---- 源码: 统一 LF (MSVC 靠 /utf-8 读, 与行尾无关) ----
+*.c    text eol=lf
+*.cc   text eol=lf
+*.cpp  text eol=lf
+*.h    text eol=lf
+*.hpp  text eol=lf
+
+# ---- 文本资料 ----
+*.md   text eol=lf
+*.txt  text eol=lf
+*.ini  text eol=lf
+*.json text eol=lf
+*.py   text eol=lf
+
+# ---- 二进制: 永不转换 ----
+*.dll  binary
+*.lib  binary
+*.exp  binary
+*.pdb  binary
+*.obj  binary
+*.png  binary
+*.ico  binary
