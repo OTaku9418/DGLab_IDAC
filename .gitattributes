@@ -29,6 +29,8 @@
 *.md   text eol=lf
 *.txt  text eol=lf
 *.ini  text eol=lf
+# 配置模板: 不带这条会落到"未指定", 行尾由各人的 core.autocrlf 决定
+*.template text eol=lf
 *.json text eol=lf
 *.py   text eol=lf
 *.sh   text eol=lf
