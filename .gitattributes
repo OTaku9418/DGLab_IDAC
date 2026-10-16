@@ -41,6 +41,9 @@
 # Git touches it", 而 Linux/Mac 贡献者拿到的是 LF —— 同一份文件两种结果。
 # .gitattributes 自己也在里面: 它要是被检出成 CRLF, 上面所有规则的行为就
 # 不再可复现。
+# LICENSE 也是无扩展名, 同样漏过一轮: 在 clone 出的仓库里它被检出成 CRLF,
+# 与库里的 LF 差 21 字节 —— 于是每改一次许可证年份, diff 都是整文件重写。
+LICENSE        text eol=lf
 .gitattributes text eol=lf
 .gitignore     text eol=lf
 .gitmodules    text eol=lf
