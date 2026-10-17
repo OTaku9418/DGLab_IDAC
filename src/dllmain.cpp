@@ -149,7 +149,7 @@ class DGLabIdacMod final : public RC::CppUserModBase {
 public:
     DGLabIdacMod() {
         ModName = STR("DGLab_IDAC");
-        ModVersion = STR("0.1.0");
+        ModVersion = DGLAB_VERSION_W;  // 版本号只有 CMake 里那一处
         ModDescription = STR("Initial D The Arcade 力反馈 -> 郊狼(DG-LAB) 波形输出");
         ModAuthors = STR("DGLab_IDAC");
         ModIntendedSDKVersion = STR("3.0.1");
@@ -236,7 +236,7 @@ private:
 
         if (stage_ < 3) { dglab_idac::bisect_note("A9  stage<3: 到此为止"); return; }
 
-        dglab_idac::log_info("==== DGLab_IDAC %s 启动 (bisect stage=%d) ====", "0.1.0", stage_);
+        dglab_idac::log_info("==== DGLab_IDAC %s 启动 (bisect stage=%d) ====", DGLAB_VERSION_A, stage_);
         dglab_idac::log_info("日志文件: %s", dglab_idac::log_path());
         dglab_idac::log_info("配置文件: %s", ini.c_str());
         dglab_idac::bisect_note("A4  logger 头几行已写");
@@ -610,7 +610,7 @@ DGLAB_MOD_API void uninstall_mod(RC::CppUserModBase* mod) {
 DGLAB_MOD_API const char* dglab_status_string() {
     static thread_local char buf[512];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                "DGLab_IDAC 0.1.0 (probe stage) log=%s", dglab_idac::log_path());
+                "DGLab_IDAC " DGLAB_VERSION_A " (probe stage) log=%s", dglab_idac::log_path());
     return buf;
 }
 

@@ -49,16 +49,15 @@ add_subdirectory("${MINHOOK_DIR}" EXCLUDE_FROM_ALL)
 # ---------------------------------------------------------------------------
 # 依赖 2: UE4SS 头文件 + 已构建的 UE4SS.dll
 #
-# 头文件来自 v3.0.1 的 sparse checkout(_ue4ss_ref/RE-UE4SS)。只用 include/,
-# 因为整个 mod ABI 就是 CppUserModBase 这一个类。
+# 真正用于编译的是下面 DGLAB_HEADERS_PINNED 指向的 _ue4ss_ref/ue4ss_0196ef29
+# (已提交进仓库, 与游戏里的 UE4SS.dll 逐提交对齐)。
+#
+# UE4SS_DIR 只是**回退**方案: 指向一份旧的 v3.0.1 检出, 只在没有对齐头文件
+# 时用, 且 ABI 很可能对不上。tools/bootstrap.cmd 会检查对齐头文件是否在位,
+# 但它**不会**去检出 RE-UE4SS —— 这个目录在 .gitignore 里, 新 clone 里不存在,
+# 所以这里不能因为它缺席就 FATAL(否则"clone 下来直接构建"必然失败)。
 # ---------------------------------------------------------------------------
-set(UE4SS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/RE-UE4SS" CACHE PATH "RE-UE4SS 源码根")
-if(NOT EXISTS "${UE4SS_DIR}/UE4SS/include/Mod/CppUserModBase.hpp")
-    message(FATAL_ERROR
-        "找不到 RE-UE4SS v3.0.1 头文件 (${UE4SS_DIR}/UE4SS/include)。\n"
-        "必须用 v3.0.1 —— 与本机 UE4SS.dll (v3.0.1 Beta #0196ef29) 对齐。\n"
-        "换版本会改变 CppUserModBase 的 vtable 布局, mod 会在 UE4SS 调用虚函数时崩。")
-endif()
+set(UE4SS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/RE-UE4SS" CACHE PATH "RE-UE4SS 源码根(可选回退)")
 
 # 已构建的 UE4SS.dll。链接它而不是重编它。
 #
@@ -100,12 +99,22 @@ if(NOT UE4SS_DLL)
 endif()
 
 if(NOT EXISTS "${UE4SS_DLL}")
-    message(FATAL_ERROR
-        "找不到 UE4SS.dll。它是**从游戏目录**链接的, 不是从仓库里拿的。指定方式:\n"
-        "  cmake -S . -B build -DUE4SS_DLL=<path-to>/ue4ss/UE4SS.dll\n"
-        "或指向游戏 mod 目录让它自己推导:\n"
-        "  cmake -S . -B build -DDGLAB_DEPLOY_DIR=<path-to>/ue4ss/Mods/DGLab_IDAC\n"
-        "当前解析结果: \"${UE4SS_DLL}\"")
+    # 注意: 这里**不是** FATAL。链接用的是 third_party/importlib/UE4SS.lib,
+    # UE4SS.dll 只在"重新生成导入库"时才需要。仓库里带着对齐好的 .lib,
+    # 所以没有游戏 DLL 的机器一样能编译 —— 这正是不把 DLL 提交进仓库的前提。
+    # 只有连导入库都没有时才真的没救(那个检查在下面链接段里)。
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/importlib/UE4SS.lib")
+        message(STATUS "DGLab_IDAC: 未找到 UE4SS.dll, 但导入库已存在 —— 编译不受影响")
+    else()
+        message(FATAL_ERROR
+            "既找不到 UE4SS.dll, 也没有 third_party/importlib/UE4SS.lib。\n"
+            "  导入库需要从真实的 UE4SS.dll 生成, 所以至少要有一个:\n"
+            "  cmake -S . -B build -DUE4SS_DLL=<path-to>/ue4ss/UE4SS.dll\n"
+            "或指向游戏 mod 目录让它自己推导:\n"
+            "  cmake -S . -B build -DDGLAB_DEPLOY_DIR=<path-to>/ue4ss/Mods/DGLab_IDAC\n"
+            "然后用 tools\\make_ue4ss_implib.cmd 生成导入库。\n"
+            "当前解析结果: \"${UE4SS_DLL}\"")
+    endif()
 endif()
 message(STATUS "DGLab_IDAC: UE4SS.dll = ${UE4SS_DLL}")
 
@@ -212,6 +221,20 @@ if(IS_DIRECTORY "${DGLAB_HEADERS_PINNED}")
         "${DGLAB_DEPS_PINNED}/*")
     message(STATUS "DGLab_IDAC: 使用★已对齐★的 UE4SS 头文件 = ${DGLAB_HEADERS_PINNED}")
 else()
+    # 回退路径: 没有对齐头文件, 只能用 UE4SS_DIR 那份旧检出。
+    # 这里才是"RE-UE4SS 到底在不在"该检查的地方 —— 放在文件开头会让
+    # 干净 clone(该目录被 .gitignore 排除)连配置都过不去。
+    if(NOT EXISTS "${UE4SS_DIR}/UE4SS/include/Mod/CppUserModBase.hpp")
+        message(FATAL_ERROR
+            "既没有对齐的头文件 (${DGLAB_HEADERS_PINNED}), 也没有回退用的 RE-UE4SS 检出 "
+            "(${UE4SS_DIR}/UE4SS/include)。\n"
+            "  正常情况下不需要回退: 对齐头文件已随仓库提交, 用\n"
+            "      git checkout -- _ue4ss_ref\n"
+            "  取回来即可。tools\\bootstrap.cmd 会检查它是否在位。\n"
+            "  回退用的 RE-UE4SS 是 v3.0.1 (commit d935b5b), 与本机 UE4SS.dll\n"
+            "  (v3.0.1 Beta #0196ef29) 相差 944 个提交, vtable 布局不同 ——\n"
+            "  真拿它编, mod 会在 UE4SS 调用虚函数时崩, 所以只在不关心 ABI 时用。")
+    endif()
     set(DGLAB_UE4SS_INCLUDES "${UE4SS_DIR}/UE4SS/include")
     file(GLOB DGLAB_DEP_INCLUDE_DIRS LIST_DIRECTORIES true
         "${UE4SS_DIR}/deps/first/*/include")
@@ -264,6 +287,14 @@ if(MSVC)
         NOMINMAX
         WIN32_LEAN_AND_MEAN
         _CRT_SECURE_NO_WARNINGS
+        # 版本号只有一个来源: 上面 project(... VERSION ...)。
+        # 代码里不许再写版本字面量 —— 以前 dllmain.cpp 有 3 处 "0.1.0",
+        # 改版本时漏一处就会出现"日志说 0.1.1、ModVersion 说 0.1.0"。
+        # 两个变体的原因: UE4SS 的 StringType 是 std::basic_string<CharType>,
+        # 而 CharType 由 StringType.hpp 里的 FORCE_U16 决定 —— 当前构建没定义它,
+        # 所以是 wchar_t, 前缀必须是 L(不是 u)。对了错都只是编译错误, 不会静默。
+        "DGLAB_VERSION_W=L\"${PROJECT_VERSION}\""
+        "DGLAB_VERSION_A=\"${PROJECT_VERSION}\""
     )
 endif()
 
@@ -310,7 +341,11 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
     OUTPUT_NAME "DGLab_IDAC"
 )
 
-message(STATUS "DGLab_IDAC: UE4SS 头文件 = ${UE4SS_DIR}")
+# 打印**实际生效**的那个头文件目录, 而不是回退目录 —— 以前这里打的是
+# UE4SS_DIR, 于是日志里永远显示 v3.0.1 路径, 而实际编进去的是对齐头文件,
+# 排查 ABI 问题时这个假信息非常致命。
+list(GET DGLAB_UE4SS_INCLUDES 0 _dglab_first_inc)
+message(STATUS "DGLab_IDAC: 生效的 UE4SS 头文件 = ${_dglab_first_inc}")
 message(STATUS "DGLab_IDAC: 链接 UE4SS.dll = ${UE4SS_DLL}")
 message(STATUS "DGLab_IDAC: MinHook     = ${MINHOOK_DIR}")
 
