@@ -45,6 +45,9 @@ struct Frame {
     ChannelFrame b;
     bool servo_on   = false;
     bool muted      = false;   // true = 本帧被安全逻辑压制为静音
+    // 静音原因, 空串表示没静音。
+    // **必须指向静态存储期的字符串**(字符串字面量)—— Frame 会跨线程传
+    // (管线 -> 传输层), 指向局部 std::string 的 c_str() 会立刻悬垂。
     const char* mute_reason = "";
 };
 
@@ -110,7 +113,8 @@ private:
     // 单通道: 本帧的目标强度(static = 固定 base_strength, level = 按 v 缩放)
     int  effective_strength(const ChannelMapping& m, double v) const;
     // 安全: 静音判定 + 斜率限制
-    bool evaluate_safety(double now, const FfbState& ffb, std::string& reason);
+    // reason 只赋字符串字面量(静态存储期), 详见 pipeline.cpp 里的实现注释。
+    bool evaluate_safety(double now, const FfbState& ffb, const char*& reason);
     int  clamp_strength(int want) const;
 
     // 本帧该用的归一化上界: auto_gain 关闭时就是 m.in_max

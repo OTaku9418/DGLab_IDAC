@@ -226,7 +226,11 @@ void Pipeline::fill_channel(const ChannelMapping& m, double v, ChannelFrame& out
 }
 
 // ---------------------------------------------------------------------------
-bool Pipeline::evaluate_safety(double now, const FfbState& ffb, std::string& reason) {
+// reason 是**输出参数**, 类型是 const char* 而不是 std::string: 它最终会被存进
+// Frame::mute_reason, 而 Frame 是要跨线程传的(管线线程 -> BLE 线程)。传
+// std::string 的话调用方会拿到 c_str() 指向的临时缓冲, tick() 一返回就成了野指针。
+// 所以这里只允许赋字符串字面量(静态存储期), 不做任何拼接。
+bool Pipeline::evaluate_safety(double now, const FfbState& ffb, const char*& reason) {
     safety_.warmup_active   = false;
     safety_.watchdog_tripped = false;
     safety_.servo_off_muted = false;
@@ -262,7 +266,7 @@ bool Pipeline::evaluate_safety(double now, const FfbState& ffb, std::string& rea
         return true;
     }
 
-    reason.clear();
+    reason = "";
     return false;
 }
 
@@ -282,7 +286,7 @@ bool Pipeline::tick(double now, const FfbState& ffb, Frame& out) {
     const double dt = (last_tick_ > 0.0) ? (now - last_tick_) : 0.0;
     last_tick_ = now;
 
-    std::string reason;
+    const char* reason = "";
     const bool muted = evaluate_safety(now, ffb, reason);
 
     // ---- 自动增益: 每 tick 推进一次包络, 供本帧的 A/B 两路归一化使用 ----
@@ -334,8 +338,9 @@ bool Pipeline::tick(double now, const FfbState& ffb, Frame& out) {
     out.b.strength = muted ? 0 : final_b;
 
     out.muted = muted;
-    static const char* const kNoReason = "";
-    out.mute_reason = muted ? reason.c_str() : kNoReason;
+    // reason 里只可能是字符串字面量(见 evaluate_safety 的注释), 所以这个指针
+    // 的生命周期是整个进程, 跨线程存下来也不会悬垂。
+    out.mute_reason = reason;
 
     // ---- 脉冲内容 ----
     if (muted) {
