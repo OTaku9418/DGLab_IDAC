@@ -114,6 +114,12 @@ int main(int argc, char** argv) {
             "  --steady: constant pulses on every slot instead of the gentle ramp.\n"
             "      The strongest, most visible output the device can make -- use it\n"
             "      when asking 'does the indicator LED react to output at all?'.\n"
+            "  --stall=N: half way through the run, stop submitting frames for N\n"
+            "      seconds. This is the only way to exercise [safety] watchdog_ms on\n"
+            "      demand: the transport's own send loop keeps beating, so once the\n"
+            "      mailbox goes older than watchdog_ms it must switch to the idle\n"
+            "      frame and log 'watchdog triggered'. Expect exactly one warning,\n"
+            "      wd=1, trips=1, idle counting up, then normal frames again.\n"
             "\n"
             "Transport diagnostics are written to DGLab_IDAC.log next to the ini's\n"
             "working directory (UTF-8). Watch that file for the detailed reason.\n");
@@ -128,9 +134,14 @@ int main(int argc, char** argv) {
     }
     bool live = false;
     int force_strength = -1;
+    int stall_seconds = 0;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--live") == 0) live = true;
         if (std::strcmp(argv[i], "--steady") == 0) g_steady = true;
+        if (std::strncmp(argv[i], "--stall=", 8) == 0) {
+            const int v = std::atoi(argv[i] + 8);
+            stall_seconds = v < 1 ? 0 : v;
+        }
         if (std::strncmp(argv[i], "--setstrength=", 14) == 0) force_strength = std::atoi(argv[i] + 14);
         if (std::strncmp(argv[i], "--freq=", 7) == 0) {
             const int v = std::atoi(argv[i] + 7);
@@ -183,6 +194,10 @@ int main(int argc, char** argv) {
     std::printf("  pattern     : %s\n", g_steady ? "STEADY (constant, maximum visibility)"
                                                  : "ramp (gentle)");
     std::printf("  duration    : %d s\n", seconds);
+    if (stall_seconds > 0) {
+        std::printf("  stall test  : stop submitting for %d s at the half-way point\n",
+                    stall_seconds);
+    }
     if (force_strength >= 0) {
         std::printf("  mode        : SETSTRENGTH %d (device-acceptance probe)\n", force_strength);
     } else {
@@ -220,7 +235,42 @@ int main(int argc, char** argv) {
     int tick = 0;
     auto next_status = t0 + std::chrono::milliseconds(1000);
 
+    // --stall: half way through, stop calling submit() for N seconds. The
+    // transport's send loop is untouched, so it keeps beating; once the newest
+    // frame in the mailbox is older than [safety] watchdog_ms it must decide to
+    // send the idle frame instead. That is the one path the offline logic_check
+    // cannot cover end to end (device ack included), so it needs a real run.
+    const auto stall_at = t0 + std::chrono::seconds(seconds / 2);
+    bool stall_armed = stall_seconds > 0;
+    bool stall_seen = false;
+
     while (std::chrono::steady_clock::now() < deadline) {
+        const auto now_pre = std::chrono::steady_clock::now();
+        if (stall_armed && !stall_seen && now_pre >= stall_at) {
+            stall_seen = true;
+            std::printf("[>>] STALL starts: no submit() for %d s. The transport keeps\n"
+                        "     beating, so wd must flip to 1 and trips to 1 after %d ms.\n",
+                        stall_seconds, cfg.watchdog_ms);
+            std::fflush(stdout);
+            const auto stall_end = now_pre + std::chrono::seconds(stall_seconds);
+            while (std::chrono::steady_clock::now() < stall_end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= next_status) {
+                    const auto el = std::chrono::duration_cast<std::chrono::seconds>(now - t0).count();
+                    std::printf("[status %3llds] STALLED, submitted %d frames | %s\n",
+                                static_cast<long long>(el), tick, t->status().c_str());
+                    std::fflush(stdout);
+                    next_status = now + std::chrono::milliseconds(1000);
+                }
+            }
+            std::printf("[<<] STALL over: resuming submit(). Watch trips stay at 1 and\n"
+                        "     normal frames come back (idle should stop counting up).\n");
+            std::fflush(stdout);
+            next_status = std::chrono::steady_clock::now();  // report immediately
+            continue;
+        }
+
         t->submit(make_frame(cfg, tick));
         ++tick;
 
