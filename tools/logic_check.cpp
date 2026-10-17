@@ -26,6 +26,7 @@
 #include <string>
 
 #include "config.hpp"
+#include "ffb_gap_stats.hpp"
 #include "ffb_types.hpp"
 #include "pipeline.hpp"
 #include "transport/transport.hpp"
@@ -371,6 +372,50 @@ void test_pipeline_warmup() {
     check(out.a.strength > 0, "预热结束后强度能上来");
 }
 
+// ---------------------------------------------------------------------------
+// 9. [ffbgap] 诊断统计 (T9)
+//
+// 这段代码唯一的真实验证机会是用户开车的那十几分钟, 分档算错了数据就白收,
+// 所以这里用假时间戳把边界逐个钉住。
+// ---------------------------------------------------------------------------
+void test_ffb_gap_stats() {
+    group("[ffbgap]: 正扭矩区间的间隔分档");
+
+    FfbGapStats g;
+    g.on_torque(10.0, 5);        // 区间开始, 第一次不计间隔
+    check_eq(static_cast<int>(g.total()), 0, "第一次回调不计间隔");
+    check(g.max_gap == 0.0, "此时最大间隔是 0");
+
+    g.on_torque(10.3, 7);        // 0.3 s -> <0.5
+    check_eq(static_cast<int>(g.n_lt_05), 1, "0.3 s 落进 <0.5s 档");
+
+    g.on_torque(11.3, 7);        // 1.0 s -> 0.5-2
+    check_eq(static_cast<int>(g.n_05_2), 1, "1.0 s 落进 0.5-2s 档");
+
+    g.on_torque(14.3, 7);        // 3.0 s -> 2-5
+    check_eq(static_cast<int>(g.n_2_5), 1, "3.0 s 落进 2-5s 档");
+
+    g.on_torque(20.3, 7);        // 6.0 s -> >5
+    check_eq(static_cast<int>(g.n_gt_5), 1, "6.0 s 落进 >5s 档");
+    check(g.max_gap > 5.9 && g.max_gap < 6.1, "max_gap 记下 6.0 s");
+
+    g.on_torque(20.4, 0);        // 力归零 -> 区间结束
+    check_eq(static_cast<int>(g.stops), 1, "力归零时记一次 stops");
+    check_eq(static_cast<int>(g.total()), 4, "归零本身不产生间隔");
+
+    // 回正期间的空白**不能**被算成一个巨大间隔: 重新起算。
+    g.on_torque(60.0, 9);
+    check_eq(static_cast<int>(g.total()), 4, "归零后重新来正值, 仍不计间隔");
+    g.on_torque(60.5, 9);
+    check_eq(static_cast<int>(g.n_lt_05), 1, "边界值 0.5 s 不进 <0.5s 档");
+    check_eq(static_cast<int>(g.n_05_2), 2, "边界值 0.5 s 进 0.5-2s 档");
+
+    g.reset();
+    check_eq(static_cast<int>(g.total()), 0, "reset 清空计数");
+    check(g.max_gap == 0.0 && g.stops == 0 && !g.armed(),
+          "reset 也清掉 max_gap / stops 与区间状态");
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -385,6 +430,7 @@ int main() {
     test_pipeline_normal();
     test_pipeline_stall();
     test_pipeline_warmup();
+    test_ffb_gap_stats();
 
     std::printf("\n-------------------------------------------\n");
     std::printf("通过 %d, 失败 %d\n", g_pass, g_fail);

@@ -44,6 +44,7 @@
 
 #include "bisect_logger.hpp"
 #include "config.hpp"
+#include "ffb_gap_stats.hpp"
 #include "logger.hpp"
 #include "pipeline.hpp"
 #include "source/indrun_hook_source.hpp"
@@ -78,6 +79,7 @@ namespace {
 // ---------------------------------------------------------------------------
 constexpr double kHeartbeatSeconds = 1.0;
 constexpr double kProbeDetailSeconds = 10.0;   // 前 10 秒每次都打原始值
+
 
 double now_seconds() {
     using clock = std::chrono::steady_clock;
@@ -460,6 +462,12 @@ private:
         uint64_t frames = 0;
         uint64_t prev_torque = 0, prev_visc = 0, prev_vib = 0;
 
+        // [ffbgap] (T9): 60 秒一行。故意比心跳(1 s)稀疏得多 —— 这是长期统计,
+        // 不是实时状态, 打太密只会让日志变贵。
+        dglab_idac::FfbGapStats gap_stats;
+        double last_gap_report = now_seconds();
+        constexpr double kGapReportSeconds = 60.0;
+
         while (running_) {
             next += period;
 
@@ -490,6 +498,32 @@ private:
                         static_cast<unsigned long long>(ffb.vibration_calls),
                         ffb.servo_on ? 1 : 0);
                 }
+                // ---- [ffbgap] 诊断: 只在"有新回调"时记一次 ----
+                // 用 torque_calls 的增量判断, 而不是每 tick 都记 —— 否则
+                // 采样频率就变成了主循环频率, 统计出来的东西没有意义。
+                if (ffb.torque_calls != prev_torque) {
+                    gap_stats.on_torque(t, ffb.torque_magnitude);
+                }
+                if (t - last_gap_report >= kGapReportSeconds) {
+                    last_gap_report = t;
+                    const uint64_t total = gap_stats.n_lt_05 + gap_stats.n_05_2 +
+                                           gap_stats.n_2_5 + gap_stats.n_gt_5;
+                    dglab_idac::log_info(
+                        "[ffbgap] t=%.0fs intervals=%llu <0.5s=%llu 0.5-2s=%llu "
+                        "2-5s=%llu >5s=%llu max=%.2fs zero_stops=%llu",
+                        t - start_time,
+                        static_cast<unsigned long long>(total),
+                        static_cast<unsigned long long>(gap_stats.n_lt_05),
+                        static_cast<unsigned long long>(gap_stats.n_05_2),
+                        static_cast<unsigned long long>(gap_stats.n_2_5),
+                        static_cast<unsigned long long>(gap_stats.n_gt_5),
+                        gap_stats.max_gap,
+                        static_cast<unsigned long long>(gap_stats.stops));
+                    // 每 60 秒清零一次: 想知道"最近 60 秒有没有卡", 而不是
+                    // 被整局平均值的稀释掉。
+                    gap_stats.reset();
+                }
+
                 prev_torque = ffb.torque_calls;
                 prev_visc = ffb.viscosity_calls;
                 prev_vib = ffb.vibration_calls;
