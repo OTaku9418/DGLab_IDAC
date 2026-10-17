@@ -125,6 +125,17 @@ bool read_bool(const std::string& file, const char* section, const char* key, bo
     return s == "1" || s == "true" || s == "True" || s == "TRUE" || s == "yes" || s == "on";
 }
 
+// 判断 INI 里到底有没有这个键。
+// 为什么需要: read_int/read_bool 传进去的是默认值, 分不清"键不存在"和
+// "键值恰好等于默认值"。对 dry_run 这种决定要不要真的通电的字段, 这两种
+// 情况必须区分开 —— 缺键要告警。用一个不可能出现的哨兵值探一次即可。
+bool has_key(const std::string& file, const char* section, const char* key) {
+    static const char* const kSentinel = "__dglab_missing_key__";
+    char buf[64]{};
+    ::GetPrivateProfileStringA(section, key, kSentinel, buf, sizeof(buf), file.c_str());
+    return std::strcmp(buf, kSentinel) != 0;
+}
+
 MapMode parse_map_mode(const std::string& s, MapMode def) {
     if (ieq(s, "linear")) return MapMode::Linear;
     if (ieq(s, "abs_linear") || ieq(s, "abslinear")) return MapMode::AbsLinear;
@@ -234,6 +245,12 @@ Config load_config(const std::string& ini_path) {
     cfg.log_file = read_str(ini_path, "general", "log_file", cfg.log_file);
 
     // ---- [link] ----
+    // 缺 mode 键时给一条明确提示: 以前的默认值是 WebSocket(未实现), 缺键
+    // 等于"什么都不连却看起来正常"; 现在是 Disabled, 也是不做任何事, 但至少
+    // 用户能在日志里看到原因。
+    if (!has_key(ini_path, "link", "mode")) {
+        log_warn("未配置 [link] mode, 按 %s 处理(不会连接任何设备)", to_string(cfg.link));
+    }
     {
         const std::string s = read_str(ini_path, "link", "mode", to_string(cfg.link));
         if (ieq(s, "ble") || ieq(s, "bluetooth")) {
@@ -302,7 +319,14 @@ Config load_config(const std::string& ini_path) {
     cfg.zero_when_servo_off = read_bool(ini_path, "safety", "zero_when_servo_off",
                                         cfg.zero_when_servo_off);
     cfg.warmup_ms           = read_int(ini_path, "safety", "warmup_ms", cfg.warmup_ms);
+    const bool has_dry_run_key = has_key(ini_path, "safety", "dry_run");
     cfg.dry_run             = read_bool(ini_path, "safety", "dry_run", cfg.dry_run);
+    // dry_run 缺键必须说清楚: 它是"要不要真的通电"的总开关, 静默取默认值
+    // 是最不该发生的。旧 INI 没有这个键 -> 现在是干跑(安全方向)。
+    if (!has_dry_run_key) {
+        log_warn("未配置 [safety] dry_run, 按 %d(干跑) 处理 —— 要真实输出请显式写 dry_run=0",
+                 cfg.dry_run ? 1 : 0);
+    }
 
     // ---- [ranges] ----
     cfg.torque_negative_is_positive =

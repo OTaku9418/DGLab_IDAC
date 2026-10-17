@@ -71,7 +71,10 @@ struct Config {
     std::string log_file            = "";      // 空 = 只写 UE4SS 日志
 
     // ---- [link] ----
-    LinkMode         link            = LinkMode::WebSocket;
+    // ★ 默认值必须是最安全的状态 ★
+    // 以前默认 WebSocket, 而 WebSocket 根本没实现 —— "忘了配 mode"的结果是
+    // 什么都不连, 日志上却一切正常。默认 Disabled 至少是明确地不做任何事。
+    LinkMode         link            = LinkMode::Disabled;
     ProtocolVersion  protocol        = ProtocolVersion::V3;
 
     // ---- [websocket] ----
@@ -146,7 +149,10 @@ struct Config {
     // 启动后前 N 毫秒强制输出 0, 让用户有时间确认连接
     int         warmup_ms           = 1500;
     // 全局总开关: 设为 false 时只记日志不发数据(干跑模式)
-    bool        dry_run             = false;
+    // ★ 默认 true ★: INI 里漏写这个键就等于允许真实输出, 与本项目"默认安全"
+    // 的设计意图相反 —— 一个字的遗漏不该产生电刺激。要真实输出必须在 INI 里
+    // 显式写 dry_run=0。缺键时 load_config 会打一条 WARN 提醒。
+    bool        dry_run             = true;
 
     // ---- [ranges] ----
     // 上面 ChannelMapping 里的 in_min/in_max 覆盖了标定; 这里额外给
