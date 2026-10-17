@@ -73,24 +73,39 @@ set(DGLAB_GAME_UE4SS_DIR ""
 
 set(UE4SS_DLL "" CACHE FILEPATH "游戏目录里的 UE4SS.dll(留空则自动推导)")
 
+# 有人显式给了线索却没找到, 就别再假装用那个默认值 —— 那会让日志里出现一条
+# 与本机无关的 D:\INDAC 路径, 看起来"找到了"其实什么都没验证(排查 ABI 问题时
+# 这种假信息最毒)。所以: 给过线索就以那条线索为准, 找不到就明说, 不往下走。
+set(_hinted FALSE)
 if(NOT UE4SS_DLL)
     if(DGLAB_DEPLOY_DIR)
+        set(_hinted TRUE)
         cmake_path(GET DGLAB_DEPLOY_DIR PARENT_PATH _mods_dir)
         cmake_path(GET _mods_dir PARENT_PATH _ue4ss_dir)
         set(_cand "${_ue4ss_dir}/UE4SS.dll")
         if(EXISTS "${_cand}")
             set(UE4SS_DLL "${_cand}")
+        else()
+            message(WARNING
+                "DGLAB_DEPLOY_DIR 指向 ${DGLAB_DEPLOY_DIR}, 由此推出的\n"
+                "  UE4SS.dll 不存在: ${_cand}\n"
+                "  没关系 —— 链接用的是 third_party/importlib/UE4SS.lib,\n"
+                "  不需要 UE4SS.dll。只是不能再帮你核对版本了。")
         endif()
     endif()
 endif()
-if(NOT UE4SS_DLL AND DGLAB_GAME_UE4SS_DIR)
+if(NOT UE4SS_DLL AND NOT _hinted AND DGLAB_GAME_UE4SS_DIR)
+    set(_hinted TRUE)
     set(_cand "${DGLAB_GAME_UE4SS_DIR}/UE4SS.dll")
     if(EXISTS "${_cand}")
         set(UE4SS_DLL "${_cand}")
+    else()
+        message(WARNING "DGLAB_GAME_UE4SS_DIR 下没有 UE4SS.dll: ${_cand}")
     endif()
 endif()
-if(NOT UE4SS_DLL)
-    # 开发机默认值。别人拿到这个仓库时上面几条都不成立, 会落到这里。
+if(NOT UE4SS_DLL AND NOT _hinted)
+    # 开发机默认值。别人拿到这个仓库时上面几条都没给, 会落到这里; 路径不存在
+    # 就直接留空, 什么都不报 —— 这是预期情况, 不是错误。
     set(_dev_default
         "D:/INDAC/MODAC321/WindowsNoEditor/GameProject/Binaries/Win64/ue4ss/UE4SS.dll")
     if(EXISTS "${_dev_default}")
@@ -100,23 +115,21 @@ endif()
 
 if(NOT EXISTS "${UE4SS_DLL}")
     # 注意: 这里**不是** FATAL。链接用的是 third_party/importlib/UE4SS.lib,
-    # UE4SS.dll 只在"重新生成导入库"时才需要。仓库里带着对齐好的 .lib,
-    # 所以没有游戏 DLL 的机器一样能编译 —— 这正是不把 DLL 提交进仓库的前提。
-    # 只有连导入库都没有时才真的没救(那个检查在下面链接段里)。
+    # UE4SS.dll 只在"重新生成导入库"时才需要。
+    # 连那个导入库也不必提交二进制: 仓库里带着 UE4SS.def, tools\bootstrap.cmd
+    # 用 lib.exe 直接吃 .def 就能生成 .lib —— 所以"没装游戏也能编译"。
+    # 真的什么导入库都没有时, 下面链接段会给出能照着做的指令。
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/importlib/UE4SS.lib")
         message(STATUS "DGLab_IDAC: 未找到 UE4SS.dll, 但导入库已存在 —— 编译不受影响")
     else()
-        message(FATAL_ERROR
-            "既找不到 UE4SS.dll, 也没有 third_party/importlib/UE4SS.lib。\n"
-            "  导入库需要从真实的 UE4SS.dll 生成, 所以至少要有一个:\n"
-            "  cmake -S . -B build -DUE4SS_DLL=<path-to>/ue4ss/UE4SS.dll\n"
-            "或指向游戏 mod 目录让它自己推导:\n"
-            "  cmake -S . -B build -DDGLAB_DEPLOY_DIR=<path-to>/ue4ss/Mods/DGLab_IDAC\n"
-            "然后用 tools\\make_ue4ss_implib.cmd 生成导入库。\n"
-            "当前解析结果: \"${UE4SS_DLL}\"")
+        message(STATUS "DGLab_IDAC: 未找到 UE4SS.dll 与导入库 —— 先跑 tools\\bootstrap.cmd")
     endif()
 endif()
-message(STATUS "DGLab_IDAC: UE4SS.dll = ${UE4SS_DLL}")
+if(UE4SS_DLL)
+    message(STATUS "DGLab_IDAC: UE4SS.dll = ${UE4SS_DLL}")
+else()
+    message(STATUS "DGLab_IDAC: UE4SS.dll = (未找到, 编译只用导入库)")
+endif()
 
 # ---------------------------------------------------------------------------
 # mod 本体
@@ -175,11 +188,21 @@ endif()
 # 进到 UE4SS 的装置里被消费的。
 # ---------------------------------------------------------------------------
 set(DGLAB_FMT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt")
-if(IS_DIRECTORY "${DGLAB_FMT_DIR}/src")
-    list(APPEND DGLAB_SOURCES
-        "${DGLAB_FMT_DIR}/src/format.cc"
-        "${DGLAB_FMT_DIR}/src/os.cc")
+if(NOT EXISTS "${DGLAB_FMT_DIR}/src/format.cc" OR NOT EXISTS "${DGLAB_FMT_DIR}/src/os.cc")
+    # 必须 FATAL。以前写成 if(IS_DIRECTORY ...) 只 list(APPEND), 文件夹不在时
+    # 一句都不报, 一路编到 DynamicOutput/Output.hpp 才报
+    #     fatal error C1083: 无法打开包含文件: "fmt/core.h"
+    # 把真正原因(这个目录在干净 clone 里被 .gitignore 排掉了)藏到后面。
+    message(FATAL_ERROR
+        "缺少 fmt 11.2.0 源文件: ${DGLAB_FMT_DIR}/src/{format.cc,os.cc}\n"
+        "  它已提交进仓库(见该目录下的 PROVENANCE.md)。恢复:\n"
+        "      git checkout -- _ue4ss_ref/third_party/fmt\n"
+        "  不能省: DynamicOutput 的头会 #include <fmt/core.h>, 而 UE4SS.dll 静态\n"
+        "  链的 fmt 没有导出, 版本还必须与 0196ef29 的 11.2.0 完全一致。")
 endif()
+list(APPEND DGLAB_SOURCES
+    "${DGLAB_FMT_DIR}/src/format.cc"
+    "${DGLAB_FMT_DIR}/src/os.cc")
 
 add_library(${PROJECT_NAME} SHARED ${DGLAB_SOURCES})
 
@@ -256,10 +279,14 @@ endforeach()
 # 版本必须与 UE4SS 在 0196ef29 用的完全一致: fmt 11.2.0 (见 deps/third/CMakeLists.txt
 # 里的 FetchContent GIT_TAG)。UE4SS 会给它打一个 "check 宏冲突" 补丁
 # (cmake/modules/MacroPatch.cmake -> fmt/ranges.h), 我们已经在固化的头文件里打过。
-if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt/include")
-    list(APPEND DGLAB_UE4SS_INCLUDES
-        "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt/include")
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt/include/fmt/core.h")
+    # 同样必须 FATAL —— 否则报的是一句 C1083, 看不出是"仓库里的 fmt 被排掉了"。
+    message(FATAL_ERROR
+        "缺少 fmt 头文件: _ue4ss_ref/third_party/fmt/include/fmt/core.h\n"
+        "  恢复:  git checkout -- _ue4ss_ref/third_party/fmt")
 endif()
+list(APPEND DGLAB_UE4SS_INCLUDES
+    "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt/include")
 
 list(REMOVE_DUPLICATES DGLAB_UE4SS_INCLUDES)
 
@@ -319,7 +346,9 @@ set(UE4SS_IMPLIB "${CMAKE_CURRENT_SOURCE_DIR}/third_party/importlib/UE4SS.lib")
 if(NOT EXISTS "${UE4SS_IMPLIB}")
     message(FATAL_ERROR
         "缺少 UE4SS 导入库: ${UE4SS_IMPLIB}\n"
-        "  先跑一次:  tools\\make_ue4ss_implib.cmd")
+        "  跑一次:  tools\\bootstrap.cmd\n"
+        "  它会用仓库里已提交的 third_party/importlib/UE4SS.def 生成 .lib ——\n"
+        "  **不需要游戏安装, 也不需要 UE4SS.dll**。")
 endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -346,7 +375,12 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 # 排查 ABI 问题时这个假信息非常致命。
 list(GET DGLAB_UE4SS_INCLUDES 0 _dglab_first_inc)
 message(STATUS "DGLab_IDAC: 生效的 UE4SS 头文件 = ${_dglab_first_inc}")
-message(STATUS "DGLab_IDAC: 链接 UE4SS.dll = ${UE4SS_DLL}")
+message(STATUS "DGLab_IDAC: 链接 UE4SS 导入库 = ${UE4SS_IMPLIB}")
+if(UE4SS_DLL)
+    message(STATUS "DGLab_IDAC: UE4SS.dll 版本参照 = ${UE4SS_DLL}")
+else()
+    message(STATUS "DGLab_IDAC: UE4SS.dll 版本参照 = (无 —— 只靠导入库, 不核对版本)")
+endif()
 message(STATUS "DGLab_IDAC: MinHook     = ${MINHOOK_DIR}")
 
 # ---------------------------------------------------------------------------

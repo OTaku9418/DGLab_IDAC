@@ -34,6 +34,9 @@
 *.json text eol=lf
 *.py   text eol=lf
 *.sh   text eol=lf
+# UE4SS 导出符号表(纯文本, 一行一个符号)。lib.exe 吃 LF 与 CRLF 生成的 .lib
+# **大小完全相同、导出表相同**(只差 MSF 头里的时间戳), 所以按普通文本存 LF。
+third_party/importlib/UE4SS.def text eol=lf
 
 # ---- 无扩展名的配置文件: 必须显式声明 ----
 # 为什么不能省: 没有规则时, 行尾由各人的 core.autocrlf 决定。本机是 true,

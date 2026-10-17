@@ -94,9 +94,9 @@ src/
     ble_winrt.cpp             ★ BLE 直连郊狼 (WinRT, 无第三方依赖)
     ble_winrt_stub.cpp        占位; 与 ble_winrt.cpp 二选一 (同符号)
 tools/
-  bootstrap.cmd               ★ 补齐依赖 (ABI 对齐头文件已在仓库里, 这一步只查它在不在)
+  bootstrap.cmd               ★ 补齐依赖 (头文件 + fmt + 导入库, 都在仓库里, 只查在不在)
   build.cmd                   构建 (+ -Deploy 直接铺进游戏, + -Stage N 写 bisect.txt)
-  make_ue4ss_implib.cmd       从 UE4SS.dll 生成导入库
+  make_ue4ss_implib.cmd       换 UE4SS 版本时重新 dump 导出表 -> UE4SS.def
   install_msvc.cmd            VS Build Tools 装到自定义盘
   mod_on.cmd / mod_off.cmd    把 <mod>\dlls 改名成 dlls.off, 用于 A/B 排查
   protocol_check.cpp          ★ 离线协议自检, 54 项, 基准是官方文档而非本项目实现
@@ -115,8 +115,10 @@ re/                           逆向脚本与报告 (非构建产物)
   disasm_indrun.py            capstone 反汇编 5 个 invoker
 ```
 
-> `_ue4ss_ref/ue4ss_0196ef29/` 与 `_ue4ss_ref/ue4ss_0196ef29_deps/` 是**提交进仓库**的
-> UE4SS 头文件 (约 330 KB), 见第 3 节"为什么头文件跟着仓库走"。
+> `_ue4ss_ref/` 下三样东西是**提交进仓库**的第三方依赖, 不是构建产物:
+> `ue4ss_0196ef29/` 与 `ue4ss_0196ef29_deps/` 的 ABI 对齐头文件 (约 330 KB)、
+> `third_party/fmt/` (fmt 11.2.0, 约 590 KB)。加上 `third_party/importlib/UE4SS.def`,
+> 一共约 1.3 MB, 换来"没有游戏安装也能构建"。见第 3 节。
 
 ---
 
@@ -128,7 +130,7 @@ re/                           逆向脚本与报告 (非构建产物)
 | 编译器 | MSVC v143 x64 (**必须 Release**, 必须 **`/MD`**) |
 | CMake | ≥ 3.18 |
 | VS 组件 | `Microsoft.VisualStudio.Component.VC.Tools.x86.x64` + Windows SDK |
-| 第三方 | MinHook (子模块)、RE-UE4SS **v3.0.1 头文件**、UE4SS 导入库 |
+| 第三方 | MinHook (子模块); RE-UE4SS **0196ef29** 头文件 + fmt 11.2.0 + UE4SS.def **都在仓库里** |
 
 > **为什么必须 `/MD` + Release**: UE4SS 官方文档原话 —— C++ mod 与 UE4SS 必须使用
 > **同一个 C 运行时版本和构建配置**, 否则 `std::string`/`std::vector` 跨 DLL 边界就崩。
@@ -142,18 +144,31 @@ tools\bootstrap.cmd
 tools\build.cmd -Deploy
 ```
 
-`bootstrap.cmd` 做三件事: 确认 ABI 对齐的 UE4SS 头文件在位 (它们在仓库里, 正常跳过)、
-初始化 MinHook 子模块、从游戏自带的 `UE4SS.dll` 生成导入库。
+`bootstrap.cmd` 做三件事: 确认 ABI 对齐的 UE4SS 头文件与 fmt 11.2.0 在位 (两者都在仓库里,
+正常跳过)、初始化 MinHook 子模块、用仓库里的 `UE4SS.def` 生成导入库。
 
-**在别的机器上**: 仓库里没有任何路径是通用的, 游戏目录需要你自己给。两种办法 ——
+**不需要装游戏, 也不需要 `UE4SS.dll`。** 这三样第三方依赖全都在仓库里:
+
+| 依赖 | 位置 | 为什么不能现拉 |
+|---|---|---|
+| ABI 对齐头文件 | `_ue4ss_ref\ue4ss_0196ef29*` | 必须是 0196ef29 那个 commit, 不能是 tag v3.0.1 (见下) |
+| fmt 11.2.0 | `_ue4ss_ref\third_party\fmt` | 版本必须与 UE4SS 静态链的那份一致, 且带 UE4SS 的 check 宏补丁 |
+| 导入库来源 | `third_party\importlib\UE4SS.def` | 4067 行导出符号; `lib /def` 几秒生成 `.lib` |
+
+`UE4SS.dll` 只在**换 UE4SS 版本、要重新 dump 导出表**时才需要 (那时跑
+`tools\make_ue4ss_implib.cmd`)。构建时它可有可无 —— 找不到就少一条版本核对信息。
+
+**在别的机器上**: 只有 `-Deploy` (往游戏目录铺) 需要知道游戏在哪。
 
 ```cmd
 set DLAB_DEPLOY_DIR=D:\你的游戏\WindowsNoEditor\GameProject\Binaries\Win64\ue4ss\Mods\DGLab_IDAC
-tools\bootstrap.cmd
+tools\build.cmd -Deploy
 ```
 
-或者直接 `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DDGLAB_DEPLOY_DIR="..."`。
-`UE4SS.dll` 的路径会从 mod 目录往上两级自动推导, 也可以用 `-DUE4SS_DLL=` 直接指定。
+或者 `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DDGLAB_DEPLOY_DIR="..."`。
+`UE4SS.dll` 的路径会从 mod 目录往上两级推导, 也可以用 `-DUE4SS_DLL=` 直接指定。
+给的线索找不到时 CMake 会打一条 WARNING 然后只靠导入库继续 (不会偷偷回退到别人的
+`D:\INDAC` 路径 —— 那种"看起来找到了"的假信息在排查 ABI 问题时最毒)。
 不部署 (不加 `-Deploy`) 时产物就留在 `build\Release\DGLab_IDAC.dll`。
 
 **为什么头文件跟着仓库走**: `_ue4ss_ref\ue4ss_0196ef29\` 不是上游 tag `v3.0.1` 的头文件,
@@ -176,6 +191,11 @@ tools\bootstrap.cmd
 glaze/ImGui/zydis/PolyHook2/raw_pdb 走 `FetchContent`, 其中多个用 `git@github.com:`
 的 SSH URL (无 SSH key 直接失败), 还依赖 **corrosion(Rust 工具链)**, 约 20 分钟且脆弱。
 改为直接链接游戏里**正在运行的那一份** `UE4SS.dll`: 版本天生一致, 构建几秒完成。
+
+**为什么提交 `.def` 而不是 `.lib`**: 导入库是派生数据, 而且绑死 MSVC 版本 —— 换一台
+机器或换个 VS 版本, 提交的 `.lib` 就可能链接不上。`.def` 是纯文本 (4067 行), 与编译器
+无关, `lib /def:UE4SS.def /machine:x64 /out:UE4SS.lib` 现场生成。实测两条路得到的
+`.lib` 大小完全相同 (2,155,224 字节)、导出表相同, 只在 MSF 头的时间戳上有差别。
 
 ### 手动等价命令
 ```cmd
