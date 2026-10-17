@@ -248,22 +248,7 @@ HRESULT activate_instance_and_qi(const wchar_t* runtime_class, REFIID iid, void*
     inst->Release();
     return hr;
 }
-// "静默帧": 全 0 强度 + 10 频率。绝不发未初始化的字节。
-Frame make_idle_frame() {
-    Frame f;
-    f.servo_on = false;
-    f.muted = true;
-    f.mute_reason = "ble-idle";
-    for (int i = 0; i < kSlotsPerFrame; ++i) {
-        f.a.slots[i].pulse_intensity = 0;
-        f.a.slots[i].pulse_frequency = 10;
-        f.b.slots[i].pulse_intensity = 0;
-        f.b.slots[i].pulse_frequency = 10;
-    }
-    f.a.strength = 0;
-    f.b.strength = 0;
-    return f;
-}
+// (静默帧构造已上移到 transport.cpp 的 make_idle_frame(const char*), 便于离线测试)
 
 // ---------------------------------------------------------------------------
 // 事件回调与工作线程共享的状态。
@@ -469,11 +454,8 @@ private:
     std::atomic<bool> running_{false};
     std::shared_ptr<SharedState> shared_;
 
-    // 信箱: 深度 1, 覆盖式。读的时候不清空 —— 否则提交频率低于帧率时会
-    // 在"真帧"和"静默帧"之间来回跳。
-    mutable std::mutex frame_mu_;
-    Frame pending_{};
-    bool ever_submitted_ = false;
+    // 信箱: 深度 1, 覆盖式, 内含 [safety] watchdog_ms 的看门狗。
+    FrameMailbox mailbox_;
 
     // 诊断(互斥量保护, status() 可能从游戏线程调用)
     mutable std::mutex stat_mu_;
@@ -608,23 +590,28 @@ void BleWinRtTransport::stop() {
 }
 
 void BleWinRtTransport::submit(const Frame& f) {
-    std::lock_guard<std::mutex> lk(frame_mu_);
-    pending_ = f;  // 深度 1, 直接覆盖
-    ever_submitted_ = true;
+    mailbox_.put(f, steady_now_ms());
 }
 
 std::string BleWinRtTransport::status() const {
     std::lock_guard<std::mutex> lk(stat_mu_);
-    char buf[320]{};
+    char buf[448]{};
     // 把 B1 计数放进 status: "设备到底会不会发 B1" 是判链路语义的关键问题,
     // 而它只能靠这个数字回答 —— 只写日志的话得等跑完翻文件才能看见。
     const uint64_t b1c = shared_ ? shared_->b1_count : 0;
     const int b1a = shared_ ? shared_->b1_last_a : -1;
     const int b1b = shared_ ? shared_->b1_last_b : -1;
+    // 看门狗与信箱计数: trips>0 说明管线侧真的断过, over>0 说明传输跟不上。
+    // 这两个数字是判断"到底是谁卡住了"的唯一凭据。
+    const MailboxStats ms = mailbox_.stats();
     std::snprintf(buf, sizeof(buf),
-                  "BLE state=%s rssi=%d writes=%llu errors=%llu b1=%llu lastA=%d lastB=%d", state_.c_str(),
-                  last_rssi_, static_cast<unsigned long long>(writes_), static_cast<unsigned long long>(errors_),
-                  static_cast<unsigned long long>(b1c), b1a, b1b);
+                  "BLE state=%s rssi=%d writes=%llu errors=%llu b1=%llu lastA=%d lastB=%d "
+                  "wd=%d trips=%llu dup=%llu over=%llu idle=%llu",
+                  state_.c_str(), last_rssi_, static_cast<unsigned long long>(writes_),
+                  static_cast<unsigned long long>(errors_), static_cast<unsigned long long>(b1c), b1a, b1b,
+                  ms.watchdog_trips > 0 ? 1 : 0, static_cast<unsigned long long>(ms.watchdog_trips),
+                  static_cast<unsigned long long>(ms.repeated), static_cast<unsigned long long>(ms.overwritten),
+                  static_cast<unsigned long long>(ms.idle_sent));
     return std::string(buf);
 }
 
@@ -732,12 +719,11 @@ void BleWinRtTransport::worker_entry() {
                         break;
                     }
 
-                    // 取最新一帧; 从没提交过就用静默帧
-                    Frame f;
-                    {
-                        std::lock_guard<std::mutex> lk(frame_mu_);
-                        f = ever_submitted_ ? pending_ : make_idle_frame();
-                    }
+                    // 取最新一帧。从没提交过、或管线超过 watchdog_ms 没提交,
+                    // 信箱内部会自动给静默帧 —— 所以这里拿到的永远是可以安全
+                    // 下发的帧, 不需要在这里判空。
+                    const MailboxTake tk = mailbox_.take(steady_now_ms(), cfg_.watchdog_ms);
+                    const Frame& f = tk.frame;
 
                     const int want_a = clamp_strength(f.a.strength);
                     const int want_b = clamp_strength(f.b.strength);

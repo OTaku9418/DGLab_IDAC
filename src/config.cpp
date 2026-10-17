@@ -352,6 +352,18 @@ Config load_config(const std::string& ini_path) {
     clamp_int(cfg.pulse_freq_max, 10, 240, "[output] pulse_freq_max");
     clamp_int(cfg.warmup_ms, 0, 60000, "[safety] warmup_ms");
     clamp_int(cfg.watchdog_ms, 50, 60000, "[safety] watchdog_ms");
+    // watchdog_ms 必须明显大于帧周期: 管线按 frame_ms 节拍提交, 而 Windows
+    // 默认定时器精度约 15.6 ms, 正常的调度抖动会让帧间隔偶尔超过 frame_ms。
+    // 门槛取 3 倍是留够两次迟到的余量。不提供"0 = 关闭"—— 看门狗是安全阀,
+    // 不能因为配错一个数字就整条失效。
+    {
+        const int wd_floor = cfg.frame_ms * 3;
+        if (cfg.watchdog_ms < wd_floor) {
+            log_warn("[safety] watchdog_ms(%d) < 3*frame_ms(%d), 会误触发, 已抬到 %d",
+                     cfg.watchdog_ms, wd_floor, wd_floor);
+            cfg.watchdog_ms = wd_floor;
+        }
+    }
     // 自动增益: floor 不能超过 ceiling, 否则归一化区间是负的, 会整体归零。
     clamp_int(cfg.gain_floor, 1, 200, "[output] gain_floor");
     clamp_int(cfg.gain_ceiling, 1, 200, "[output] gain_ceiling");
@@ -532,8 +544,8 @@ bool write_default_config(const std::string& ini_path) {
     w("safety", "max_strength", "40");
     w("safety", "clamp_strength", "40");
     w("safety", "slew_per_second", "40");
-    // ★ watchdog_ms 目前未实现, 配了不生效 —— 没有任何代码读它。
-    // 参见 src/config.hpp 的说明; 别把它当安全保证。
+    // watchdog_ms: 管线超过这么多毫秒没提交新帧, 传输层改发静默帧。
+    // 判据是"管线有没有在提交帧", 不是"力反馈回调有没有来"(回调是边沿触发的)。
     w("safety", "watchdog_ms", "500");
     w("safety", "zero_when_servo_off", "1");
     w("safety", "warmup_ms", "1500");

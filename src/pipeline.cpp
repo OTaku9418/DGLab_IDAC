@@ -283,11 +283,35 @@ bool Pipeline::tick(double now, const FfbState& ffb, Frame& out) {
     out = Frame{};
     out.servo_on = ffb.servo_on;
 
-    const double dt = (last_tick_ > 0.0) ? (now - last_tick_) : 0.0;
+    const double dt_raw = (last_tick_ > 0.0) ? (now - last_tick_) : 0.0;
+
+    // ---- 看门狗 ----
+    // 判据是"本 tick 距上一 tick 太久", 也就是**管线自己停顿过**(主线程被
+    // 别的东西占住、断点、机器休眠)。这不是"游戏没给数据"—— 力反馈回调是
+    // 边沿触发的, 力不变时不回调完全正常, 拿它做判据会一直误触发。
+    const bool stalled = (last_tick_ > 0.0) && (cfg_.watchdog_ms > 0) &&
+                         (dt_raw * 1000.0 > static_cast<double>(cfg_.watchdog_ms));
     last_tick_ = now;
+    // 停顿后绝不能拿 dt_raw 算斜率: 那等于把停顿时长一次性乘进斜率里,
+    // 一帧就从 0 跳到满值。按 dt=0 处理, 本帧强度保持不变。
+    const double dt = stalled ? 0.0 : dt_raw;
+
+    if (stalled) {
+        // 安全起步: 强度累积清零 + 重新预热, 让手感从 0 慢慢爬回去,
+        // 而不是"停顿结束后突然满力"。
+        slew_a_ = 0.0;
+        slew_b_ = 0.0;
+        applied_strength_ = 0.0;
+        boot_time_ = now;
+        log_warn("管线停顿 %.0f ms 超过 watchdog_ms=%d, 输出归零并重新预热",
+                 dt_raw * 1000.0, cfg_.watchdog_ms);
+    }
 
     const char* reason = "";
     const bool muted = evaluate_safety(now, ffb, reason);
+    // 传给上层(诊断用)。放在 evaluate_safety 之后, 免得覆盖里边写的标志。
+    safety_.watchdog_tripped = stalled;
+
 
     // ---- 自动增益: 每 tick 推进一次包络, 供本帧的 A/B 两路归一化使用 ----
     // 必须在 map_input 之前, 因为 map_input 读的是本帧算出来的增益。

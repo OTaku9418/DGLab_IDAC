@@ -403,3 +403,37 @@ if(MSVC)
         NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# logic_check —— 信箱/看门狗/静默帧/管线的离线逻辑自检 (普通控制台程序)
+#
+# 存在的理由: 看门狗只在**出故障的时候**才生效, 平时跑一万次也看不出问题。
+# 等真出事(游戏卡死 2 秒)才发现它没接上, 代价是设备在错误强度上一直输出。
+# 所以判定逻辑必须能离线测 —— FrameMailbox 的时间由调用方传入, 不依赖真时钟。
+#
+# 与 protocol_check 的分工: protocol_check 管"字节编码对不对", logic_check
+# 管"什么时候该发什么"。两者都不链 UE4SS / WinRT / minhook。
+#
+# 构建:  cmake --build build --config Release --target logic_check
+# 运行:  build\Release\logic_check.exe    (全通过返回 0)
+# ---------------------------------------------------------------------------
+add_executable(logic_check
+    tools/logic_check.cpp
+    ${DGLAB_PROTOCOL_SRC}
+    src/pipeline.cpp
+    src/logger.cpp
+)
+
+target_include_directories(logic_check PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+
+set_property(TARGET logic_check PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+if(MSVC)
+    target_compile_options(logic_check PRIVATE
+        /utf-8 /W4 /permissive- /Zc:__cplusplus /EHsc /MP /wd4100
+    )
+    target_compile_definitions(logic_check PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
+    )
+endif()
