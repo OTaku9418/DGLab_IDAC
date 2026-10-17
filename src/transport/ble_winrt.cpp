@@ -431,6 +431,8 @@ private:
     bool connect_and_setup();
     bool subscribe_notify_and_conn();
     bool send_bf();
+    // 停止前尽力发一帧归零。失败只记日志, 不抛也不重试 —— 它跑在退出路径上。
+    void send_shutdown_idle();
     void send_loop();
     void teardown_link();
     void wait_ms(DWORD ms) const;
@@ -858,6 +860,20 @@ void BleWinRtTransport::worker_entry() {
                         next_deadline = now + frame_dur;
                     }
                 }
+            }
+
+            // --- (f2) 正常停止: 尽力把强度归零 ---
+            // 发送循环退出有两种原因: 链路死了(break) 或 running_ 被 stop() 置 false。
+            // 后一种是正常退出, 此时链路还通 —— 必须主动发一帧 0。
+            //
+            // 为什么不能靠"下次连接再说": 断链时设备是保持强度还是归零, 官方
+            // 文档没写(README §7), 按"保持"设计。人手边不一定有硬件开关。
+            //
+            // 只发 1 帧、不等 B1 应答、失败只记日志: 这跑在退出路径上, 不能让
+            // 一次写超时把 stop() 的 join 拖住。
+            if (!running_.load(std::memory_order_acquire) && shared_ != nullptr &&
+                !shared_->link_down.load(std::memory_order_acquire)) {
+                send_shutdown_idle();
             }
 
             // --- (g) 重连 ---
@@ -1422,6 +1438,43 @@ bool BleWinRtTransport::send_bf() {
     }
     log_info("BLE: 已发送 BF 软限位 A=B=%d", lim);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 停止前把强度归零。
+//
+// 场景: stop() 把 running_ 置 false, 发送循环退出, 接着 teardown_link() 断链。
+// 如果最后发出去的那一帧带着强度, 而设备在断链后保持强度, 用户就处在一个
+// "程序已经关了、电极还在输出"的状态 —— 这是本项目最不能接受的状态。
+//
+// 为什么用 StrengthMode::Unchanged 传进去: encode_b0 里强度为 0 的通道会被
+// 强制提升成"绝对设置"(见 protocol_check 的静音路径用例)。传 Unchanged 是
+// 为了让那个强制逻辑生效, 而不是赌它 —— 真按 Unchanged 编出去的话设备会
+// **保持旧强度**, 正是我们要避免的结果。
+// ---------------------------------------------------------------------------
+void BleWinRtTransport::send_shutdown_idle() {
+    bool valid_a = false;
+    bool valid_b = false;
+    const Frame idle = make_idle_frame("shutdown");
+    const B0 cmd = encode_b0(idle, StrengthMode::Unchanged, StrengthMode::Unchanged, 0, &valid_a, &valid_b);
+
+    const int frame_ms = cfg_.frame_ms > 0 ? cfg_.frame_ms : 100;
+    // 上限 200 ms: 正常一帧的写只要几毫秒, 这里给两倍帧周期已经够宽松。
+    // 卡住的时候宁可放弃归零也不能让退出流程停在这里。
+    const DWORD write_timeout = static_cast<DWORD>((std::min)(200, frame_ms * 2));
+
+    const HRESULT hr = write_bytes(cmd.bytes, static_cast<uint32_t>(kB0Size), write_timeout);
+    if (FAILED(hr)) {
+        const std::string e = hresult_hex(hr);
+        log_warn("BLE: 停止归零帧发送失败 (HRESULT=%s) —— 设备可能仍保持最后的强度, "
+                 "请手动关闭通道或断开电极", e.c_str());
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(stat_mu_);
+        ++writes_;
+    }
+    log_info("BLE: 已发送停止归零帧 %s", cmd.to_hex().c_str());
 }
 
 HRESULT BleWinRtTransport::get_buffer(uint32_t len, IBuffer** out) {

@@ -270,6 +270,18 @@ void test_idle_frame_encoding() {
     }
     check(b0.bytes[4] >= 10 && b0.bytes[4] <= 240, "A 槽频率落在 10..240");
     check(b0.bytes[12] >= 10 && b0.bytes[12] <= 240, "B 槽频率落在 10..240");
+
+    // 停止归零帧(BleWinRtTransport::send_shutdown_idle)走的是 Unchanged 路径。
+    // 它必须在编码里被提升成"绝对设置 0": 真按 Unchanged 编出去的话设备会
+    // **保持旧强度**, 结果就是"程序已经关了、电极还在输出"。
+    bool va2 = false;
+    bool vb2 = false;
+    const B0 shut = encode_b0(f, StrengthMode::Unchanged, StrengthMode::Unchanged, 0, &va2, &vb2);
+    check_eq((shut.bytes[1] >> 2) & 0x03, 3, "停止归零: 强度 0 + Unchanged => A 提升为绝对设置");
+    check_eq(shut.bytes[1] & 0x03, 3, "停止归零: 强度 0 + Unchanged => B 提升为绝对设置");
+    check_eq(shut.bytes[2], 0, "停止归零: A 强度字节 = 0");
+    check_eq(shut.bytes[3], 0, "停止归零: B 强度字节 = 0");
+    check_eq(shut.seq(), 0, "停止归零: seq=0 (不等 B1 应答)");
 }
 
 // ---------------------------------------------------------------------------
