@@ -451,6 +451,8 @@ private:
 
         auto next = clock::now();
         double last_heartbeat = 0.0;
+        // [tx] 另一条独立的 10 秒计时: 心跳是每秒一次的, 传输层状态没必要跟着刷。
+        double last_tx_report = 0.0;
         double start_time = now_seconds();
 
         uint64_t frames = 0;
@@ -516,6 +518,16 @@ private:
                         s.servo_on ? 1 : 0,
                         source_->status_report().c_str(),
                         pipeline_ ? pipeline_->gain_summary().c_str() : "pipeline=null");
+
+                    // ---- 传输层状态: 每 10 秒一行(不是每秒, 否则日志本身就成了负担) ----
+                    // 为什么要单独打这个: 传输层的计数(submitted/repeated/overwritten)
+                    // 从来没进过周期日志, 而它正是"管线与传输两个线程的相位对不对"
+                    // 的唯一证据。repeated 高说明传输比管线快、在重发旧帧; overwritten
+                    // 高说明传输跟不上、帧被丢弃。两者都高就是相位打架。
+                    if (transport_ != nullptr && t - last_tx_report >= 10.0) {
+                        last_tx_report = t;
+                        dglab_idac::log_info("[tx] %s", transport_->status().c_str());
+                    }
 
                     // 明确告警: 挂了 hook 但一次回调都没有 —— 说明要么还没进
                     // 游戏, 要么力反馈通路在 mode=xinput 下根本不走。
