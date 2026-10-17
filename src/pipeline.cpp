@@ -248,7 +248,8 @@ bool Pipeline::evaluate_safety(double now, const FfbState& ffb, const char*& rea
     }
 
     // 2) 看门狗位置说明: 真正"数据流停了就归零"的看门狗不在这里, 在
-    //    src/frame_mailbox.cpp 的 FrameMailbox 里 —— 它盯的是"管线 -> 传输"
+    //    src/transport/transport.cpp 的 FrameMailbox 里(声明在 transport.hpp)
+    //    —— 它盯的是"管线 -> 传输"
     //    这一段是否还在出帧, 停了就改发静默帧(强度 0、无脉冲), 配置项是
     //    [safety] watchdog_ms, 最小值被钳到 3×frame_ms。
     //    这里只做"从来没有数据"和"servo 状态"两件事。

@@ -448,8 +448,11 @@ set_target_properties(abitest PROPERTIES
 # 运行:  build\Release\protocol_check.exe    (全通过返回 0)
 # ---------------------------------------------------------------------------
 set(DGLAB_PROTOCOL_SRC "src/transport/transport.cpp")
+# 以前这里会静默回退到 src/transport/transport_stub.cpp —— 那个文件根本不存在,
+# 所以回退分支只会在"transport.cpp 被改名"时把一个更隐蔽的错误丢给编译器。
+# 缺文件就直接报错。
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${DGLAB_PROTOCOL_SRC}")
-    set(DGLAB_PROTOCOL_SRC "src/transport/transport_stub.cpp")
+    message(FATAL_ERROR "缺少 ${DGLAB_PROTOCOL_SRC} —— protocol_check 需要它来验证 B0/BF 编码")
 endif()
 
 add_executable(protocol_check
