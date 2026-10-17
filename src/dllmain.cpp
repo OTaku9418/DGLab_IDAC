@@ -19,7 +19,9 @@
 //   构建配置**。所以:
 //     * 必须 Release 构建(UE4SS.dll 是 Game__Shipping__Win64 (MSVC))
 //     * 必须 /MD(它导入 msvcp140.dll / vcruntime140.dll)
-//     * CppUserModBase 的 vtable 布局必须完全一致 —— 所以我们锁死 v3.0.1
+//     * CppUserModBase 的 vtable 布局必须完全一致 —— 所以我们锁死的是
+//       _ue4ss_ref/ue4ss_0196ef29 这份对齐头文件(commit 0196ef294f852), 它
+//       不是上游 tag v3.0.1(d935b5b), 两者相差 944 个提交、vtable 槽位不同。
 //   下面的 static_assert 与运行期自检就是为了让"配错了"变成可见的失败,
 //   而不是随机崩溃。
 // ---------------------------------------------------------------------------

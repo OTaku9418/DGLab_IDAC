@@ -285,7 +285,9 @@ Config load_config(const std::string& ini_path) {
     cfg.ble_connect_timeout_ms = read_int(ini_path, "ble", "connect_timeout_ms",
                                           cfg.ble_connect_timeout_ms);
 
-    // ---- [websocket] (预留) ----
+    // ---- [websocket] (旧设计遗留, 解析保留但无人消费) ----
+    // 将来实现 Socket 输出时这些键会被重新定义, 不要基于 bind/port 的
+    // "PC 做服务端" 语义去写新代码。见 docs/research-dglab-transport.md 第 1.2 节。
     cfg.ws_bind_address = read_str(ini_path, "websocket", "bind", cfg.ws_bind_address);
     cfg.ws_port         = static_cast<uint16_t>(read_int(ini_path, "websocket", "port", cfg.ws_port));
     cfg.ws_path         = read_str(ini_path, "websocket", "path", cfg.ws_path);

@@ -247,12 +247,14 @@ bool Pipeline::evaluate_safety(double now, const FfbState& ffb, const char*& rea
         return true;
     }
 
-    // 2) 看门狗: 游戏停止喂数据(卡死/退出/挂载掉了)时把输出拉回 0。
-    //    注意用 ffb.latest_at() 而不是"上次 tick 时间" —— 力反馈回调是
-    //    **边沿触发**的(IndRun 内部有变化缓存, 值不变就不回调), 所以
-    //    "很久没回调" 完全可能只是"方向盘没动", 不是故障。
-    //    真正要防的是"servo 开着但数据流彻底停了", 这个由传输层的
-    //    silence 帧兜底; 这里只处理 servo 状态。
+    // 2) 看门狗位置说明: 真正"数据流停了就归零"的看门狗不在这里, 在
+    //    src/frame_mailbox.cpp 的 FrameMailbox 里 —— 它盯的是"管线 -> 传输"
+    //    这一段是否还在出帧, 停了就改发静默帧(强度 0、无脉冲), 配置项是
+    //    [safety] watchdog_ms, 最小值被钳到 3×frame_ms。
+    //    这里只做"从来没有数据"和"servo 状态"两件事。
+    //    为什么不在这里按 FFB 回调间隔判断: 回调是**边沿触发**的(IndRun 内部
+    //    有变化缓存, 值不变就不回调), "很久没回调" 通常只是"方向盘没动",
+    //    不是故障。按它判断会误归零。
     if (!ffb.ever_updated) {
         // 一次都没收到过回调 —— 可能还没进游戏, 也可能 hook 没生效
         reason = "no_ffb_data_yet";

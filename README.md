@@ -276,8 +276,13 @@ servo on/off = 1/1, state=1
 - 建议 500 Ω 下 r.m.s. 电流远低于 50 mA、单次 ~30 min、变换频率、插入休息期
 - 郊狼的 **BF 软上限**是最后一道安全阀 (滚轮和 B0 都无法突破), 但它**断电保存**,
   且每次重连后都必须重发
-- 断链时设备对通道强度是保持还是归零**未文档化** —— 按"保持"设计:
-  看门狗归零 + BF 软上限 + 手边留硬件开关
+- 断链时设备对通道强度是保持还是归零**未文档化** —— 按"保持"设计。实际存在的三道兜底:
+  1. **看门狗** (`[safety] watchdog_ms`, 默认 500, 下限 `3*frame_ms`): 管线超过这个时间没提交
+     新帧, 传输层就不再发上一帧, 改发**静默帧** (强度字节 0、无脉冲); 管线自身停顿超时也会
+     清零强度累积并重新预热, 避免恢复瞬间一帧跳到满力。
+  2. **BF 软上限** (`max_strength`), 设备侧硬顶, 滚轮和 B0 都突破不了。
+  3. **手边留物理断电开关** —— 前面两条都在软件里, 软件卡死时只有拔电可靠。
+  `dry_run=1` 是配置层的硬开关, 走空输出, 连 BLE 都不建立。
 
 ---
 
@@ -292,12 +297,22 @@ servo on/off = 1/1, state=1
 - 强度变化时序列号非 0, 且**要等 B1 回来**才能发下一次强度修改
 - 官方仓库 [`dungeonlab-open/dglab-bluetooth-protocol`](https://github.com/dungeonlab-open/dglab-bluetooth-protocol)
   只有 **BLE** 规范 (`coyote/v3/README.md`)
-- 另有 **SOCKET (WebSocket) 控制协议**, 在另一个官方仓库
-  [`dungeonlab-open/dglab-websocket-simple`](https://github.com/dungeonlab-open/dglab-websocket-simple)
-  的 `socket/` 目录 (**该仓库已归档**), 中继服务器是
-  [`dungeonlab-open/dglab-websocket-server`](https://github.com/dungeonlab-open/dglab-websocket-server)。
-  它**不是 BLE 的替代品**: 走那条路时手机 APP 仍是 BLE 中枢, PC 只是通过服务器把排好队的
-  数据交给 APP 转发, 且必须扫码配对。本项目选 BLE 直连的理由见 `docs/research-dglab-transport.md` 第 1.1 节
+- 另有 **SOCKET (WebSocket) 控制协议**, 与本 mod 走的 BLE 完全独立:
+  - **V3** (旧): 规范在
+    [`dungeonlab-open/dglab-websocket-simple`](https://github.com/dungeonlab-open/dglab-websocket-simple)
+    的 `socket/` 目录, **该仓库已归档**; 一对一配对, JSON 四字段 `{type,clientId,targetId,message}`,
+    波形按 `pulse-A:[...]` 批量队列下发。
+  - **V4** (现行, 官方推荐): 中继服务器
+    [`dungeonlab-open/dglab-websocket-server`](https://github.com/dungeonlab-open/dglab-websocket-server)
+    的 `v4-server.ts` (默认 9998), SDK 是
+    [`dungeonlab-open/dglab-kit`](https://github.com/dungeonlab-open/dglab-kit)。**一个控制端对多个 APP**;
+    控制器先连上拿到 `clientId`, APP 用 `?tid=<clientId>` 连进来; 设备命令不在服务器解析, 而是
+    `data` 里的 RPC (`device.op` / `device.op.clear` / `devices.get`), 由 SDK 生成; 意图是
+    **定时任务** (`addIntensity` / `setTempIntensity(…,duration)` / `sendPulse(…,duration,frames)`,
+    带 priority 与 immediate), 不是逐帧字节。
+  - 两条路**都不是 BLE 的替代品**: 中继服务器没有蓝牙栈, 手机 APP 仍是 BLE 中枢, 也必须扫码配对。
+    PC 只是多一跳网络把命令交给 APP。本项目选 BLE 直连的理由见
+    `docs/research-dglab-transport.md` 第 1.1 / 1.2 节; `[link] mode=websocket` 因此仍未实现
 
   项目后续可能会提供使用Socket连接方案的替代版本
 

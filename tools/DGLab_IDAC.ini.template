@@ -28,7 +28,9 @@ verbose=1
 ; mode : 输出到哪。数值是字符串:
 ;        disabled  不连任何设备(纯干跑, 但仍然跑管线与日志) —— 排障首选
 ;        ble       PC 直接做 BLE 中央设备连郊狼主机, 不需要手机 ← 生产用法
-;        websocket 未实现(需要手机 APP 中转, 见 docs/research-dglab-transport.md 第 1.1 节)
+;        websocket 暂未实现。官方的 SOCKET 方案(V4 中继)仍然要让手机 APP
+;                  参与: 本程序做"控制器"连中继服务器, 手机 APP 再连过来。
+;                  详见 docs/research-dglab-transport.md 第 1.2 节
 ; protocol : 郊狼协议版本。目前只支持 v3。数值是字符串。
 mode=ble
 protocol=v3

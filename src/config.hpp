@@ -78,7 +78,12 @@ struct Config {
     ProtocolVersion  protocol        = ProtocolVersion::V3;
 
     // ---- [websocket] ----
-    // 本机做服务端, DGLab 客户端/APP 连过来。需要本机蓝牙的那个方案不用它。
+    // ★ 这是"PC 做服务端"旧设计的遗留键, 当前没有任何代码消费它们 ★
+    // (解析留着只为不破坏老 INI 的手感)。真正的 Socket 方案是官方
+    // dglab-websocket-server 的 V4 中继: 第三方控制器(即本程序)连到中继
+    // 服务器, 手机 APP 再用 tid 连过来 —— 方向与这里的 "本机 bind/port"
+    // 相反, 而且服务端没有 BLE, 手机仍然是必经环节。
+    // 详见 docs/research-dglab-transport.md 第 1.2 节。
     std::string ws_bind_address     = "127.0.0.1";
     uint16_t    ws_port             = 9999;
     std::string ws_path             = "/dglab";

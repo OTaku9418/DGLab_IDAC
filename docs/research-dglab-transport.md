@@ -121,6 +121,65 @@ Consequences for us (racing FFB, streaming real-time signal):
 
 **Decision: stay on BLE-direct** (`[link] mode=ble`). This is what is already implemented.
 
+### 1.2 Update (added later): the SOCKET protocol has moved on to V4
+
+§1.1 describes **V3** of the SOCKET protocol, and its conclusions are scoped to V3. Since then the vendor
+shipped **V4**, and the V3 spec repository (`dglab-websocket-simple`) has been archived. The live, maintained
+counterparts are:
+
+- [`dungeonlab-open/dglab-websocket-server`](https://github.com/dungeonlab-open/dglab-websocket-server) —
+  reference relay, now containing **two** servers side by side: `v4-server.ts` (default port `9998`, V4,
+  "the recommended protocol") and `v3-server.ts` (port `9999`, kept as legacy). Both are Bun/TypeScript.
+- [`dungeonlab-open/dglab-kit`](https://github.com/dungeonlab-open/dglab-kit) — the TypeScript SDK that
+  actually generates device commands (`DglabSocket`, `sendPulse`, `requestDevices`, `device.op`, …).
+
+The V4 wire format (from the server README's "V4 protocol" section and dglab-kit's "V4 Protocol Reference"):
+
+- **Topology changed from 1:1 to 1:N.** A controller (our side) may serve *multiple* app clients at once,
+  instead of the V3 one-controller-one-app pairing.
+- **Connection flow.** The controller connects to `ws://host:9998` with no query string and receives
+  `{"type":"hello","clientId":"<controller-client-id>"}`. An app client then connects to
+  `ws://host:9998?tid=<controller-client-id>`; the controller receives
+  `{"type":"client_attached","clientId":"<app-client-id>"}` and stores that id. Disconnects arrive as
+  `client_disconnected` / `controller_disconnected`.
+- **Envelope.** `{"type":"message","clientId":"<app-client-id>","data":{…}}` to a specific app. The server
+  handles only `type`, `clientId` and `data`; it **does not parse DG-LAB device commands at all** — that is
+  the SDK's job.
+- **Payload inside `data`.** A `t` field discriminates `req` / `resp` / `ev`. RPC requests carry
+  `{t:"req", reqId, m, data}` and are answered with `{t:"resp", reqId, result|error}`. The methods that
+  matter to us: `devices.get`, `ping`, `device.op` (submit a `DeviceOperate` task) and `device.op.clear`
+  (`ClearOperate`).
+- **Devices are addressed, not implicit.** After attaching, the app immediately sends `devices.snapshot`;
+  descriptors are `{slotId, name, type:"COYOTE_030"|…, props, slotState}`. Every operation names a `slotId`
+  and a channel (`V4Channel.A` / `V4Channel.B`).
+- **Intent is task-based, not byte-based.** There is no B0/BF here: you submit *intentions*
+  (`addIntensity`, `resetIntensity`, `setTempIntensity(…, duration)`, `sendPulse(…, duration, frames)`,
+  `clearOperate`) and they run as timed tasks with `priority 0|1|2` and an `immediate` flag. The app decides
+  how to realise them over BLE.
+- **Pairing QR.** `https://dungeon-lab.cn/s/?v=1&action=socket&url=<percent-encoded ws URL incl. ?tid=>`
+  (different from the V3 `app-download.php#DGLAB-SOCKET#<url>/<clientId>` form).
+- **Lifecycle.** Heartbeat every 30 s (no reply needed); close codes `4000` controller gone / `4001` unknown
+  controller / `4002` controller idle-timeout (300 s with no app attached). The public endpoint is
+  `wss://trex.dungeon-lab.cn/v4`.
+
+What this does and does not change for this project:
+
+1. **The architectural conclusion of §1.1 still holds.** V4 changes the controller↔server↔app vocabulary, not
+   the hardware topology: the relay server has no Bluetooth stack, so the **phone app is still the BLE
+   central** and still owns the device. There is no server-side API that reaches the Coyote without an app.
+2. **The "queued playlist" criticism weakens.** V3's `pulse-A:[…]` batch model is replaced by timed tasks
+   with priorities and an `immediate` flag, which is a better fit than V3 for continuously changing input.
+   The extra network hop and the app's own scheduling latency remain.
+3. **BLE-direct remains the default** (`[link] mode=ble`). V4 is the protocol to implement *if* a socket
+   output mode is ever added — not a reason to switch today. `[link] mode=websocket` is therefore still
+   unimplemented, and the `[websocket]` config keys are leftovers from an earlier "PC as server" design
+   (see the comments in `src/config.hpp`).
+
+> Citation note: the V3 facts in §1.1 are unchanged and still correct for V3. This section, like §1.1, is
+> compiled from the vendor's own repositories (server `README.md`; dglab-kit `README.md`, section
+> "V4 Protocol Reference") rather than from third-party write-ups. No byte-level capture was performed
+> against a live V4 relay, so the frame examples above are quoted, not observed.
+
 ---
 
 ## 2. BLE (direct) transport
