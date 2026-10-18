@@ -153,6 +153,13 @@
 一句话记法: **`max_strength` 是给设备的"物理限位", `clamp_strength` 是给自己的"自我约束",
 `base_strength` 是"这个通道想用多少"**。
 
+> ⚠ **如果把 `DGLab_IDAC.ini` 删了**, 程序下次启动会自动生成一份"能跑起来"的最小配置。
+> 那份配置的**数值与本节不同**: 它是 `link=disabled` + `dry_run=1`(既不连设备也不输出),
+> 强度是 `max_strength=40` / `clamp_strength=40` / A `base_strength=40` / B `30`,
+> `warmup_ms=1500`。想把配置恢复到本节这套出厂组合(`ble` / `dry_run=0` /
+> `max=clamp=30` / A 15 / B 10 / `warmup_ms=5000`), 请从自己的备份拷回一份, 或者照本节
+> 的数值逐项改 —— 发布包里不含带注释的模板。
+
 > 改完配置**必须重启游戏**(`main.dll` 在进程生命周期内保持映射, 热重载对 C++ mod 无效)。
 
 ---
