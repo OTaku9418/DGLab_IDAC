@@ -103,6 +103,7 @@ struct Config {
 
     // ---- [output] ----
     // 帧节拍。V3 的 B0 必须每 100 ms 发一次, 每次带 4 个 25 ms 的组。
+    // BLE 模式下这个值由 effective_frame_ms() 固定为 100(见下面那个函数)。
     int         frame_ms            = 100;
     // 通道 A / B 的映射
     ChannelMapping channel_a;   // 默认: 扭矩
@@ -179,6 +180,14 @@ struct Config {
 
 // 从 INI 读; 文件不存在时返回默认值并写日志
 Config load_config(const std::string& ini_path);
+
+// 把 INI 里写的 frame_ms 折算成"实际生效值"(纯函数, 但会打 WARN)。
+//
+// 只有 BLE 直连有约束: V3 的 B0 一帧覆盖 4×25 ms = 100 ms, 设备也按 100 ms 的
+// 窗口回 B1, 把节拍配成别的值不会让设备变快或变慢, 只会让管线提交节拍与设备
+// 消费节拍错位(信箱覆盖率、看门狗阈值都跟着算错)。所以 BLE 模式下固定 100 ms,
+// 配成别的值打 WARN 并忽略。空输出/WebSocket 没有这个约束, 原样返回。
+int effective_frame_ms(int requested_ms, LinkMode link);
 
 // 把 INI 里写的 watchdog_ms 折算成"实际生效值"(纯函数, 但会打 WARN)。
 //

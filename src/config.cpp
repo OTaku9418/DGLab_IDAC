@@ -225,6 +225,18 @@ bool is_held_risk_source(const std::string& src) {
     return ieq(src, "viscosity") || ieq(src, "viscosity_a");
 }
 
+int effective_frame_ms(int requested_ms, LinkMode link) {
+    // 只有 BLE 直连这条链路的节拍是硬的: V3 的 B0 每帧覆盖 4×25 ms = 100 ms,
+    // 设备也按这个窗口回 B1。改成 50 不会让设备变快, 只会让"管线提交节拍"
+    // 与"设备消费节拍"错位, 信箱覆盖率和看门狗阈值跟着一起算错。
+    // 空输出/WebSocket 没有这个约束, 原样返回。
+    if (link != LinkMode::Ble) return requested_ms;
+    if (requested_ms == 100) return 100;
+    log_warn("[output] frame_ms=%d: BLE 链路的帧节拍固定为 100 ms, 已按 100 处理 (配置值被忽略)",
+             requested_ms);
+    return 100;
+}
+
 int effective_watchdog_ms(int requested_ms, int frame_ms) {
     const int fm = (frame_ms < 20) ? 20 : frame_ms;
     const int wd_floor = fm * 3;
@@ -410,6 +422,9 @@ Config load_config(const std::string& ini_path) {
     clamp_int(cfg.channel_a.base_strength, 0, 200, "[channel_a] base_strength");
     clamp_int(cfg.channel_b.base_strength, 0, 200, "[channel_b] base_strength");
     clamp_int(cfg.frame_ms, 20, 1000, "[output] frame_ms");
+    // T19: BLE 链路的节拍固定 100 ms, 在配置层就固定下来(不改 encode_b0),
+    // 必须在 effective_watchdog_ms() 之前 —— 看门狗的 3*frame_ms 用的是实际节拍。
+    cfg.frame_ms = effective_frame_ms(cfg.frame_ms, cfg.link);
     clamp_int(cfg.pulse_freq_min, 10, 240, "[output] pulse_freq_min");
     clamp_int(cfg.pulse_freq_max, 10, 240, "[output] pulse_freq_max");
     clamp_int(cfg.warmup_ms, 0, 60000, "[safety] warmup_ms");

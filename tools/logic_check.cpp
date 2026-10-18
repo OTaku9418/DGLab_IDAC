@@ -466,6 +466,25 @@ void test_effective_watchdog_ms() {
 }
 
 // ---------------------------------------------------------------------------
+// 13. BLE 模式下的帧节拍 (T19)
+//
+// 配 frame_ms=50 不会让设备变快: 一帧仍然覆盖 4x25ms, 只是管线提交频率翻倍,
+// 信箱覆盖率与看门狗阈值全部跟着算错。所以在配置层固定 100, 并让非 BLE 链路
+// 保持原值(空输出没有节拍约束, 离线测试要靠它跑得快)。
+// ---------------------------------------------------------------------------
+void test_effective_frame_ms() {
+    group("[output] BLE 帧节拍固定 100");
+
+    check_eq(effective_frame_ms(100, LinkMode::Ble), 100, "BLE 下 100 不动");
+    check_eq(effective_frame_ms(50, LinkMode::Ble), 100, "BLE 下 50 => 100");
+    check_eq(effective_frame_ms(200, LinkMode::Ble), 100, "BLE 下 200 => 100");
+    check_eq(effective_frame_ms(20, LinkMode::Ble), 100, "BLE 下最小值 20 => 100");
+    check_eq(effective_frame_ms(1000, LinkMode::Ble), 100, "BLE 下最大值 1000 => 100");
+    check_eq(effective_frame_ms(50, LinkMode::Disabled), 50, "空输出不约束, 原样返回");
+    check_eq(effective_frame_ms(33, LinkMode::WebSocket), 33, "WebSocket 不约束, 原样返回");
+}
+
+// ---------------------------------------------------------------------------
 // 12. 覆盖计数分栏 (T13c)
 //
 // 链路建立前 BLE 线程不取帧, 管线照样 10 Hz 提交 —— 那些覆盖不是"传输跟不上"。
@@ -516,6 +535,7 @@ int main() {
     test_ffb_gap_stats();
     test_held_risk_source();
     test_effective_watchdog_ms();
+    test_effective_frame_ms();
     test_mailbox_consumer_ready();
 
     std::printf("\n-------------------------------------------\n");
