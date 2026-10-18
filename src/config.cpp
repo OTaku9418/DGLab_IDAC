@@ -59,20 +59,35 @@ bool normalize_ini_line_endings(const std::string& path) {
         out.push_back(data[i]);
     }
 
-    HANDLE w = ::CreateFileA(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+    // ★ 原子写入 (T13d) ★
+    // 以前直接 CREATE_ALWAYS 覆盖原文件: 如果写到一半失败(磁盘满/被杀进程),
+    // 用户配置就变成一个残缺的 INI —— 而下次启动会把它当"合法配置"读, 每项
+    // 都可能回落到内置默认值(其中 base_strength 的默认值比用户配的大得多)。
+    // 所以先写 <path>.tmp, 再用 MoveFileEx 替换; 任何一步失败都保留原文件。
+    const std::string tmp = path + ".tmp";
+    HANDLE w = ::CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                              FILE_ATTRIBUTE_NORMAL, nullptr);
     if (w == INVALID_HANDLE_VALUE) {
-        log_warn("配置 %s 是 LF 行尾(Win32 INI API 会读不到内容), 但改写失败 —— 本次仍按默认值运行",
-                 path.c_str());
+        log_warn("配置 %s 是 LF 行尾(Win32 INI API 会读不到内容), 但临时文件建不出来 —— "
+                 "本次仍按默认值运行, 原文件未改动", path.c_str());
         return false;
     }
     DWORD wrote = 0;
     const BOOL wok = ::WriteFile(w, out.data(), static_cast<DWORD>(out.size()), &wrote, nullptr);
+    ::FlushFileBuffers(w);
     ::CloseHandle(w);
 
     if (!wok || wrote != out.size()) {
-        log_error("配置 %s 行尾归一化写入不完整 (%lu/%zu)", path.c_str(),
+        ::DeleteFileA(tmp.c_str());
+        log_error("配置 %s 行尾归一化写入不完整 (%lu/%zu), 已放弃改写, 原文件未改动", path.c_str(),
                   static_cast<unsigned long>(wrote), out.size());
+        return false;
+    }
+    if (!::MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD err = ::GetLastError();
+        ::DeleteFileA(tmp.c_str());
+        log_warn("配置 %s 行尾归一化没能替换原文件 (GetLastError=%lu), 原文件未改动 —— "
+                 "本次仍按默认值运行", path.c_str(), static_cast<unsigned long>(err));
         return false;
     }
 
@@ -123,6 +138,17 @@ double read_double(const std::string& file, const char* section, const char* key
 bool read_bool(const std::string& file, const char* section, const char* key, bool def) {
     const std::string s = read_str(file, section, key, def ? "1" : "0");
     return s == "1" || s == "true" || s == "True" || s == "TRUE" || s == "yes" || s == "on";
+}
+
+// 判断 INI 里到底有没有这个键。
+// 为什么需要: read_int/read_bool 传进去的是默认值, 分不清"键不存在"和
+// "键值恰好等于默认值"。对 dry_run 这种决定要不要真的通电的字段, 这两种
+// 情况必须区分开 —— 缺键要告警。用一个不可能出现的哨兵值探一次即可。
+bool has_key(const std::string& file, const char* section, const char* key) {
+    static const char* const kSentinel = "__dglab_missing_key__";
+    char buf[64]{};
+    ::GetPrivateProfileStringA(section, key, kSentinel, buf, sizeof(buf), file.c_str());
+    return std::strcmp(buf, kSentinel) != 0;
 }
 
 MapMode parse_map_mode(const std::string& s, MapMode def) {
@@ -195,6 +221,64 @@ const char* to_string(MapMode m) {
     return "?";
 }
 
+bool is_held_risk_source(const std::string& src) {
+    return ieq(src, "viscosity") || ieq(src, "viscosity_a");
+}
+
+int effective_frame_ms(int requested_ms, LinkMode link) {
+    // 只有 BLE 直连这条链路的节拍是硬的: V3 的 B0 每帧覆盖 4×25 ms = 100 ms,
+    // 设备也按这个窗口回 B1。改成 50 不会让设备变快, 只会让"管线提交节拍"
+    // 与"设备消费节拍"错位, 信箱覆盖率和看门狗阈值跟着一起算错。
+    // 空输出/WebSocket 没有这个约束, 原样返回。
+    if (link != LinkMode::Ble) return requested_ms;
+    if (requested_ms == 100) return 100;
+    log_warn("[output] frame_ms=%d: BLE 链路的帧节拍固定为 100 ms, 已按 100 处理 (配置值被忽略)",
+             requested_ms);
+    return 100;
+}
+
+int effective_viscosity_hold_ms(int requested_ms) {
+    // 0 是唯一表示"关闭"的值 —— 这是用户可选的取舍(有人就想要停住的阻尼),
+    // 所以不把它当成"配错"抬到下限。
+    if (requested_ms == 0) return 0;
+    if (requested_ms < 500) {
+        log_warn("[safety] viscosity_hold_ms(%d) < 500, 会把正常行驶中的短暂间隙误判为停更, 已抬到 500",
+                 requested_ms);
+        return 500;
+    }
+    if (requested_ms > 10000) {
+        log_warn("[safety] viscosity_hold_ms(%d) > 10000, 残值会先被感知到才归零, 已降到 10000",
+                 requested_ms);
+        return 10000;
+    }
+    return requested_ms;
+}
+
+int effective_watchdog_ms(int requested_ms, int frame_ms) {
+    const int fm = (frame_ms < 20) ? 20 : frame_ms;
+    const int wd_floor = fm * 3;
+    // 上限 2000, 但若 3*frame_ms 已经超过 2000(frame_ms > 666), 约束自相矛盾 ——
+    // 让下限优先, 因为"低于帧周期三倍"的看门狗会一直误触发。
+    const int wd_cap = (wd_floor > 2000) ? wd_floor : 2000;
+
+    int v = requested_ms;
+    if (v < 50) {
+        log_warn("[safety] watchdog_ms(%d) < 50, 已抬到 50", v);
+        v = 50;
+    }
+    if (v > wd_cap) {
+        log_warn("[safety] watchdog_ms(%d) 超过上限 %d ms, 已降到 %d —— 看门狗再长就失去兜底意义",
+                 v, wd_cap, wd_cap);
+        v = wd_cap;
+    }
+    if (v < wd_floor) {
+        log_warn("[safety] watchdog_ms(%d) < 3*frame_ms(%d), 会误触发, 已抬到 %d", v, wd_floor,
+                 wd_floor);
+        v = wd_floor;
+    }
+    return v;
+}
+
 Config load_config(const std::string& ini_path) {
     Config cfg{};
 
@@ -234,6 +318,12 @@ Config load_config(const std::string& ini_path) {
     cfg.log_file = read_str(ini_path, "general", "log_file", cfg.log_file);
 
     // ---- [link] ----
+    // 缺 mode 键时给一条明确提示: 以前的默认值是 WebSocket(未实现), 缺键
+    // 等于"什么都不连却看起来正常"; 现在是 Disabled, 也是不做任何事, 但至少
+    // 用户能在日志里看到原因。
+    if (!has_key(ini_path, "link", "mode")) {
+        log_warn("未配置 [link] mode, 按 %s 处理(不会连接任何设备)", to_string(cfg.link));
+    }
     {
         const std::string s = read_str(ini_path, "link", "mode", to_string(cfg.link));
         if (ieq(s, "ble") || ieq(s, "bluetooth")) {
@@ -268,7 +358,9 @@ Config load_config(const std::string& ini_path) {
     cfg.ble_connect_timeout_ms = read_int(ini_path, "ble", "connect_timeout_ms",
                                           cfg.ble_connect_timeout_ms);
 
-    // ---- [websocket] (预留) ----
+    // ---- [websocket] (旧设计遗留, 解析保留但无人消费) ----
+    // 将来实现 Socket 输出时这些键会被重新定义, 不要基于 bind/port 的
+    // "PC 做服务端" 语义去写新代码。见 docs/research-dglab-transport.md 第 1.2 节。
     cfg.ws_bind_address = read_str(ini_path, "websocket", "bind", cfg.ws_bind_address);
     cfg.ws_port         = static_cast<uint16_t>(read_int(ini_path, "websocket", "port", cfg.ws_port));
     cfg.ws_path         = read_str(ini_path, "websocket", "path", cfg.ws_path);
@@ -294,6 +386,22 @@ Config load_config(const std::string& ini_path) {
     read_channel(ini_path, "channel_a", cfg.channel_a);
     read_channel(ini_path, "channel_b", cfg.channel_b);
 
+    // ★ 已知风险源告警 ★
+    // viscosity 的回调是"值变了才回调", 而强制退出比赛回到菜单时游戏会把阻尼
+    // 停在一个可感的值上却不再回调 —— 本程序没有"源数据陈旧"判定, 那个值会被
+    // 一直输出。默认配置不用它, 但用户有权选, 所以只在"启用 + 真会输出"时提醒
+    // 一次(不阻止)。判定逻辑本身在 is_held_risk_source(), 有离线自检。
+    if (cfg.channel_a.enable && cfg.channel_a.base_strength > 0 &&
+        is_held_risk_source(cfg.channel_a.source)) {
+        log_warn("[channel_a] source=%s: 强制退出比赛回到菜单后阻尼可能停在可感的值上并持续输出, "
+                 "不推荐作为输出源 (见 README 已知风险)", cfg.channel_a.source.c_str());
+    }
+    if (cfg.channel_b.enable && cfg.channel_b.base_strength > 0 &&
+        is_held_risk_source(cfg.channel_b.source)) {
+        log_warn("[channel_b] source=%s: 强制退出比赛回到菜单后阻尼可能停在可感的值上并持续输出, "
+                 "不推荐作为输出源 (见 README 已知风险)", cfg.channel_b.source.c_str());
+    }
+
     // ---- [safety] ----
     cfg.max_strength        = read_int(ini_path, "safety", "max_strength", cfg.max_strength);
     cfg.clamp_strength      = read_int(ini_path, "safety", "clamp_strength", cfg.clamp_strength);
@@ -302,7 +410,16 @@ Config load_config(const std::string& ini_path) {
     cfg.zero_when_servo_off = read_bool(ini_path, "safety", "zero_when_servo_off",
                                         cfg.zero_when_servo_off);
     cfg.warmup_ms           = read_int(ini_path, "safety", "warmup_ms", cfg.warmup_ms);
+    cfg.viscosity_hold_ms   = read_int(ini_path, "safety", "viscosity_hold_ms",
+                                        cfg.viscosity_hold_ms);
+    const bool has_dry_run_key = has_key(ini_path, "safety", "dry_run");
     cfg.dry_run             = read_bool(ini_path, "safety", "dry_run", cfg.dry_run);
+    // dry_run 缺键必须说清楚: 它是"要不要真的通电"的总开关, 静默取默认值
+    // 是最不该发生的。旧 INI 没有这个键 -> 现在是干跑(安全方向)。
+    if (!has_dry_run_key) {
+        log_warn("未配置 [safety] dry_run, 按 %d(干跑) 处理 —— 要真实输出请显式写 dry_run=0",
+                 cfg.dry_run ? 1 : 0);
+    }
 
     // ---- [ranges] ----
     cfg.torque_negative_is_positive =
@@ -324,10 +441,18 @@ Config load_config(const std::string& ini_path) {
     clamp_int(cfg.channel_a.base_strength, 0, 200, "[channel_a] base_strength");
     clamp_int(cfg.channel_b.base_strength, 0, 200, "[channel_b] base_strength");
     clamp_int(cfg.frame_ms, 20, 1000, "[output] frame_ms");
+    // T19: BLE 链路的节拍固定 100 ms, 在配置层就固定下来(不改 encode_b0),
+    // 必须在 effective_watchdog_ms() 之前 —— 看门狗的 3*frame_ms 用的是实际节拍。
+    cfg.frame_ms = effective_frame_ms(cfg.frame_ms, cfg.link);
     clamp_int(cfg.pulse_freq_min, 10, 240, "[output] pulse_freq_min");
     clamp_int(cfg.pulse_freq_max, 10, 240, "[output] pulse_freq_max");
     clamp_int(cfg.warmup_ms, 0, 60000, "[safety] warmup_ms");
-    clamp_int(cfg.watchdog_ms, 50, 60000, "[safety] watchdog_ms");
+    // watchdog_ms 的取舍逻辑在 effective_watchdog_ms() 里 —— 它有上下限两条
+    // 与 frame_ms 绑定的约束, 且必须能被离线用例覆盖(T13a), 所以不再用
+    // clamp_int + 就地抬 floor 的写法。
+    cfg.watchdog_ms = effective_watchdog_ms(cfg.watchdog_ms, cfg.frame_ms);
+    // T17: 0 = 关闭, 其他值钳到 500..10000(理由见 config.hpp 里那个字段)。
+    cfg.viscosity_hold_ms = effective_viscosity_hold_ms(cfg.viscosity_hold_ms);
     // 自动增益: floor 不能超过 ceiling, 否则归一化区间是负的, 会整体归零。
     clamp_int(cfg.gain_floor, 1, 200, "[output] gain_floor");
     clamp_int(cfg.gain_ceiling, 1, 200, "[output] gain_ceiling");
@@ -475,11 +600,14 @@ bool write_default_config(const std::string& ini_path) {
     //   torque    方向盘回正扭矩的幅值(= abs(游戏扭矩), 域 0..127), 实测最活跃。
     //             左转与右转都输出力, 但取的是幅值, 本程序不区分左右。
     //   viscosity 转向阻尼, 几乎全程有值
+    //             ⚠ 不推荐作为输出源: 强制退出比赛回到菜单后, 游戏可能把阻尼停在
+    //             一个可感的值上; 这个回调只在值变化时触发, 停住的值会一直输出,
+    //             直到下一次变化。
     //   vibration 振动/路肩, 只在事件发生时给一次
     //   static    恒定输出, 不看游戏数据
     // 另有 torque_signed(按 direction 恢复符号): 逆向证实该参数是齿轮/档位索引
     // (域 0..255), 不是左右方向, 当前不要用 —— 见 re/indrun_hook_mechanics.md 4.1/5。
-    // 建议 A 用 torque 或 viscosity。
+    // 建议 A 用 torque。
     // 字段范围: enable 0/1; map_mode {abs_linear,linear,abs_sqrt,sqrt};
     // in_min 0~200; in_max 1~200(auto_gain=1 时只当启动初值);
     // level 0.0~1.0; base_strength 0~200(再受 [safety] max_strength 钳制);
@@ -496,7 +624,7 @@ bool write_default_config(const std::string& ini_path) {
     w("channel_a", "strength_source", "static");
     w("channel_b", "enable", "1");
     // B 当前接 vibration, 它是事件型信号: 只在压路肩/碰撞等判定发生时给一次
-    // 短促输出, 其余时间安静。希望 B 也有持续可感的东西就改成 viscosity。
+    // 短促输出, 其余时间安静。不建议改成 viscosity(原因见上面的来源表)。
     // 想分辨"是哪个通道在动", 让两个通道 base_strength 不同即可。
     w("channel_b", "source", "vibration");
     w("channel_b", "map_mode", "abs_linear");
@@ -508,11 +636,14 @@ bool write_default_config(const std::string& ini_path) {
     w("safety", "max_strength", "40");
     w("safety", "clamp_strength", "40");
     w("safety", "slew_per_second", "40");
-    // ★ watchdog_ms 目前未实现, 配了不生效 —— 没有任何代码读它。
-    // 参见 src/config.hpp 的说明; 别把它当安全保证。
+    // watchdog_ms: 管线超过这么多毫秒没提交新帧, 传输层改发静默帧。
+    // 判据是"管线有没有在提交帧", 不是"力反馈回调有没有来"(回调是边沿触发的)。
     w("safety", "watchdog_ms", "500");
     w("safety", "zero_when_servo_off", "1");
     w("safety", "warmup_ms", "1500");
+    // viscosity_hold_ms: viscosity 源停更多久就按 0 处理(T17)。0 = 关闭。
+    // 副作用: 发车倒计时等原地不动的时段也会被归零 —— 这是它的工作原理, 不是 bug。
+    w("safety", "viscosity_hold_ms", "2000");
     // dry_run=1 是硬开关: 不管 [link] mode 写什么, 一律走空输出, 绝不碰设备。
     // 想真实输出必须显式改成 0 —— 别把"干跑"和"接真机"混在一次改动里。
     w("safety", "dry_run", "1");

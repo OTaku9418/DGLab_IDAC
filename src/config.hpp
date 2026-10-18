@@ -71,11 +71,19 @@ struct Config {
     std::string log_file            = "";      // 空 = 只写 UE4SS 日志
 
     // ---- [link] ----
-    LinkMode         link            = LinkMode::WebSocket;
+    // ★ 默认值必须是最安全的状态 ★
+    // 以前默认 WebSocket, 而 WebSocket 根本没实现 —— "忘了配 mode"的结果是
+    // 什么都不连, 日志上却一切正常。默认 Disabled 至少是明确地不做任何事。
+    LinkMode         link            = LinkMode::Disabled;
     ProtocolVersion  protocol        = ProtocolVersion::V3;
 
     // ---- [websocket] ----
-    // 本机做服务端, DGLab 客户端/APP 连过来。需要本机蓝牙的那个方案不用它。
+    // ★ 这是"PC 做服务端"旧设计的遗留键, 当前没有任何代码消费它们 ★
+    // (解析留着只为不破坏老 INI 的手感)。真正的 Socket 方案是官方
+    // dglab-websocket-server 的 V4 中继: 第三方控制器(即本程序)连到中继
+    // 服务器, 手机 APP 再用 tid 连过来 —— 方向与这里的 "本机 bind/port"
+    // 相反, 而且服务端没有 BLE, 手机仍然是必经环节。
+    // 详见 docs/research-dglab-transport.md 第 1.2 节。
     std::string ws_bind_address     = "127.0.0.1";
     uint16_t    ws_port             = 9999;
     std::string ws_path             = "/dglab";
@@ -95,6 +103,7 @@ struct Config {
 
     // ---- [output] ----
     // 帧节拍。V3 的 B0 必须每 100 ms 发一次, 每次带 4 个 25 ms 的组。
+    // BLE 模式下这个值由 effective_frame_ms() 固定为 100(见下面那个函数)。
     int         frame_ms            = 100;
     // 通道 A / B 的映射
     ChannelMapping channel_a;   // 默认: 扭矩
@@ -134,19 +143,38 @@ struct Config {
     int         clamp_strength      = 40;
     // 每秒允许的强度变化量(0 = 不限制)。避免阶跃冲击。
     double      slew_per_second     = 40.0;
-    // ★ 目前**没有实现**, 配了不会生效 —— 保留键位是为了兼容既有 INI。
-    // 原意是"力反馈静默超过这个毫秒数就把输出拉到 0", 实际没有任何代码读它。
-    // 现有的静默保护只到"超过 20 秒没有任何回调就打一条 WARN 日志"为止
-    // (见 src/dllmain.cpp 的心跳分支), 那是一句告警, 不是归零动作。
-    // 真要做需要: 在 worker loop 里记录 last_callback_at, 超时后强制
-    // clamp_strength(0) 并 skip 后续 submit —— 尚未实现。
+    // 看门狗: 管线侧超过这么多毫秒没有提交新帧, 传输层就改发静默帧(强度 0)。
+    //
+    // ★ 判据是"管线有没有在提交帧", 不是"力反馈回调有没有来" ★
+    // 力反馈回调是**边沿触发**的(IndRun 内部有变化缓存, 值不变就不回调),
+    // 所以方向盘稳定受力时"几秒没有回调"完全正常 —— 拿回调间隔做看门狗
+    // 会在游戏正常运行时把输出静音。
+    //
+    // 实现分两层, 缺一不可:
+    //   * src/transport/transport.cpp 的 FrameMailbox::take() —— 传输线程侧,
+    //     逐帧判断, 超时就换静默帧(这是真正"拉回 0"的那一层)。
+    //   * src/pipeline.cpp 的 tick() —— 管线侧, 自己停顿超过这个值就清零强度
+    //     累积并重新预热, 避免停顿结束后一帧跳到满力。
+    // 取值由 effective_watchdog_ms() 折算: 抬到至少 3*frame_ms, 压到最多 2000。
     int         watchdog_ms         = 500;
     // servo off / 未就绪时是否强制归零
     bool        zero_when_servo_off = true;
+    // T17: viscosity 源的"保持超时"(毫秒)。
+    // viscosity 的回调是"值变了才回调", 退出比赛回菜单后游戏会把阻尼停在一个
+    // 非零值上不再更新 —— 那个值会被当成当前状态一直输出(实测停住的 visc_b=10
+    // 对应脉冲 42/100, 指示灯亮着)。超过这个毫秒数没有新回调就把该通道的原始值
+    // 按 0 处理, 源一更新立刻恢复。
+    //   0 = 关闭; 其他值钳到 500..10000(低于 500 会把正常行驶中的短暂间隙误判,
+    //   实测 viscosity 在驾驶时间隔几乎全 <0.5 s)。
+    // 只影响 source=viscosity / viscosity_a 的通道, 另一通道不受影响。
+    int         viscosity_hold_ms   = 2000;
     // 启动后前 N 毫秒强制输出 0, 让用户有时间确认连接
     int         warmup_ms           = 1500;
     // 全局总开关: 设为 false 时只记日志不发数据(干跑模式)
-    bool        dry_run             = false;
+    // ★ 默认 true ★: INI 里漏写这个键就等于允许真实输出, 与本项目"默认安全"
+    // 的设计意图相反 —— 一个字的遗漏不该产生电刺激。要真实输出必须在 INI 里
+    // 显式写 dry_run=0。缺键时 load_config 会打一条 WARN 提醒。
+    bool        dry_run             = true;
 
     // ---- [ranges] ----
     // 上面 ChannelMapping 里的 in_min/in_max 覆盖了标定; 这里额外给
@@ -162,6 +190,33 @@ struct Config {
 // 从 INI 读; 文件不存在时返回默认值并写日志
 Config load_config(const std::string& ini_path);
 
+// 把 INI 里写的 frame_ms 折算成"实际生效值"(纯函数, 但会打 WARN)。
+//
+// 只有 BLE 直连有约束: V3 的 B0 一帧覆盖 4×25 ms = 100 ms, 设备也按 100 ms 的
+// 窗口回 B1, 把节拍配成别的值不会让设备变快或变慢, 只会让管线提交节拍与设备
+// 消费节拍错位(信箱覆盖率、看门狗阈值都跟着算错)。所以 BLE 模式下固定 100 ms,
+// 配成别的值打 WARN 并忽略。空输出/WebSocket 没有这个约束, 原样返回。
+int effective_frame_ms(int requested_ms, LinkMode link);
+
+// 把 INI 里写的 viscosity_hold_ms 折算成"实际生效值"(纯函数, 但会打 WARN)。
+//
+// 语义: 0 = 关闭保持超时; 非 0 时钳到 [500, 10000]。下限 500 ms 的理由是实测
+// viscosity 在正常驾驶时间隔几乎全 <0.5 s, 再小会把正常抖动当成"停更";
+// 上限 10 s 的理由是超过它以后残值已经被感知到很久了, 等于没做保护。
+int effective_viscosity_hold_ms(int requested_ms);
+
+// 把 INI 里写的 watchdog_ms 折算成"实际生效值"(纯函数, 但会打 WARN)。
+//
+// 三条约束, 都与帧周期绑定:
+//   * 下限 50 ms —— 再小没有意义;
+//   * 下限 3*frame_ms —— 管线按 frame_ms 提交, Windows 默认定时器精度约
+//     15.6 ms, 正常抖动会让帧间隔偶尔超过 frame_ms, 留两次迟到的余量;
+//   * 上限 2000 ms —— 看门狗的意义是"数据流断了就归零"。配得比 2 s 还大,
+//     等于容忍设备在卡死期间长时间保持最后的强度, 那就不是兜底了。
+// 如果 frame_ms 大到 3*frame_ms 超过 2000, 以 3*frame_ms 为准(否则约束自相矛盾),
+// 这条路径会打 WARN。0 不表示"关闭": 看门狗是安全阀, 不能靠一个数字失效。
+int effective_watchdog_ms(int requested_ms, int frame_ms);
+
 // 写一份带全部注释的默认 INI(首次运行时铺出来)
 bool write_default_config(const std::string& ini_path);
 
@@ -172,5 +227,15 @@ std::string resolve_config_path();
 const char* to_string(LinkMode m);
 const char* to_string(ProtocolVersion v);
 const char* to_string(MapMode m);
+
+// 这个输入源有没有"停住的值会被一直输出"的风险(见 README「已知风险与使用须知」)。
+//
+// 目前只有 viscosity / viscosity_a: 它的回调是**值变了才回调**(IndRun 内部有
+// 变化缓存), 而强制退出比赛回到菜单时, 游戏会把阻尼停在一个可感的值上却不再
+// 回调 —— 本程序没有"源数据陈旧"判定, 于是那个值会被管线一直输出, 直到下一次
+// 变化。torque/vibration 在回菜单时会被游戏压到接近 0, 所以不在名单里。
+//
+// 纯函数, 供 load_config 告警与离线自检共用。
+bool is_held_risk_source(const std::string& src);
 
 }  // namespace dglab_idac

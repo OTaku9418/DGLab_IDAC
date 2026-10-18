@@ -119,12 +119,15 @@ void Pipeline::reconfigure(const Config& cfg) {
 // 高速弯的重手感; 取全局最大值会让前半段全部糊在底部。所以要让它落回来。
 // ---------------------------------------------------------------------------
 double Pipeline::update_gain(GainTracker& t, const ChannelMapping& m,
-                             const FfbState& ffb, double now) {
+                             const FfbState& ffb, double now, bool raw_zeroed) {
     // 关闭时直接返回静态 in_max —— 自动增益完全不介入, 行为与加它之前一致。
     if (!cfg_.auto_gain) return static_cast<double>(m.in_max);
 
     bool ok = false;
-    const int32_t raw = pick_source(m.source, ffb, ok, cfg_.torque_negative_is_positive);
+    int32_t raw = pick_source(m.source, ffb, ok, cfg_.torque_negative_is_positive);
+    // T17: 源保持超时的值与"这个值是 0"必须对包络和映射一样 —— 否则脉冲归零了,
+    // 包络却还拿旧峰值当标定, 下一段恢复时会莫名变软。
+    if (raw_zeroed) raw = 0;
     const double v = ok ? static_cast<double>(raw < 0 ? -raw : raw) : 0.0;
 
     double hi = static_cast<double>(cfg_.gain_ceiling);
@@ -155,6 +158,34 @@ double Pipeline::update_gain(GainTracker& t, const ChannelMapping& m,
 }
 
 // ---------------------------------------------------------------------------
+// T17: viscosity 的"保持超时"判定。
+//
+// 为什么只对 viscosity 做: 它的回调是"值变了才回调"(IndRun 侧有变化缓存),
+// 而 torque/vibration 也不会在菜单里刷, 差别在于 —— 退出比赛回菜单时游戏会把
+// 阻尼停在一个非零值上然后不再回调, 于是那个值被当成"当前状态"一直输出。
+// 实测(第二轮 T16): 停住的 visc_b=10 会让脉冲停在 42/100, 人体无感但设备的
+// 电流指示灯亮着; 按默认 25/35 的强度用就会明显可感。
+//
+// 做法: 在"取原始值"这一层把它当 0 —— 不是给输出打补丁, 所以归一化、映射、
+// 增益包络看到的是同一个 0(见 map_input / update_gain 的 raw_zeroed 参数)。
+// 0 表示关闭(viscosity_hold_ms=0), 从不判定。
+// ---------------------------------------------------------------------------
+bool Pipeline::viscosity_hold_expired(const ChannelMapping& m, const FfbState& ffb,
+                                     double now, double* held_ms_out) const {
+    if (held_ms_out != nullptr) *held_ms_out = 0.0;
+    if (cfg_.viscosity_hold_ms <= 0) return false;   // 0 = 关闭
+    if (!m.enable) return false;                     // 关掉的通道本来就输出 0
+    if (!is_held_risk_source(m.source)) return false;  // 只有 viscosity / viscosity_a
+    // 还没收到过任何样本(游戏还没进比赛): 原始值本来就是 0, 不需要额外处理,
+    // 也不该在启动阶段打一条"保持超时"的日志。
+    if (ffb.viscosity_at <= 0.0) return false;
+
+    const double held_ms = (now - ffb.viscosity_at) * 1000.0;
+    if (held_ms_out != nullptr) *held_ms_out = held_ms > 0.0 ? held_ms : 0.0;
+    return held_ms > static_cast<double>(cfg_.viscosity_hold_ms);
+}
+
+// ---------------------------------------------------------------------------
 double Pipeline::effective_in_max(const ChannelMapping& m,
                                   const FfbState& ffb) const {
     const bool is_a = (&m == &cfg_.channel_a);
@@ -164,7 +195,8 @@ double Pipeline::effective_in_max(const ChannelMapping& m,
 }
 
 // ---------------------------------------------------------------------------
-double Pipeline::map_input(const ChannelMapping& m, const FfbState& ffb) const {
+double Pipeline::map_input(const ChannelMapping& m, const FfbState& ffb,
+                           bool raw_zeroed) const {
     if (!m.enable) return 0.0;
     if (m.mode == MapMode::Constant) return clamp01(m.level);
 
@@ -174,6 +206,8 @@ double Pipeline::map_input(const ChannelMapping& m, const FfbState& ffb) const {
         // 每个 tick 都刷屏没意义, 所以这里不打日志 —— 配置解析时就该发现。
         return 0.0;
     }
+    // T17: 见 update_gain 里同一条注释。
+    if (raw_zeroed) raw = 0;
 
     const double span = effective_in_max(m, ffb) - static_cast<double>(m.in_min);
     if (span <= 0.0) return clamp01(m.level);
@@ -226,7 +260,11 @@ void Pipeline::fill_channel(const ChannelMapping& m, double v, ChannelFrame& out
 }
 
 // ---------------------------------------------------------------------------
-bool Pipeline::evaluate_safety(double now, const FfbState& ffb, std::string& reason) {
+// reason 是**输出参数**, 类型是 const char* 而不是 std::string: 它最终会被存进
+// Frame::mute_reason, 而 Frame 是要跨线程传的(管线线程 -> BLE 线程)。传
+// std::string 的话调用方会拿到 c_str() 指向的临时缓冲, tick() 一返回就成了野指针。
+// 所以这里只允许赋字符串字面量(静态存储期), 不做任何拼接。
+bool Pipeline::evaluate_safety(double now, const FfbState& ffb, const char*& reason) {
     safety_.warmup_active   = false;
     safety_.watchdog_tripped = false;
     safety_.servo_off_muted = false;
@@ -243,12 +281,15 @@ bool Pipeline::evaluate_safety(double now, const FfbState& ffb, std::string& rea
         return true;
     }
 
-    // 2) 看门狗: 游戏停止喂数据(卡死/退出/挂载掉了)时把输出拉回 0。
-    //    注意用 ffb.latest_at() 而不是"上次 tick 时间" —— 力反馈回调是
-    //    **边沿触发**的(IndRun 内部有变化缓存, 值不变就不回调), 所以
-    //    "很久没回调" 完全可能只是"方向盘没动", 不是故障。
-    //    真正要防的是"servo 开着但数据流彻底停了", 这个由传输层的
-    //    silence 帧兜底; 这里只处理 servo 状态。
+    // 2) 看门狗位置说明: 真正"数据流停了就归零"的看门狗不在这里, 在
+    //    src/transport/transport.cpp 的 FrameMailbox 里(声明在 transport.hpp)
+    //    —— 它盯的是"管线 -> 传输"
+    //    这一段是否还在出帧, 停了就改发静默帧(强度 0、无脉冲), 配置项是
+    //    [safety] watchdog_ms, 最小值被钳到 3×frame_ms。
+    //    这里只做"从来没有数据"和"servo 状态"两件事。
+    //    为什么不在这里按 FFB 回调间隔判断: 回调是**边沿触发**的(IndRun 内部
+    //    有变化缓存, 值不变就不回调), "很久没回调" 通常只是"方向盘没动",
+    //    不是故障。按它判断会误归零。
     if (!ffb.ever_updated) {
         // 一次都没收到过回调 —— 可能还没进游戏, 也可能 hook 没生效
         reason = "no_ffb_data_yet";
@@ -262,7 +303,7 @@ bool Pipeline::evaluate_safety(double now, const FfbState& ffb, std::string& rea
         return true;
     }
 
-    reason.clear();
+    reason = "";
     return false;
 }
 
@@ -279,24 +320,79 @@ bool Pipeline::tick(double now, const FfbState& ffb, Frame& out) {
     out = Frame{};
     out.servo_on = ffb.servo_on;
 
-    const double dt = (last_tick_ > 0.0) ? (now - last_tick_) : 0.0;
-    last_tick_ = now;
+    const double dt_raw = (last_tick_ > 0.0) ? (now - last_tick_) : 0.0;
 
-    std::string reason;
+    // ---- 看门狗 ----
+    // 判据是"本 tick 距上一 tick 太久", 也就是**管线自己停顿过**(主线程被
+    // 别的东西占住、断点、机器休眠)。这不是"游戏没给数据"—— 力反馈回调是
+    // 边沿触发的, 力不变时不回调完全正常, 拿它做判据会一直误触发。
+    //
+    // ★ 这一层能覆盖什么、不能覆盖什么 (实测, 见 README 第 8 节第 1 条) ★
+    // 能: 游戏还在跑, 但主线程被占住/管线被饿死 —— 此时 BLE 发送线程还活着,
+    //     传输层侧的 FrameMailbox 看门狗也会同时生效, 真的把设备拉回 0。
+    // 不能: 整个游戏进程一起卡死(例如拖动控制台滚动条)。本作的物理与渲染
+    //     在同一帧推进, 卡顿时挂钩、管线、发送线程**一起**停, 所以下面这条
+    //     WARN 只在卡死结束后才被写出来, 卡死期间设备保持最后一帧的强度。
+    //     实测两次 10.9 s / 14.0 s 的停顿里 [tx] 的 trips 全程为 0。
+    // 这就是为什么"手边留物理断电开关"不是客套话。
+    const bool stalled = (last_tick_ > 0.0) && (cfg_.watchdog_ms > 0) &&
+                         (dt_raw * 1000.0 > static_cast<double>(cfg_.watchdog_ms));
+    last_tick_ = now;
+    // 停顿后绝不能拿 dt_raw 算斜率: 那等于把停顿时长一次性乘进斜率里,
+    // 一帧就从 0 跳到满值。按 dt=0 处理, 本帧强度保持不变。
+    const double dt = stalled ? 0.0 : dt_raw;
+
+    if (stalled) {
+        // 安全起步: 强度累积清零 + 重新预热, 让手感从 0 慢慢爬回去,
+        // 而不是"停顿结束后突然满力"。
+        slew_a_ = 0.0;
+        slew_b_ = 0.0;
+        applied_strength_ = 0.0;
+        boot_time_ = now;
+        log_warn("管线停顿 %.0f ms 超过 watchdog_ms=%d, 输出归零并重新预热",
+                 dt_raw * 1000.0, cfg_.watchdog_ms);
+    }
+
+    const char* reason = "";
     const bool muted = evaluate_safety(now, ffb, reason);
+    // 传给上层(诊断用)。放在 evaluate_safety 之后, 免得覆盖里边写的标志。
+    safety_.watchdog_tripped = stalled;
+
+
+    // ---- T17: viscosity 保持超时 ----
+    // 必须在 update_gain / map_input 之前, 它们两个都要看这个判定结果。
+    double held_a_ms = 0.0;
+    double held_b_ms = 0.0;
+    const bool hold_a = viscosity_hold_expired(cfg_.channel_a, ffb, now, &held_a_ms);
+    const bool hold_b = viscosity_hold_expired(cfg_.channel_b, ffb, now, &held_b_ms);
+    // 只在进入/退出时各打一条 —— 这个状态一次会话里会来回切换几十次(发车、
+    // 冲线、菜单), 每 tick 打一条就把日志淹了。
+    auto report_hold = [this](const char* name, bool now_zero, bool& was_zero, double held_ms) {
+        if (now_zero == was_zero) return;
+        was_zero = now_zero;
+        if (now_zero) {
+            log_info("[channel_%s] viscosity 已 %.0f ms 没有更新(保持超时 %d ms), 输出归零 —— "
+                     "原地不动的时段(菜单、发车倒计时)会这样, 源一更新就恢复",
+                     name, held_ms, cfg_.viscosity_hold_ms);
+        } else {
+            log_info("[channel_%s] viscosity 恢复更新, 输出恢复", name);
+        }
+    };
+    report_hold("A", hold_a, hold_zero_a_, held_a_ms);
+    report_hold("B", hold_b, hold_zero_b_, held_b_ms);
 
     // ---- 自动增益: 每 tick 推进一次包络, 供本帧的 A/B 两路归一化使用 ----
     // 必须在 map_input 之前, 因为 map_input 读的是本帧算出来的增益。
-    update_gain(gain_a_, cfg_.channel_a, ffb, now);
-    update_gain(gain_b_, cfg_.channel_b, ffb, now);
+    update_gain(gain_a_, cfg_.channel_a, ffb, now, hold_a);
+    update_gain(gain_b_, cfg_.channel_b, ffb, now, hold_b);
     last_gain_t_ = now;
 
     // ---- 目标通道强度 ----
     // 通道强度是慢变量, 每 100 ms 最多动 slew 允许的量; 快变化全部走
     // 脉冲强度(波形振幅)。默认 strength_source=static, 强度只由配置决定,
     // 游戏数据完全不参与 —— 见 config.hpp 里那个字段的注释。
-    const double v_a = map_input(cfg_.channel_a, ffb);
-    const double v_b = map_input(cfg_.channel_b, ffb);
+    const double v_a = map_input(cfg_.channel_a, ffb, hold_a);
+    const double v_b = map_input(cfg_.channel_b, ffb, hold_b);
     last_v_a_ = v_a;
     last_v_b_ = v_b;
 
@@ -334,8 +430,9 @@ bool Pipeline::tick(double now, const FfbState& ffb, Frame& out) {
     out.b.strength = muted ? 0 : final_b;
 
     out.muted = muted;
-    static const char* const kNoReason = "";
-    out.mute_reason = muted ? reason.c_str() : kNoReason;
+    // reason 里只可能是字符串字面量(见 evaluate_safety 的注释), 所以这个指针
+    // 的生命周期是整个进程, 跨线程存下来也不会悬垂。
+    out.mute_reason = reason;
 
     // ---- 脉冲内容 ----
     if (muted) {

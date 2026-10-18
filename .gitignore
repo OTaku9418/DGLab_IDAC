@@ -50,9 +50,30 @@ _ue4ss_ref/*
 !_ue4ss_ref/ue4ss_0196ef29_deps/
 # 但那份 7.8 MB 的预生成字体位图不提交, 构建用不到它(全仓库无引用):
 _ue4ss_ref/ue4ss_0196ef29/fonts/
+# fmt 11.2.0 的头文件 + src 也必须提交, 理由见
+# _ue4ss_ref/third_party/fmt/PROVENANCE.md: DynamicOutput/Output.hpp 会
+# #include <fmt/core.h>, 而 UE4SS.dll 静态链了 fmt 却**不导出**它 ——
+# 文件不在就直接 C1083, 版本不对就 LNK2019(8 个符号), 且版本必须与
+# 0196ef29 用的 11.2.0 一致(std::string 跨 DLL 边界传递)。
+# 这份副本只带 RE-UE4SS 的 check 宏补丁, 其余与上游 tag 11.2.0 逐字节相同。
+# 注意这三行的写法: git 不会进被忽略的**目录**里去找否定规则, 所以必须先把
+# third_party/ 本身放出来, 再整体忽略它的内容, 最后只放行 fmt/。
+!_ue4ss_ref/third_party/
+_ue4ss_ref/third_party/*
+!_ue4ss_ref/third_party/fmt/
 
-# 从游戏自带的 UE4SS.dll 现场生成的导入库(2 MB), 见 tools\make_ue4ss_implib.cmd。
-third_party/importlib/
+# 导入库目录: **只提交 UE4SS.def**(342 KB 文本, 4067 条导出符号)。
+# .lib 是 lib.exe 从 .def 生成的产物(2 MB 二进制), 不提交 ——
+# tools\bootstrap.cmd 会现场生成, 而且**不需要游戏里的 UE4SS.dll**:
+#     lib /def:third_party\importlib\UE4SS.def /machine:x64 /out:...\UE4SS.lib
+# (已实测: 这样生成的 .lib 与"从真实 DLL dumpbin 出来"的 .lib 大小相同, 链接正常)
+# .def 本身由 tools\make_ue4ss_implib.cmd 从 UE4SS.dll 的 dumpbin /exports 得到,
+# 只有换 UE4SS 版本时才需要重新生成它。
+third_party/importlib/*
+!third_party/importlib/UE4SS.def
+# 来源说明(源 DLL 的 SHA-256 / 版本 / 生成命令 / 校验记录)要跟着仓库走,
+# 否则别人 clone 下来只有一堆修饰名, 无从判断它对的是哪个 UE4SS。
+!third_party/importlib/PROVENANCE.md
 
 # ---- UE4SS 发布包(6.9 MB 二进制, 不提交) ----
 # tools\UE4SS_v3.0.1-944-g0196ef29.zip 只是"我们从哪儿取出对齐头文件"的物证,
@@ -68,3 +89,4 @@ _ue4ss_exp/
 .vscode/
 *.user
 *.suo
+dist/

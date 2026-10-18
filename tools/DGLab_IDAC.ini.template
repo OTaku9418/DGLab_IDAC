@@ -2,9 +2,11 @@
 ; DGLab_IDAC 配置模板 —— 带注释的权威版本
 ; ============================================================================
 ; 用法: 拷到 mod 目录并改名为 DGLab_IDAC.ini
-;   <游戏>\GameProject\Binaries\Win64\ue4ss\Mods\DGLab_IDAC\dlls\DGLab_IDAC.ini
+;   <游戏>\WindowsNoEditor\GameProject\Binaries\Win64\ue4ss\Mods\DGLab_IDAC\dlls\DGLab_IDAC.ini
 ;
-; 写配置前先离线体检, 别靠读日志猜:
+; 发布包里这个文件已经放在正确位置并叫 DGLab_IDAC.ini, 一般不需要拷。
+;
+; 改配置前想先离线体检, 别靠读日志猜(conftest.exe 是仓库里的开发工具, 发布包不含):
 ;   tools\conftest.exe "<上面那个 ini 的完整路径>"
 ; 它会直接判定"会连真实设备吗 / 设备会有刺激吗"。dry_run 写错的表现是
 ; 日志一切正常、只是少做了一件事, 光看日志看不出来。
@@ -28,7 +30,9 @@ verbose=1
 ; mode : 输出到哪。数值是字符串:
 ;        disabled  不连任何设备(纯干跑, 但仍然跑管线与日志) —— 排障首选
 ;        ble       PC 直接做 BLE 中央设备连郊狼主机, 不需要手机 ← 生产用法
-;        websocket 未实现(需要手机 APP 中转, 见 docs/research-dglab-transport.md 第 1.1 节)
+;        websocket 暂未实现。官方的 SOCKET 方案(V4 中继)仍然要让手机 APP
+;                  参与: 本程序做"控制器"连中继服务器, 手机 APP 再连过来。
+;                  详见 docs/research-dglab-transport.md 第 1.2 节
 ; protocol : 郊狼协议版本。目前只支持 v3。数值是字符串。
 mode=ble
 protocol=v3
@@ -44,6 +48,9 @@ connect_timeout_ms=15000
 
 [output]
 ; frame_ms : 一帧多少毫秒。数值是毫秒的整数, 郊狼协议节拍是 100。
+;   ★ BLE 直连时这个值固定 100, 填别的会打一条 WARN 并按 100 处理 ★
+;   原因: 一帧正好覆盖 4x25ms, 设备也按 100ms 的窗口回执; 改它不会让设备变快,
+;   只会让管线的提交节拍与设备的消费节拍错位。
 ; pulse_freq_base : 脉冲频率基准值。数值 10~240。
 ;   注意语义是反的: 数值越大 = 单元时长越长 = 电气频率越低 = 手感越"敦实"。
 ; pulse_freq_min / pulse_freq_max : 上面那个值允许的浮动范围。数值 10~240。
@@ -74,7 +81,9 @@ gain_idle_reset_sec=3.0
 ;   torque    方向盘回正扭矩的幅值(= abs(游戏扭矩), 域 0..127), 实测最活跃
 ;             (回调约 1000 次/轮)。左转与右转都输出力 —— 注意取的是**幅值**,
 ;             左右方向在波形上是同一个信号, 本程序不区分。
-;   viscosity 转向阻尼, 几乎全程有值 —— 实测约 10900 次/轮, 持续可感
+;   viscosity 转向阻尼, 几乎全程有值 —— 实测约 10900 次/轮
+;             ⚠ 不推荐作为输出源: 强制退出比赛回到菜单后, 游戏可能把阻尼停在一个
+;             可感的值上; 这个回调只在值变化时触发, 停住的值会一直输出, 直到下一次变化。
 ;   vibration 振动/路肩, 只在压路肩/碰撞等判定发生时给一次 —— 实测约 160 次/轮,
 ;             属于"事件型"手感, 大部分时间是安静的
 ;   static    恒定输出, 不看游戏数据
@@ -82,7 +91,7 @@ gain_idle_reset_sec=3.0
 ;   逆向证实那个参数不是"左右", 而是齿轮/档位索引(域 0..255); 它取 -1 只表示
 ;   "算出的扭矩为正", 其余情况装的是档位值。用它恢复符号得不到方向。
 ;   依据: re/indrun_hook_mechanics.md 第 4.1 与第 5 节。
-; 建议 A 用 torque 或 viscosity。
+; 建议 A 用 torque。
 ; 想分辨"是哪个通道在动", 让两个通道的 base_strength 不同即可。
 
 [channel_a]
@@ -119,7 +128,7 @@ strength_margin=0.0
 
 [channel_b]
 ; 各键含义与取值范围同 [channel_a]。
-; 当前接 vibration(事件型)。希望 B 通道也有持续可感的东西就改成 viscosity。
+; 当前接 vibration(事件型)。不建议改成 viscosity(原因见上面的来源表)。
 enable=1
 source=vibration
 map_mode=abs_linear
@@ -138,22 +147,36 @@ strength_margin=0.0
 ; clamp_strength : 应用层钳制值, 实际生效上限取它与 max_strength 的较小者。
 ; slew_per_second : 每秒最多变化多少档强度。数值是整数档/秒;
 ;                40 表示每 100 ms 最多变 4 档, 从 0 爬到 15 约需 375 ms。
-; watchdog_ms : ★ 目前未实现, 配了不生效 ★。原意是"力反馈静默超过这个毫秒数
-;                就把输出拉到 0", 但没有任何代码读它。当前唯一的静默保护是
-;                超过 20 秒没有回调时打一条 WARN 日志(告警, 不是归零)。
-;                别把它当安全保证 —— 真正的闸门是 max_strength 与设备 BF 软限位。
+; watchdog_ms : 看门狗。超过这么多毫秒没有新的帧送到传输层, 就改发静默帧
+;                (强度 0), 防止管线卡死时设备一直保持上一个强度。数值是毫秒。
+;                判据是"管线有没有在提交帧", 不是"力反馈回调有没有来" ——
+;                回调是边沿触发的, 力不变时不回调属于正常现象。
+;                配置加载时会被抬到至少 3 倍的 frame_ms, 免得正常抖动误触发;
+;                超过 2000 ms 会被压回 2000(再长就失去兜底意义)。
+;                它只兜底"数据流断了", 真正的力道上限仍然是 max_strength
+;                与设备侧的 BF 软限位。
+; viscosity_hold_ms : viscosity 源的保持超时(毫秒)。数值 0 = 关闭; 其他值 500~10000。
+;                viscosity 的回调是"值变了才回调", 退出比赛回菜单后游戏可能把阻尼
+;                停在一个非零值上不再更新, 那个值会被一直输出(实测脉冲 42/100,
+;                人体无感但设备指示灯亮着)。超过这个毫秒数没有新回调就把该通道的
+;                原始值按 0 处理, 源一更新立刻恢复。
+;                ★ 副作用: 发车倒计时、暂停等原地不动的时段也会被归零 ★
+;                只影响 source=viscosity / viscosity_a 的通道。
 ; zero_when_servo_off : 1=游戏伺服未就绪时强制归零, 0=不归零。数值 0 或 1。
 ; warmup_ms : 启动后多久内不输出, 给设备与链路留握手时间。数值是毫秒。
 ; dry_run : ★ 硬开关 ★ 1=不管 [link] mode 写什么, 一律走空输出, 绝不碰设备;
 ;                0=允许真实输出。数值 0 或 1。
 ;           这是"物理上不可能电到人"的唯一开关, 优先于 [link] mode。
-;           第一次跑新配置时先用 1 验证链路, 确认无误再改 0。
+;           用途是把"加载/挂钩"和"真实输出"分开验证:
+;             写 1 —— 只验证加载和挂钩(不建立 BLE, 设备不会连上);
+;             验证链路用 0, 并先不接电极(看日志里的 B1 回执即可)。
 max_strength=30
 clamp_strength=30
 slew_per_second=40
 watchdog_ms=500
 zero_when_servo_off=1
 warmup_ms=5000
+viscosity_hold_ms=2000
 dry_run=0
 
 [debug]

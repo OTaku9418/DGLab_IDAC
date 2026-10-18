@@ -8,12 +8,128 @@
 #include "transport/transport.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 
 #include "logger.hpp"
 
 namespace dglab_idac {
+
+// ===========================================================================
+// 帧信箱 + 看门狗
+// ===========================================================================
+
+int64_t steady_now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+Frame make_idle_frame(const char* reason) {
+    Frame f;
+    f.servo_on = false;
+    f.muted = true;
+    f.mute_reason = reason ? reason : "idle";
+    for (int i = 0; i < kSlotsPerFrame; ++i) {
+        f.a.slots[i].pulse_intensity = 0;
+        f.a.slots[i].pulse_frequency = 10;
+        f.b.slots[i].pulse_intensity = 0;
+        f.b.slots[i].pulse_frequency = 10;
+    }
+    f.a.strength = 0;
+    f.b.strength = 0;
+    return f;
+}
+
+void FrameMailbox::put(const Frame& f, int64_t now_ms) {
+    std::lock_guard<std::mutex> lk(mu_);
+    // 上一帧还没被取走就又来一帧 = 传输线程跟不上, 这一帧直接丢弃。
+    // 队列深度必须是 1: 发"最新"的波形, 而不是排队发"过时"的。
+    // 但"消费端还没就绪"(链路没连上)时的覆盖不是传输跟不上, 单独记一栏,
+    // 否则每局开头那 3 秒都会凭空贡献 20 多次 over(T13c)。
+    if (has_pending_ && put_count_ > taken_count_) {
+        if (consumer_ready_.load(std::memory_order_relaxed)) {
+            ++stats_.overwritten;
+        } else {
+            ++stats_.overwritten_pre;
+        }
+    }
+    pending_ = f;
+    has_pending_ = true;
+    last_put_ms_ = now_ms;
+    ++put_count_;
+    ++stats_.submitted;
+}
+
+void FrameMailbox::set_consumer_ready(bool ready) {
+    consumer_ready_.store(ready, std::memory_order_relaxed);
+}
+
+bool FrameMailbox::consumer_ready() const {
+    return consumer_ready_.load(std::memory_order_relaxed);
+}
+
+MailboxTake FrameMailbox::take(int64_t now_ms, int watchdog_ms) {
+    MailboxTake out;
+    bool trip_now = false;
+    bool untrip_now = false;
+    int64_t stalled_for = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+
+        if (!has_pending_) {
+            // 从来没有人 put 过 —— 这是"启动后还没进游戏", 不是故障。
+            out.frame = make_idle_frame("idle");
+            ++stats_.idle_sent;
+        } else {
+            // 看门狗: 距上次 put 超过 watchdog_ms 就认为管线侧断了。
+            // 判据是"上一次 put 的时刻", 不是"距离上次 take" —— 后者在
+            // 传输线程自己节拍正常时会永远为 0, 看门狗就失效了。
+            const int64_t gap = now_ms - last_put_ms_;
+            const bool stale = (watchdog_ms > 0) && (gap > static_cast<int64_t>(watchdog_ms));
+
+            if (stale) {
+                out.frame = make_idle_frame("watchdog");
+                out.stale = true;
+                ++stats_.idle_sent;
+                if (!tripped_) {
+                    tripped_ = true;
+                    trip_now = true;
+                    stalled_for = gap;
+                    ++stats_.watchdog_trips;
+                }
+            } else {
+                if (tripped_) {
+                    tripped_ = false;
+                    untrip_now = true;
+                }
+                out.frame = pending_;
+                if (put_count_ > taken_count_) {
+                    taken_count_ = put_count_;
+                    out.fresh = true;
+                    ++stats_.taken_fresh;
+                } else {
+                    ++stats_.repeated;
+                }
+            }
+        }
+    }  // 锁在这里释放, 下面打日志
+
+    // 日志只在"状态切换"时打, 不是每帧 —— 停顿持续 3 秒也只有一条告警。
+    if (trip_now) {
+        log_warn("看门狗触发: 管线 %lld ms 没有提交新帧 (watchdog_ms=%d), 改发静默帧",
+                 static_cast<long long>(stalled_for), watchdog_ms);
+    } else if (untrip_now) {
+        log_info("看门狗恢复: 管线重新开始提交帧");
+    }
+    return out;
+}
+
+MailboxStats FrameMailbox::stats() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return stats_;
+}
 
 namespace {
 

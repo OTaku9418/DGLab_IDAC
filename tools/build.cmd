@@ -37,9 +37,10 @@ pushd "%REPO%" || (echo [x] cannot enter %REPO% & exit /b 1)
 REM Toolchain location (measured on this machine: Build Tools live on E:)
 if not defined VCVARS set "VCVARS=E:\VS\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 
-REM 游戏 mod 目录。其它机器上设 DLAB_DEPLOY_DIR 覆盖, 或者干脆不部署
-REM (不传 -Deploy, 产物就留在 build\Release\)。
-REM 注意这里用反斜杠给 cmd 用, 传给 CMake 时再换成正斜杠。
+REM Game mod dir. On other machines set DLAB_DEPLOY_DIR to override, or just
+REM do not deploy (without -Deploy the output stays in build\Release\).
+REM Backslashes here are for cmd; they are converted to forward slashes before
+REM being handed to CMake.
 if not defined DLAB_DEPLOY_DIR set "DLAB_DEPLOY_DIR=D:\INDAC\MODAC321\WindowsNoEditor\GameProject\Binaries\Win64\ue4ss\Mods\DGLab_IDAC"
 set "GAME_MODS=%DLAB_DEPLOY_DIR%"
 
@@ -68,6 +69,22 @@ if /I "%~1"=="--stage" (
 shift
 goto parse
 :parsed
+
+REM ---- validate -Stage ----
+REM A typo here is silent and expensive: the mod reads bisect.txt with atoi, so
+REM a non-numeric stage becomes 0 (= loaded but does nothing) and looks exactly
+REM like "the mod is not working".
+if defined STAGE (
+    echo !STAGE!| findstr /R /C:"^[0-9][0-9]*$" >nul
+    if errorlevel 1 (
+        echo [x] -Stage needs an integer in 0..11, got "!STAGE!"
+        popd & exit /b 1
+    )
+    if !STAGE! GTR 11 (
+        echo [x] -Stage must be in 0..11  ^(0 = load only, 11 = full^), got !STAGE!
+        popd & exit /b 1
+    )
+)
 
 set "BUILD_DIR=build"
 
@@ -102,7 +119,8 @@ REM ninja.exe (it ships with the "C++ CMake tools for Windows" component),
 REM while MSBuild is always present.
 set "CMAKE_ARGS=-S . -B %BUILD_DIR% -G "Visual Studio 17 2022" -A x64"
 if defined DO_DEPLOY (
-    REM CMake 里反斜杠是转义字符, 传过去会踩到 "D:\INDAC" 的 \I —— 换成正斜杠。
+    REM CMake treats backslash as an escape character, so "D:\INDAC" would lose
+    REM the "\I". Convert to forward slashes.
     set "GAME_MODS_FWD=!GAME_MODS:\=/!"
     set "CMAKE_ARGS=!CMAKE_ARGS! -DDGLAB_DEPLOY_DIR=!GAME_MODS_FWD!"
 )
@@ -139,16 +157,18 @@ if defined DO_DEPLOY (
 )
 
 if defined STAGE (
-    echo %STAGE%> "%GAME_MODS%\dlls\bisect.txt"
+    REM Redirect-into-file order matters: "echo 5> file" makes cmd treat the 5
+    REM as a handle number, so nothing useful lands in the file. Put the
+    REM redirection first.
+    >"%GAME_MODS%\dlls\bisect.txt" echo %STAGE%
     echo [ok] bisect stage set to %STAGE%  ^(bisect.txt written^)
     echo      bisect log will be: %GAME_MODS%\dlls\bisect.log
     if "%STAGE%"=="0" echo      stage 0 = load only, does nothing. Safe.
 ) else (
     if defined DO_DEPLOY (
         echo.
-        echo [i] bisect stage NOT set. The mod will do NOTHING (stage 0 default)
-        echo     unless dlls\bisect.txt already exists. Set one with:
-        echo       tools\build.cmd -Stage 11
+        echo [i] bisect stage NOT set. Without dlls\bisect.txt the mod runs FULL stage 11.
+        echo     To bisect, run: tools\build.cmd -Stage N   ^(0 = load only, 11 = full^)
     )
 )
 

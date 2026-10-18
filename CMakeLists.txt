@@ -16,7 +16,7 @@
 #   tools\build.cmd -Deploy          —— 额外把产物铺到游戏 Mods 目录
 # ---------------------------------------------------------------------------
 cmake_minimum_required(VERSION 3.18)
-project(DGLab_IDAC VERSION 0.1.0 LANGUAGES CXX)
+project(DGLab_IDAC VERSION 0.2.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "只能构建 x64 —— 游戏是 64 位进程。")
@@ -49,16 +49,15 @@ add_subdirectory("${MINHOOK_DIR}" EXCLUDE_FROM_ALL)
 # ---------------------------------------------------------------------------
 # 依赖 2: UE4SS 头文件 + 已构建的 UE4SS.dll
 #
-# 头文件来自 v3.0.1 的 sparse checkout(_ue4ss_ref/RE-UE4SS)。只用 include/,
-# 因为整个 mod ABI 就是 CppUserModBase 这一个类。
+# 真正用于编译的是下面 DGLAB_HEADERS_PINNED 指向的 _ue4ss_ref/ue4ss_0196ef29
+# (已提交进仓库, 与游戏里的 UE4SS.dll 逐提交对齐)。
+#
+# UE4SS_DIR 只是**回退**方案: 指向一份旧的 v3.0.1 检出, 只在没有对齐头文件
+# 时用, 且 ABI 很可能对不上。tools/bootstrap.cmd 会检查对齐头文件是否在位,
+# 但它**不会**去检出 RE-UE4SS —— 这个目录在 .gitignore 里, 新 clone 里不存在,
+# 所以这里不能因为它缺席就 FATAL(否则"clone 下来直接构建"必然失败)。
 # ---------------------------------------------------------------------------
-set(UE4SS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/RE-UE4SS" CACHE PATH "RE-UE4SS 源码根")
-if(NOT EXISTS "${UE4SS_DIR}/UE4SS/include/Mod/CppUserModBase.hpp")
-    message(FATAL_ERROR
-        "找不到 RE-UE4SS v3.0.1 头文件 (${UE4SS_DIR}/UE4SS/include)。\n"
-        "必须用 v3.0.1 —— 与本机 UE4SS.dll (v3.0.1 Beta #0196ef29) 对齐。\n"
-        "换版本会改变 CppUserModBase 的 vtable 布局, mod 会在 UE4SS 调用虚函数时崩。")
-endif()
+set(UE4SS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/RE-UE4SS" CACHE PATH "RE-UE4SS 源码根(可选回退)")
 
 # 已构建的 UE4SS.dll。链接它而不是重编它。
 #
@@ -74,24 +73,39 @@ set(DGLAB_GAME_UE4SS_DIR ""
 
 set(UE4SS_DLL "" CACHE FILEPATH "游戏目录里的 UE4SS.dll(留空则自动推导)")
 
+# 有人显式给了线索却没找到, 就别再假装用那个默认值 —— 那会让日志里出现一条
+# 与本机无关的 D:\INDAC 路径, 看起来"找到了"其实什么都没验证(排查 ABI 问题时
+# 这种假信息最毒)。所以: 给过线索就以那条线索为准, 找不到就明说, 不往下走。
+set(_hinted FALSE)
 if(NOT UE4SS_DLL)
     if(DGLAB_DEPLOY_DIR)
+        set(_hinted TRUE)
         cmake_path(GET DGLAB_DEPLOY_DIR PARENT_PATH _mods_dir)
         cmake_path(GET _mods_dir PARENT_PATH _ue4ss_dir)
         set(_cand "${_ue4ss_dir}/UE4SS.dll")
         if(EXISTS "${_cand}")
             set(UE4SS_DLL "${_cand}")
+        else()
+            message(WARNING
+                "DGLAB_DEPLOY_DIR 指向 ${DGLAB_DEPLOY_DIR}, 由此推出的\n"
+                "  UE4SS.dll 不存在: ${_cand}\n"
+                "  没关系 —— 链接用的是 third_party/importlib/UE4SS.lib,\n"
+                "  不需要 UE4SS.dll。只是不能再帮你核对版本了。")
         endif()
     endif()
 endif()
-if(NOT UE4SS_DLL AND DGLAB_GAME_UE4SS_DIR)
+if(NOT UE4SS_DLL AND NOT _hinted AND DGLAB_GAME_UE4SS_DIR)
+    set(_hinted TRUE)
     set(_cand "${DGLAB_GAME_UE4SS_DIR}/UE4SS.dll")
     if(EXISTS "${_cand}")
         set(UE4SS_DLL "${_cand}")
+    else()
+        message(WARNING "DGLAB_GAME_UE4SS_DIR 下没有 UE4SS.dll: ${_cand}")
     endif()
 endif()
-if(NOT UE4SS_DLL)
-    # 开发机默认值。别人拿到这个仓库时上面几条都不成立, 会落到这里。
+if(NOT UE4SS_DLL AND NOT _hinted)
+    # 开发机默认值。别人拿到这个仓库时上面几条都没给, 会落到这里; 路径不存在
+    # 就直接留空, 什么都不报 —— 这是预期情况, 不是错误。
     set(_dev_default
         "D:/INDAC/MODAC321/WindowsNoEditor/GameProject/Binaries/Win64/ue4ss/UE4SS.dll")
     if(EXISTS "${_dev_default}")
@@ -100,14 +114,22 @@ if(NOT UE4SS_DLL)
 endif()
 
 if(NOT EXISTS "${UE4SS_DLL}")
-    message(FATAL_ERROR
-        "找不到 UE4SS.dll。它是**从游戏目录**链接的, 不是从仓库里拿的。指定方式:\n"
-        "  cmake -S . -B build -DUE4SS_DLL=<path-to>/ue4ss/UE4SS.dll\n"
-        "或指向游戏 mod 目录让它自己推导:\n"
-        "  cmake -S . -B build -DDGLAB_DEPLOY_DIR=<path-to>/ue4ss/Mods/DGLab_IDAC\n"
-        "当前解析结果: \"${UE4SS_DLL}\"")
+    # 注意: 这里**不是** FATAL。链接用的是 third_party/importlib/UE4SS.lib,
+    # UE4SS.dll 只在"重新生成导入库"时才需要。
+    # 连那个导入库也不必提交二进制: 仓库里带着 UE4SS.def, tools\bootstrap.cmd
+    # 用 lib.exe 直接吃 .def 就能生成 .lib —— 所以"没装游戏也能编译"。
+    # 真的什么导入库都没有时, 下面链接段会给出能照着做的指令。
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/importlib/UE4SS.lib")
+        message(STATUS "DGLab_IDAC: 未找到 UE4SS.dll, 但导入库已存在 —— 编译不受影响")
+    else()
+        message(STATUS "DGLab_IDAC: 未找到 UE4SS.dll 与导入库 —— 先跑 tools\\bootstrap.cmd")
+    endif()
 endif()
-message(STATUS "DGLab_IDAC: UE4SS.dll = ${UE4SS_DLL}")
+if(UE4SS_DLL)
+    message(STATUS "DGLab_IDAC: UE4SS.dll = ${UE4SS_DLL}")
+else()
+    message(STATUS "DGLab_IDAC: UE4SS.dll = (未找到, 编译只用导入库)")
+endif()
 
 # ---------------------------------------------------------------------------
 # mod 本体
@@ -166,11 +188,21 @@ endif()
 # 进到 UE4SS 的装置里被消费的。
 # ---------------------------------------------------------------------------
 set(DGLAB_FMT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt")
-if(IS_DIRECTORY "${DGLAB_FMT_DIR}/src")
-    list(APPEND DGLAB_SOURCES
-        "${DGLAB_FMT_DIR}/src/format.cc"
-        "${DGLAB_FMT_DIR}/src/os.cc")
+if(NOT EXISTS "${DGLAB_FMT_DIR}/src/format.cc" OR NOT EXISTS "${DGLAB_FMT_DIR}/src/os.cc")
+    # 必须 FATAL。以前写成 if(IS_DIRECTORY ...) 只 list(APPEND), 文件夹不在时
+    # 一句都不报, 一路编到 DynamicOutput/Output.hpp 才报
+    #     fatal error C1083: 无法打开包含文件: "fmt/core.h"
+    # 把真正原因(这个目录在干净 clone 里被 .gitignore 排掉了)藏到后面。
+    message(FATAL_ERROR
+        "缺少 fmt 11.2.0 源文件: ${DGLAB_FMT_DIR}/src/{format.cc,os.cc}\n"
+        "  它已提交进仓库(见该目录下的 PROVENANCE.md)。恢复:\n"
+        "      git checkout -- _ue4ss_ref/third_party/fmt\n"
+        "  不能省: DynamicOutput 的头会 #include <fmt/core.h>, 而 UE4SS.dll 静态\n"
+        "  链的 fmt 没有导出, 版本还必须与 0196ef29 的 11.2.0 完全一致。")
 endif()
+list(APPEND DGLAB_SOURCES
+    "${DGLAB_FMT_DIR}/src/format.cc"
+    "${DGLAB_FMT_DIR}/src/os.cc")
 
 add_library(${PROJECT_NAME} SHARED ${DGLAB_SOURCES})
 
@@ -212,6 +244,20 @@ if(IS_DIRECTORY "${DGLAB_HEADERS_PINNED}")
         "${DGLAB_DEPS_PINNED}/*")
     message(STATUS "DGLab_IDAC: 使用★已对齐★的 UE4SS 头文件 = ${DGLAB_HEADERS_PINNED}")
 else()
+    # 回退路径: 没有对齐头文件, 只能用 UE4SS_DIR 那份旧检出。
+    # 这里才是"RE-UE4SS 到底在不在"该检查的地方 —— 放在文件开头会让
+    # 干净 clone(该目录被 .gitignore 排除)连配置都过不去。
+    if(NOT EXISTS "${UE4SS_DIR}/UE4SS/include/Mod/CppUserModBase.hpp")
+        message(FATAL_ERROR
+            "既没有对齐的头文件 (${DGLAB_HEADERS_PINNED}), 也没有回退用的 RE-UE4SS 检出 "
+            "(${UE4SS_DIR}/UE4SS/include)。\n"
+            "  正常情况下不需要回退: 对齐头文件已随仓库提交, 用\n"
+            "      git checkout -- _ue4ss_ref\n"
+            "  取回来即可。tools\\bootstrap.cmd 会检查它是否在位。\n"
+            "  回退用的 RE-UE4SS 是 v3.0.1 (commit d935b5b), 与本机 UE4SS.dll\n"
+            "  (v3.0.1 Beta #0196ef29) 相差 944 个提交, vtable 布局不同 ——\n"
+            "  真拿它编, mod 会在 UE4SS 调用虚函数时崩, 所以只在不关心 ABI 时用。")
+    endif()
     set(DGLAB_UE4SS_INCLUDES "${UE4SS_DIR}/UE4SS/include")
     file(GLOB DGLAB_DEP_INCLUDE_DIRS LIST_DIRECTORIES true
         "${UE4SS_DIR}/deps/first/*/include")
@@ -233,10 +279,14 @@ endforeach()
 # 版本必须与 UE4SS 在 0196ef29 用的完全一致: fmt 11.2.0 (见 deps/third/CMakeLists.txt
 # 里的 FetchContent GIT_TAG)。UE4SS 会给它打一个 "check 宏冲突" 补丁
 # (cmake/modules/MacroPatch.cmake -> fmt/ranges.h), 我们已经在固化的头文件里打过。
-if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt/include")
-    list(APPEND DGLAB_UE4SS_INCLUDES
-        "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt/include")
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt/include/fmt/core.h")
+    # 同样必须 FATAL —— 否则报的是一句 C1083, 看不出是"仓库里的 fmt 被排掉了"。
+    message(FATAL_ERROR
+        "缺少 fmt 头文件: _ue4ss_ref/third_party/fmt/include/fmt/core.h\n"
+        "  恢复:  git checkout -- _ue4ss_ref/third_party/fmt")
 endif()
+list(APPEND DGLAB_UE4SS_INCLUDES
+    "${CMAKE_CURRENT_SOURCE_DIR}/_ue4ss_ref/third_party/fmt/include")
 
 list(REMOVE_DUPLICATES DGLAB_UE4SS_INCLUDES)
 
@@ -259,11 +309,21 @@ if(MSVC)
         /EHsc
         /MP
         /wd4100           # 未引用的形参(detour 里刻意占位)
+        /Zi               # 生成 PDB: 崩溃报告(bisect.log)里的地址要能查符号
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE
         NOMINMAX
         WIN32_LEAN_AND_MEAN
         _CRT_SECURE_NO_WARNINGS
+        # 版本号只有一个来源: 上面 project(... VERSION ...)。
+        # 代码里不许再写版本字面量 —— 以前 dllmain.cpp 有 3 处 "0.1.0",
+        # 改版本时漏一处就会出现"日志说 0.1.1、ModVersion 说 0.1.0"。
+        # 两个变体的原因: UE4SS 的 StringType 是 std::basic_string<CharType>,
+        # 而 CharType 由 StringType.hpp 里的 FORCE_U16 决定 —— 当前构建没定义它,
+        # 所以是 wchar_t, 前缀必须是 L(不是 u)。对了错都只是编译错误, 不会静默。
+        "DGLAB_VERSION_W=L\"${PROJECT_VERSION}\""
+        "DGLAB_VERSION_A=\"${PROJECT_VERSION}\""
+        "DGLAB_VERSION_DIAG=L\"${PROJECT_VERSION}-diag\""
     )
 endif()
 
@@ -288,7 +348,9 @@ set(UE4SS_IMPLIB "${CMAKE_CURRENT_SOURCE_DIR}/third_party/importlib/UE4SS.lib")
 if(NOT EXISTS "${UE4SS_IMPLIB}")
     message(FATAL_ERROR
         "缺少 UE4SS 导入库: ${UE4SS_IMPLIB}\n"
-        "  先跑一次:  tools\\make_ue4ss_implib.cmd")
+        "  跑一次:  tools\\bootstrap.cmd\n"
+        "  它会用仓库里已提交的 third_party/importlib/UE4SS.def 生成 .lib ——\n"
+        "  **不需要游戏安装, 也不需要 UE4SS.dll**。")
 endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -303,6 +365,18 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     shell32.lib         # CommandLineToArgvW / 杂项
 )
 
+if(MSVC)
+    # /DEBUG + /Zi: 让 make_release.cmd 能把 PDB 与 DLL 一起归档。
+    # /Brepro: 不把当前时间写进 PE 头 —— 否则同样的源码每次构建出来的 DLL
+    #   有 4 个字节不同(实测: 文件头 TimeDateStamp 与 CodeView 记录各一处),
+    #   md5 就失去"验证同一份代码"的意义。
+    # /PDBALTPATH: DLL 里只记文件名, 不把构建机路径(D:\INDAC\...)写进发布产物。
+    # /OPT:REF /OPT:ICF 必须显式写出: 链接器在 /DEBUG 下默认关掉它们(即使 Release 配置),
+    # 会把没被引用的函数全塞进镜像 —— 实测不加这两项, DLL 从 268 KB 涨到 1.18 MB。
+    target_link_options(${PROJECT_NAME} PRIVATE
+        /DEBUG /Brepro /OPT:REF /OPT:ICF "/PDBALTPATH:DGLab_IDAC.pdb")
+endif()
+
 # 输出名: UE4SS 只找 <mod>/dlls/main.dll, 所以交付时改名。
 # 构建产物仍叫 DGLab_IDAC.dll 以免和别的 mod 的 main.dll 混淆。
 set_target_properties(${PROJECT_NAME} PROPERTIES
@@ -310,8 +384,17 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
     OUTPUT_NAME "DGLab_IDAC"
 )
 
-message(STATUS "DGLab_IDAC: UE4SS 头文件 = ${UE4SS_DIR}")
-message(STATUS "DGLab_IDAC: 链接 UE4SS.dll = ${UE4SS_DLL}")
+# 打印**实际生效**的那个头文件目录, 而不是回退目录 —— 以前这里打的是
+# UE4SS_DIR, 于是日志里永远显示 v3.0.1 路径, 而实际编进去的是对齐头文件,
+# 排查 ABI 问题时这个假信息非常致命。
+list(GET DGLAB_UE4SS_INCLUDES 0 _dglab_first_inc)
+message(STATUS "DGLab_IDAC: 生效的 UE4SS 头文件 = ${_dglab_first_inc}")
+message(STATUS "DGLab_IDAC: 链接 UE4SS 导入库 = ${UE4SS_IMPLIB}")
+if(UE4SS_DLL)
+    message(STATUS "DGLab_IDAC: UE4SS.dll 版本参照 = ${UE4SS_DLL}")
+else()
+    message(STATUS "DGLab_IDAC: UE4SS.dll 版本参照 = (无 —— 只靠导入库, 不核对版本)")
+endif()
 message(STATUS "DGLab_IDAC: MinHook     = ${MINHOOK_DIR}")
 
 # ---------------------------------------------------------------------------
@@ -379,8 +462,11 @@ set_target_properties(abitest PROPERTIES
 # 运行:  build\Release\protocol_check.exe    (全通过返回 0)
 # ---------------------------------------------------------------------------
 set(DGLAB_PROTOCOL_SRC "src/transport/transport.cpp")
+# 以前这里会静默回退到 src/transport/transport_stub.cpp —— 那个文件根本不存在,
+# 所以回退分支只会在"transport.cpp 被改名"时把一个更隐蔽的错误丢给编译器。
+# 缺文件就直接报错。
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${DGLAB_PROTOCOL_SRC}")
-    set(DGLAB_PROTOCOL_SRC "src/transport/transport_stub.cpp")
+    message(FATAL_ERROR "缺少 ${DGLAB_PROTOCOL_SRC} —— protocol_check 需要它来验证 B0/BF 编码")
 endif()
 
 add_executable(protocol_check
@@ -400,6 +486,41 @@ if(MSVC)
         /utf-8 /W4 /permissive- /Zc:__cplusplus /EHsc /MP
     )
     target_compile_definitions(protocol_check PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# logic_check —— 信箱/看门狗/静默帧/管线的离线逻辑自检 (普通控制台程序)
+#
+# 存在的理由: 看门狗只在**出故障的时候**才生效, 平时跑一万次也看不出问题。
+# 等真出事(游戏卡死 2 秒)才发现它没接上, 代价是设备在错误强度上一直输出。
+# 所以判定逻辑必须能离线测 —— FrameMailbox 的时间由调用方传入, 不依赖真时钟。
+#
+# 与 protocol_check 的分工: protocol_check 管"字节编码对不对", logic_check
+# 管"什么时候该发什么"。两者都不链 UE4SS / WinRT / minhook。
+#
+# 构建:  cmake --build build --config Release --target logic_check
+# 运行:  build\Release\logic_check.exe    (全通过返回 0)
+# ---------------------------------------------------------------------------
+add_executable(logic_check
+    tools/logic_check.cpp
+    ${DGLAB_PROTOCOL_SRC}
+    src/pipeline.cpp
+    src/config.cpp          # is_held_risk_source() 在这里, 告警名单也要被离线覆盖
+    src/logger.cpp
+)
+
+target_include_directories(logic_check PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+
+set_property(TARGET logic_check PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+if(MSVC)
+    target_compile_options(logic_check PRIVATE
+        /utf-8 /W4 /permissive- /Zc:__cplusplus /EHsc /MP /wd4100
+    )
+    target_compile_definitions(logic_check PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
     )
 endif()

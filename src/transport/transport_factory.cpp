@@ -1,10 +1,15 @@
 // ---------------------------------------------------------------------------
 // DGLab_IDAC — 传输工厂
 //
-// 用户要求"连接方式通过配置文件切换"。目前**只有 BLE 一条真路径** ——
-// 本地协议仓库(dglab-bluetooth-protocol)里没有 WebSocket 规范, 那部分是
-// 从网上查到的手机 APP 方案(见 docs/research-coyote-protocol.md), 需要
-// 手机参与, 与"PC 直连"的目标不符, 所以没有实现。
+// 用户要求"连接方式通过配置文件切换"。目前**只有 BLE 一条真路径**。
+//
+// WebSocket 尚未实现。计划基于官方 DG-LAB V4 协议(dglab-websocket-server 的
+// v4-server.ts + dglab-kit 的 device.op / clearOperate), 但那条路**仍然需要
+// 手机 APP 做蓝牙中转**:
+//     third-party controller(本程序) <-> WebSocket 中继 <-> 多个 DG-LAB 4 APP
+// 中继服务器不解析设备命令, 只转发 data 字段; 真正的 BLE 链路在手机上。
+// 对逐帧变化的力反馈来说, 它比 BLE 直连多一跳网络 + 一套任务队列语义, 所以
+// 主线继续走 BLE。详见 docs/research-dglab-transport.md 第 1.2 节。
 //
 // 分派规则:
 //   dry_run = 1       -> Null, 且**优先于 link** (不管 link 写的是什么)
@@ -59,13 +64,13 @@ ITransport* create_transport(const Config& cfg) {
         }
 
         case LinkMode::WebSocket:
-            log_error("[link] mode=websocket 尚未实现。官方的 SOCKET 协议确实存在"
-                      "(dungeonlab-open/dglab-websocket-simple 仓库的 socket/ 目录, "
-                      "JSON over WebSocket, 该仓库已归档), "
-                      "但它必须由手机 APP 扫码参与: APP 仍是 BLE 中枢, 第三方只是把排好队的"
-                      "数据交给 APP 转发, 且波形是按批量队列(pulse-A:[...])下发的。"
-                      "对逐帧变化的力反馈信号来说它比 BLE 直连更差(多一跳网络 + 队列语义), "
-                      "所以本 mod 只走 BLE。详见 docs/research-dglab-transport.md 第 1.1 节。");
+            log_error("[link] mode=websocket 尚未实现。计划基于官方 V4 协议: "
+                      "本程序作为控制器连 dglab-websocket-server 的 v4 中继, "
+                      "DG-LAB 4 APP 用 ?tid=<控制器 clientId> 连进来, "
+                      "设备命令走 dglab-kit 的 device.op / device.op.clear。"
+                      "注意中继服务器不做 BLE —— 手机 APP 仍是蓝牙中枢, "
+                      "所以它解决不了\"PC 直连\"的目标, 只多了一跳网络与任务队列语义。"
+                      "详见 docs/research-dglab-transport.md 第 1.2 节。");
             return create_null_transport(cfg);
 
         case LinkMode::Disabled:

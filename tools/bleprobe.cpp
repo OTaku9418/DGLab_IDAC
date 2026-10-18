@@ -31,6 +31,7 @@
 // to DGLab_IDAC.log, which is written as UTF-8.
 // ---------------------------------------------------------------------------
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <atomic>
 #include <chrono>
@@ -39,6 +40,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "config.hpp"
 #include "logger.hpp"
@@ -47,6 +49,52 @@
 using namespace dglab_idac;
 
 static std::atomic<int> g_frames_submitted{0};
+
+// ---- --freeze: suspend every thread of THIS process except the caller, then
+//      resume it. ----
+// Why not Task Manager / Resource Monitor? Their "Suspend Process" command is
+// unreliable on some Windows 10/11 builds (the context menu entry does nothing),
+// and suspending another process needs cross-process rights that the tool would
+// have to be granted. Suspending ourselves needs no extra rights and produces
+// the same thing as seen from the device: a long stretch with no B0 frame.
+//
+// Threads are resumed through the very handles we suspended with, so a thread
+// created during the freeze is never over-resumed.
+static int freeze_other_threads(std::vector<HANDLE>* out) {
+    const DWORD my_pid = GetCurrentProcessId();
+    const DWORD self_tid = GetCurrentThreadId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    int n = 0;
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != my_pid) continue;
+            if (te.th32ThreadID == self_tid) continue;
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+            if (h == nullptr) continue;
+            if (SuspendThread(h) == static_cast<DWORD>(-1)) {
+                CloseHandle(h);
+                continue;
+            }
+            out->push_back(h);
+            ++n;
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return n;
+}
+
+static int resume_threads(std::vector<HANDLE>& hs) {
+    int n = 0;
+    for (HANDLE h : hs) {
+        if (ResumeThread(h) != static_cast<DWORD>(-1)) ++n;
+        CloseHandle(h);
+    }
+    hs.clear();
+    return n;
+}
 
 // ---- Build a frame on the frame_ms beat. A simple ramp waveform, so the
 //      device LED has something visible to show. ----
@@ -114,6 +162,18 @@ int main(int argc, char** argv) {
             "  --steady: constant pulses on every slot instead of the gentle ramp.\n"
             "      The strongest, most visible output the device can make -- use it\n"
             "      when asking 'does the indicator LED react to output at all?'.\n"
+            "  --stall=N: half way through the run, stop submitting frames for N\n"
+            "      seconds. This is the only way to exercise [safety] watchdog_ms on\n"
+            "      demand: the transport's own send loop keeps beating, so once the\n"
+            "      mailbox goes older than watchdog_ms it must switch to the idle\n"
+            "      frame and log 'watchdog triggered'. Expect exactly one warning,\n"
+            "      wd=1, trips=1, idle counting up, then normal frames again.\n"
+            "  --freeze=N: at 35%% of the run, suspend every other thread of this\n"
+            "      process for N seconds, then resume. Same effect as Task Manager's\n"
+            "      'Suspend Process' (K2 bench case) but needs no extra rights and\n"
+            "      no UI. The link is dead for those N seconds: no B0 reaches the\n"
+            "      device, so whatever the device does then is what a frozen game\n"
+            "      would leave the user with.\n"
             "\n"
             "Transport diagnostics are written to DGLab_IDAC.log next to the ini's\n"
             "working directory (UTF-8). Watch that file for the detailed reason.\n");
@@ -128,9 +188,19 @@ int main(int argc, char** argv) {
     }
     bool live = false;
     int force_strength = -1;
+    int stall_seconds = 0;
+    int freeze_seconds = 0;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--live") == 0) live = true;
         if (std::strcmp(argv[i], "--steady") == 0) g_steady = true;
+        if (std::strncmp(argv[i], "--stall=", 8) == 0) {
+            const int v = std::atoi(argv[i] + 8);
+            stall_seconds = v < 1 ? 0 : v;
+        }
+        if (std::strncmp(argv[i], "--freeze=", 9) == 0) {
+            const int v = std::atoi(argv[i] + 9);
+            freeze_seconds = v < 1 ? 0 : v;
+        }
         if (std::strncmp(argv[i], "--setstrength=", 14) == 0) force_strength = std::atoi(argv[i] + 14);
         if (std::strncmp(argv[i], "--freq=", 7) == 0) {
             const int v = std::atoi(argv[i] + 7);
@@ -183,6 +253,14 @@ int main(int argc, char** argv) {
     std::printf("  pattern     : %s\n", g_steady ? "STEADY (constant, maximum visibility)"
                                                  : "ramp (gentle)");
     std::printf("  duration    : %d s\n", seconds);
+    if (stall_seconds > 0) {
+        std::printf("  stall test  : stop submitting for %d s at the half-way point\n",
+                    stall_seconds);
+    }
+    if (freeze_seconds > 0) {
+        std::printf("  freeze test : suspend all other threads for %d s at 35%% of the run\n",
+                    freeze_seconds);
+    }
     if (force_strength >= 0) {
         std::printf("  mode        : SETSTRENGTH %d (device-acceptance probe)\n", force_strength);
     } else {
@@ -220,7 +298,63 @@ int main(int argc, char** argv) {
     int tick = 0;
     auto next_status = t0 + std::chrono::milliseconds(1000);
 
+    // --stall: half way through, stop calling submit() for N seconds. The
+    // transport's send loop is untouched, so it keeps beating; once the newest
+    // frame in the mailbox is older than [safety] watchdog_ms it must decide to
+    // send the idle frame instead. That is the one path the offline logic_check
+    // cannot cover end to end (device ack included), so it needs a real run.
+    const auto stall_at = t0 + std::chrono::seconds(seconds / 2);
+    bool stall_armed = stall_seconds > 0;
+    bool stall_seen = false;
+
+    // --freeze: earlier than --stall so the two never overlap if both are given.
+    const auto freeze_at = t0 + std::chrono::seconds(seconds * 35 / 100);
+    bool freeze_armed = freeze_seconds > 0;
+    bool freeze_seen = false;
+
     while (std::chrono::steady_clock::now() < deadline) {
+        const auto now_pre = std::chrono::steady_clock::now();
+        if (freeze_armed && !freeze_seen && now_pre >= freeze_at) {
+            freeze_seen = true;
+            std::vector<HANDLE> suspended;
+            const int n = freeze_other_threads(&suspended);
+            std::printf("[>>] FREEZE: suspended %d thread(s) (this one keeps running) for %d s.\n"
+                        "     No B0 leaves the process now. What the device does in the next\n"
+                        "     %d s is exactly what a frozen game would leave you with.\n",
+                        n, freeze_seconds, freeze_seconds);
+            std::fflush(stdout);
+            std::this_thread::sleep_for(std::chrono::seconds(freeze_seconds));
+            const int rn = resume_threads(suspended);
+            std::printf("[<<] FREEZE over: resumed %d thread(s).\n", rn);
+            std::fflush(stdout);
+            next_status = std::chrono::steady_clock::now();  // report immediately
+            continue;
+        }
+        if (stall_armed && !stall_seen && now_pre >= stall_at) {
+            stall_seen = true;
+            std::printf("[>>] STALL starts: no submit() for %d s. The transport keeps\n"
+                        "     beating, so wd must flip to 1 and trips to 1 after %d ms.\n",
+                        stall_seconds, cfg.watchdog_ms);
+            std::fflush(stdout);
+            const auto stall_end = now_pre + std::chrono::seconds(stall_seconds);
+            while (std::chrono::steady_clock::now() < stall_end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= next_status) {
+                    const auto el = std::chrono::duration_cast<std::chrono::seconds>(now - t0).count();
+                    std::printf("[status %3llds] STALLED, submitted %d frames | %s\n",
+                                static_cast<long long>(el), tick, t->status().c_str());
+                    std::fflush(stdout);
+                    next_status = now + std::chrono::milliseconds(1000);
+                }
+            }
+            std::printf("[<<] STALL over: resuming submit(). Watch trips stay at 1 and\n"
+                        "     normal frames come back (idle should stop counting up).\n");
+            std::fflush(stdout);
+            next_status = std::chrono::steady_clock::now();  // report immediately
+            continue;
+        }
+
         t->submit(make_frame(cfg, tick));
         ++tick;
 

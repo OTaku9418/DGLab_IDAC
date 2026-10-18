@@ -11,7 +11,9 @@
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include "config.hpp"
@@ -93,6 +95,73 @@ B0 make_bf(int limit_a, int limit_b, int freq_bal_a = 128, int freq_bal_b = 128)
 // ⚠ 线上值越小频率越高 —— 典型的符号反向 bug 来源。
 // 本函数输入直接是赫兹, 内部先转成 ms 周期的等价量再套公式。
 uint8_t hz_to_pulse_value(double hz);
+
+// ---------------------------------------------------------------------------
+// 帧信箱 —— 管线线程 put(), 传输线程 take()。深度 1, 覆盖式。
+//
+// 为什么抽出来做成独立的纯 C++ 类:
+//   * 它承载 [safety] watchdog_ms 的实现, 是安全逻辑, 必须能**离线测试**
+//     (时间由调用方传进来, 不依赖真实时钟)。
+//   * 以后的 Socket 传输要复用同一套语义, 不能各写一遍。
+//
+// 看门狗只判断"管线 → 传输"这条数据流有没有断, **不**按 FFB 回调间隔判断:
+// 力反馈回调是边沿触发的(值不变就不回调), 方向盘稳定受力时"很久没回调"
+// 完全正常, 按它做看门狗会误静音。
+//
+// ★ 覆盖边界 (实测, 见 README 第 8 节第 1 条) ★
+// 它能兜住的是"发送线程还在跑、但管线不再出帧"(管线卡住/崩溃/被饿死)。它兜不住
+// 整个进程一起冻结: 那时本类的 take() 自己也不会被调用, 设备保持最后一帧的强度。
+// 421 s 的那局里两次 10.9 s / 14.0 s 的卡顿, trips 全程为 0 就是这个原因。
+// ---------------------------------------------------------------------------
+struct MailboxTake {
+    Frame frame;
+    bool  fresh = false;   // 上次 take 之后有没有新帧
+    bool  stale = false;   // 看门狗已触发(此时 frame 是静默帧)
+};
+
+struct MailboxStats {
+    uint64_t submitted      = 0;
+    uint64_t overwritten    = 0;   // 传输层就绪时, 上一帧还没被取走就被新帧覆盖
+    // 传输层**还没就绪**时发生的覆盖(典型: 连接建立的 ~3 s 里 BLE 线程不取帧,
+    // 管线照样 10 Hz 提交)。和 overwritten 分开计, 否则那 3 秒的 26 次覆盖会
+    // 把所有局的 over/submitted 比例都污染成"传输跟不上"(T13c)。
+    uint64_t overwritten_pre = 0;
+    uint64_t taken_fresh    = 0;
+    uint64_t repeated       = 0;   // 重复发送了旧帧
+    uint64_t idle_sent      = 0;   // 发出的静默帧数
+    uint64_t watchdog_trips = 0;
+};
+
+class FrameMailbox {
+public:
+    void        put(const Frame& f, int64_t now_ms);
+    MailboxTake take(int64_t now_ms, int watchdog_ms);
+    MailboxStats stats() const;
+
+    // "消费端就绪"标志: 传输线程真正开始逐帧取帧时置 true, 链路断了置 false。
+    // 只影响覆盖计数归到哪一栏, 不影响看门狗判定。
+    void set_consumer_ready(bool ready);
+    bool consumer_ready() const;
+
+private:
+    mutable std::mutex mu_;
+    Frame    pending_{};
+    bool     has_pending_   = false;
+    int64_t  last_put_ms_   = 0;
+    uint64_t put_count_     = 0;   // put 的总次数
+    uint64_t taken_count_   = 0;   // 已经被 take 走的 put 次数
+    bool     tripped_       = false;
+    std::atomic<bool> consumer_ready_{false};
+    MailboxStats stats_{};
+};
+
+// steady_clock 的毫秒数。看门狗用单调时钟, 不受系统时间调整影响。
+int64_t steady_now_ms();
+
+// 静默帧: 强度 0、4 个槽的脉冲强度 0、频率 10、muted=true。
+// reason 必须是字符串字面量 —— 它会存进 Frame::mute_reason, 那个字段要求
+// 静态存储期(见 pipeline.hpp)。
+Frame make_idle_frame(const char* reason);
 
 // ---------------------------------------------------------------------------
 // 传输接口

@@ -10,294 +10,258 @@
 
 **输出会真实作用于人体**,
 且 `[link] mode=ble` + `[safety] dry_run=0` 时没有任何软件层面的"不会电到人"保证。
-第一次接电极前请先读第 7 节, 并考虑先用 `tools\bleprobe.exe <ini> 20` (不加 `--live`,
-会强制把两个通道强度压到 0) 确认链路, 再上人。
+第一次接电极前请先读第 5 节(已知风险)与第 6 节(安全)。
+第一次上人之前, 建议先让游戏跑起来、看着日志把链路和强度都确认一遍, 再考虑接电极
+(怎么确认见第 3 节)。
 
 # DGLab_IDAC
 
-把《Initial D THE ARCADE》的方向盘**力反馈**实时转换成
-**郊狼3.0 (DG-LAB Coyote v3)** 主机的输出波形。
+把《Initial D THE ARCADE》方向盘的**力反馈**实时转换成 **郊狼3.0 (DG-LAB Coyote v3)**
+主机的输出波形 —— PC 直接当 BLE 中央设备连郊狼主机, 不需要手机参与。
 
-游戏由 Unreal Engine 4.24 驱动, 本模块以 **UE4SS C++ mod** 的形式接入,
-基于ArcadeZone.cn服务器所提供的3.21游戏版本（启动器V2.11）+自定义BGM Mod（引用自定义BGM Mod自带的UE4SS版本）
-和 `.../Win64/ue4ss/Mods/` 下已有的 mod 一起由 UE4SS 统一加载管理。
-
----
-
-## 1. 数据链与挂载点结论
-
-```
-游戏逻辑算出扭矩/黏滞/振动意图
-  └─ IndRun.dll  (UE4 插件, 跑在游戏进程内)
-       └─ 5 个 invoker 跳板 (std::function 槽位的调用点)
-            └─ 下游: EXE 内的 UE4 /Script/SerialPort 模块
-                     └─ CreateFileW/WriteFile/GetCommState → UART → 机台 I/O 板
-                        └─ 方向盘电机
-```
-
-**挂载点选在 `IndRun.dll` 的 invoker 跳板**, 理由:
-
-| | 挂 `IndRun.dll` (选定) | 挂 `AMDaemon\idachook.dll` |
-|---|---|---|
-| 语义 | 力反馈的**语义源头**: `torque(direction, magnitude)` / `viscosity(a,b)` / `vibration(a,b)` / `servo_on` / `servo_off` | 设备编码**之后**的字节流 |
-| 进程 | 与 UE4SS **同进程** → 天然满足"接入 UE4SS 统一 hook 管理" | AMDaemon 是独立进程, 得另做注入 |
-| 与本游戏的关系 | 直接相关 | 游戏进程里**没有** idachook.dll; EXE 里 `idac`/`IDAC`/`idachook` 字符串出现 **0** 次 |
-
-`idachook.dll` 只存在于 `\AMDaemon\`, 是 SegaTools 的魔改打包版
-(把 `common/board/ffb.c` 的串口 FFB 板钩子 + `games/idachook` 反盗版补丁 +
-`games/idacio` 方向盘输入 + aimeio 全塞进一个 DLL)。它确实导出 5 个干净的
-`idac_io_ffb_*` 函数, **保留为备选/交叉验证的第二个观测点**, 但不在本模块的主路径上。
-
-### 挂钩的 5 个跳板 (IndRun.dll RVA, ImageBase `0x180000000`)
-
-| 通道 | RVA | 签名 | 对应槽位 |
-|---|---|---|---|
-| servo-on | `0x2160` | `void(void)` | `g+0x08` |
-| servo-off | `0x21A0` | `void(void)` | `g+0x48` |
-| **torque** | `0x21C0` | `void(int direction, int magnitude)` | `g+0x108` |
-| viscosity | `0x2200` | `void(int, int)` | `g+0x148` |
-| vibration | `0x2240` | `void(int, int)` | `g+0x188` |
-
-- 单例指针变量在 IndRun.dll RVA `0x241890` (**单次解引用**), 由 RVA `0x5E0C3` 写一次。
-- `DllCharacteristics 0x0060` = `DYNAMIC_BASE|HIGH_ENTROPY_VA` → **必须运行期重定位**,
-  绝不能硬编码绝对地址。
-- 5 个目标全镜像扫描**零取地址引用**, 函数体后是 `int3` 填充 → 前 5 字节补丁安全。
-- ⚠ `0x2160` (servo-on) 的门控用的是 **servo-off 槽** (`[rax+0x80]`), 然后才调
-  servo-on 槽 (`[rax+0x40]`); 语义是 `if (g && g->slot48) g->slot08();`。
-- ⚠ `direction` **不是 2 态**: 域为 `{-1} ∪ {0} ∪ [0,255]`。`-1` 是"算出的扭矩为正"
-  的哨兵 (全二进制唯一的字面量), `0` = 中性/停止, `r13d` = 当前档位索引。
-  所以按**有符号 int** 处理。
-- ⚠ centering (`g+0x88` / `g+0xC8`) 是**死代码** —— 整个映像里没有 invoker,
-  EXE 里 `?BindCentering` 出现 0 次。发售版游戏从不绑定回正力。
+本 mod 是 **UE4SS C++ mod**, 挂在游戏目录里已有的 UE4SS 框架下。按本站私服的惯例,
+这套框架由**自定义 BGM 模组(Custom BGM Mod Pack)**提供 —— 从
+[arcadezone.cn/guide](https://arcadezone.cn/guide) 页面上的下载链接获取, 由私服启动器
+安装; 装好之后 `Mods\` 下会出现 `LocalRadio` 目录, 里面既有 UE4SS 本体也有 BGM 模组
+本身。本 mod 只是那套框架下的**一个附加 mod** —— 不修改游戏本体, 也不修改那个模组。
 
 ---
 
-## 2. 仓库结构
+## 1. 前置条件
 
-```
-CMakeLists.txt                构建定义 (只链游戏里那份 UE4SS.dll, 不重编 UE4SS)
-src/
-  dllmain.cpp                 UE4SS mod 入口: start_mod / uninstall_mod
-  ffb_types.hpp               力反馈状态契约 (FfbState / IFfbSource)
-  config.hpp/.cpp             INI 配置
-  pipeline.hpp/.cpp           力反馈 → 波形映射 + 安全限流
-  logger.hpp/.cpp             独立日志文件 + OutputDebugString
-  bisect_logger.hpp/.cpp      崩溃夹逼用的极简日志 (VEH 之前就落盘, 不依赖 CRT)
-  diag_mod.cpp                诊断构建的入口 (-DDGLAB_DIAGNOSTIC=ON, 与本体互斥)
-  abitest.cpp                 最小 ABI 探针 mod (判定崩溃是代码问题还是头文件 ABI 不匹配)
-  source/
-    indrun_hook_source.hpp/.cpp   ★ IndRun.dll 五跳板 MinHook 挂钩
-  transport/
-    transport.hpp/.cpp        传输接口 + B0/BF 协议编码
-    transport_factory.cpp     按配置选传输
-    null_transport.cpp        空实现 (干跑/探针用)
-    ble_winrt.cpp             ★ BLE 直连郊狼 (WinRT, 无第三方依赖)
-    ble_winrt_stub.cpp        占位; 与 ble_winrt.cpp 二选一 (同符号)
-tools/
-  bootstrap.cmd               ★ 补齐依赖 (ABI 对齐头文件已在仓库里, 这一步只查它在不在)
-  build.cmd                   构建 (+ -Deploy 直接铺进游戏, + -Stage N 写 bisect.txt)
-  make_ue4ss_implib.cmd       从 UE4SS.dll 生成导入库
-  install_msvc.cmd            VS Build Tools 装到自定义盘
-  mod_on.cmd / mod_off.cmd    把 <mod>\dlls 改名成 dlls.off, 用于 A/B 排查
-  protocol_check.cpp          ★ 离线协议自检, 54 项, 基准是官方文档而非本项目实现
-  bleprobe.cpp                ★ 脱离游戏单独跑 BLE 链路 ([--live] 才真输出)
-  conftest.cpp                ★ 离线校验 INI: "会连真实设备吗 / 设备会有刺激吗"
-  DGLab_IDAC.ini.template     带注释的配置模板 (部署脚本铺的就是它)
-docs/
-  research-overview.md        总览
-  research-indrun-ffb.md      IndRun 力反馈数据链
-  research-coyote-protocol.md 郊狼协议 (含 Socket API, 网络来源)
-  research-dglab-transport.md 郊狼 BLE 传输 (来自本地协议仓库, 权威)
-re/                           逆向脚本与报告 (非构建产物)
-  indrun_hook_mechanics.md    ★ 挂钩点的完整逆向结论
-  indrun_ffb_report.md        ★ 参数语义 (torque/viscosity/vibration 各是什么)
-  verify_indrun_rva.py        离线校验 IndRun.dll 的 TimeDateStamp + 5 处特征码
-  disasm_indrun.py            capstone 反汇编 5 个 invoker
-```
-
-> `_ue4ss_ref/ue4ss_0196ef29/` 与 `_ue4ss_ref/ue4ss_0196ef29_deps/` 是**提交进仓库**的
-> UE4SS 头文件 (约 330 KB), 见第 3 节"为什么头文件跟着仓库走"。
-
----
-
-## 3. 构建
-
-### 依赖
-| | |
+| 需要 | 说明 |
 |---|---|
-| 编译器 | MSVC v143 x64 (**必须 Release**, 必须 **`/MD`**) |
-| CMake | ≥ 3.18 |
-| VS 组件 | `Microsoft.VisualStudio.Component.VC.Tools.x86.x64` + Windows SDK |
-| 第三方 | MinHook (子模块)、RE-UE4SS **v3.0.1 头文件**、UE4SS 导入库 |
+| Windows + 游戏本体 | 街机版 3.21 (启动器 V2.11) 上实测 |
+| **自定义 BGM 模组(Custom BGM Mod Pack)** | 提供 UE4SS 框架。从 [arcadezone.cn/guide](https://arcadezone.cn/guide) 的下载链接获取、由启动器安装。**必须先装好它**, 本 mod 自己不带 UE4SS |
+| 郊狼 3.0 主机 | 手机 APP 不需要参与, 但主机要开机、电极接好 |
+| 电脑蓝牙 | 支持 BLE 的蓝牙适配器, 本 mod 直接连主机 |
 
-> **为什么必须 `/MD` + Release**: UE4SS 官方文档原话 —— C++ mod 与 UE4SS 必须使用
-> **同一个 C 运行时版本和构建配置**, 否则 `std::string`/`std::vector` 跨 DLL 边界就崩。
-> 已实测: 游戏里那份 `UE4SS.dll` 导入 `msvcp140.dll` / `vcruntime140.dll` → 动态 CRT。
-> 能正常工作的参照 mod `Mods\LocalRadio\dlls\main.dll` 同样是 `/MD`。
-
-### 三步
-
-```cmd
-tools\bootstrap.cmd
-tools\build.cmd -Deploy
-```
-
-`bootstrap.cmd` 做三件事: 确认 ABI 对齐的 UE4SS 头文件在位 (它们在仓库里, 正常跳过)、
-初始化 MinHook 子模块、从游戏自带的 `UE4SS.dll` 生成导入库。
-
-**在别的机器上**: 仓库里没有任何路径是通用的, 游戏目录需要你自己给。两种办法 ——
-
-```cmd
-set DLAB_DEPLOY_DIR=D:\你的游戏\WindowsNoEditor\GameProject\Binaries\Win64\ue4ss\Mods\DGLab_IDAC
-tools\bootstrap.cmd
-```
-
-或者直接 `cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DDGLAB_DEPLOY_DIR="..."`。
-`UE4SS.dll` 的路径会从 mod 目录往上两级自动推导, 也可以用 `-DUE4SS_DLL=` 直接指定。
-不部署 (不加 `-Deploy`) 时产物就留在 `build\Release\DGLab_IDAC.dll`。
-
-**为什么头文件跟着仓库走**: `_ue4ss_ref\ue4ss_0196ef29\` 不是上游 tag `v3.0.1` 的头文件,
-而是 commit `0196ef294f8525d6a492ae0b41b0c18ad5ccd84b` (2026-03-27, `experimental-latest-695-g0196ef2`)
-那一版的。两者之间 `CppUserModBase` 的虚表布局**不同**:
-
-| 槽位 | v3.0.1 | 0196ef29 |
-|---|---|---|
-| `on_ui_init` | 无 | 有 |
-| `on_cpp_mods_loaded` | 无 | 有 |
-| 新旧 `on_lua_start`/`on_lua_stop` 重载 | 各 2 个 | 各 4 个 (新旧并存) |
-
-用 v3.0.1 的头文件编出来的 mod, UE4SS 调用虚函数时会跳到错误的位置 —— 表现为
-**游戏启动即崩, 崩在 `UE4SS.dll` 内部**, 而且日志干净得看不出我们参与了。
-本仓库历史上就是栽在这上面: 当时先怀疑是虚表错位, 手工写了一版 shim 去"猜"槽位顺序,
-结果崩得更早(`start_mod` 都没跑到)。教训是 **ABI 不能猜, 只能逐 commit 对齐头文件**。
-所以这两份头文件 (约 330 KB) 直接提交, 换 UE4SS 版本时必须换掉它们并重编。
-
-**不 `add_subdirectory(RE-UE4SS)` 的理由**: 那条路会连 UE4SS 本体一起重编 —— 要对
-glaze/ImGui/zydis/PolyHook2/raw_pdb 走 `FetchContent`, 其中多个用 `git@github.com:`
-的 SSH URL (无 SSH key 直接失败), 还依赖 **corrosion(Rust 工具链)**, 约 20 分钟且脆弱。
-改为直接链接游戏里**正在运行的那一份** `UE4SS.dll`: 版本天生一致, 构建几秒完成。
-
-### 手动等价命令
-```cmd
-call "<VS构建工具路径>\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
-      -DDGLAB_DEPLOY_DIR="<游戏>\...\ue4ss\Mods\DGLab_IDAC"
-cmake --build build --config Release
-```
+**关于 UE4SS 版本**: 本 mod 是按自定义 BGM 模组里那份 UE4SS `v3.0.1-944-g0196ef29`
+对齐编译的。如果那个模组更新后换了 UE4SS 版本, 本 mod 可能加载失败或游戏启动即崩 —— 那种情况
+基本不是游戏的问题, 请开 issue 告知作者(附 `UE4SS.log` 的前 20 行, 里面有版本号)。
 
 ---
 
-## 4. 部署
+## 2. 安装
 
-构建产物是 `build\Release\DGLab_IDAC.dll`。
-UE4SS **只认 `<mod>\dlls\main.dll`**, 所以部署时改名:
+1. **关掉游戏和启动器。**
+2. 把压缩包里的 `DGLab_IDAC` 整个目录解压到
+   `<游戏>\WindowsNoEditor\GameProject\Binaries\Win64\ue4ss\Mods\`。
+   解压后应该是这个层级(注意 `dlls` 这层不能少):
 
-```
-<游戏>\WindowsNoEditor\GameProject\Binaries\Win64\ue4ss\Mods\DGLab_IDAC\
-    dlls\main.dll        <- build\Release\DGLab_IDAC.dll
-    enabled.txt          <- 空文件即可
-```
+   ```
+   Mods\DGLab_IDAC\dlls\main.dll
+   Mods\DGLab_IDAC\dlls\DGLab_IDAC.ini
+   Mods\DGLab_IDAC\README.md
+   Mods\DGLab_IDAC\LICENSE
+   ```
 
-`tools\build.cmd -Deploy` 会自动做这件事。
-启用方式二选一 (UE4SS v3.0.1 实测行为):
+3. **激活 mod**。下面两种方式选一种即可, 效果相同。
 
-1. 往 `Mods\mods.txt` 加一行 `DGLab_IDAC : 1` —— **推荐, 有加载顺序**
-2. 丢一个空的 `enabled.txt` 进 mod 目录 —— 内容从不被读取, 只看文件存不存在
+   **方式 B: 放一个 `enabled.txt`(推荐)**
 
-**不需要改 `UE4SS-settings.ini`。**
+   在 `Mods\DGLab_IDAC\` 目录下新建一个**空文件** `enabled.txt`(文件名就这十个字母,
+   内容可以是空的)。这是 UE4SS 认的另一种启用标记, 资源包内置的 `LocalRadio` 模组就是
+   这么做的。放了这个文件之后, `mods.txt` 里**完全不用写**本 mod。
 
-> ⚠ 排查问题时值得改的三个键 (当前都是关的, 所以看不到 GUI 控制台):
-> `[Debug] ConsoleEnabled=1`、`GuiConsoleEnabled=1`、`GuiConsoleVisible=1`,
-> 以及把 `[Debug] GraphicsAPI` 从 `opengl` 改成 `dx11` (游戏是 DX11, opengl 渲染不出来)。
-> **热重载对 C++ mod 无效** —— `main.dll` 在整个进程生命周期内保持映射, 每次迭代都要重启游戏。
+   之所以推荐这一种: **启动器重写 `mods.txt` 时它不受影响**, 不用每次更新后重新加行。
+   发布前实测过: `mods.txt` 里没有本 mod 的任何一行、只放 `enabled.txt`,
+   日志里 `==== DGLab_IDAC 0.2.0 启动` / `特征码校验通过: 5/5` / `hooks=OK` /
+   `BLE: 链路就绪` 四样都正常出现。
+
+   **方式 A: 写 `mods.txt`**
+
+   用记事本打开 `Mods\mods.txt`, 在 **`; Built-in keybinds, do not move up!` 这一行的上方**
+   插入一行:
+
+   ```
+   DGLab_IDAC : 1
+   ```
+
+   冒号前后各有一个空格, `1` 表示启用。注意**不要加在文件末尾** —— `Keybinds : 1` 那一行
+   之后的位置是留给内置按键绑定的, 下面的内容有相应的加载顺序要求。
+
+   > 两种方式**不要同时用**, 也不要为了"保险"两个都加 —— 只留一种, 出问题时才好判断
+   > 是哪一条生效了。
+
+4. 启动游戏。第一次运行会在 `Mods\DGLab_IDAC\dlls\` 下生成 `DGLab_IDAC.log`。
+
+> 卸载: 删掉 `Mods\DGLab_IDAC\` 整个目录(连带 `enabled.txt`), 再把 `mods.txt` 里那一行
+> 删掉(如果你用的是方式 A)。
 
 ---
 
-## 5. 配置
+## 3. 第一次运行怎么确认它真的在工作
 
-部署后首次运行会在 mod 目录生成 `DGLab_IDAC.ini`。**出厂默认是探针模式**:
+打开 `Mods\DGLab_IDAC\dlls\DGLab_IDAC.log`, 依次找这几行:
 
-```ini
-[general] enable=1, verbose=1
-[link]    mode=disabled      ; 不连郊狼, 只记录
-[channel_a] source=torque       map_mode=abs_linear  in_max=127  base_strength=40
-[channel_b] source=vibration    map_mode=abs_linear  in_max=127  base_strength=30
-[safety]  max_strength=40  clamp_strength=40  slew_per_second=40
-          watchdog_ms=500  zero_when_servo_off=1  warmup_ms=1500
-          dry_run=1        ; 就算 mode=ble 也只算不发
-```
-
-日志 `DGLab_IDAC.log` 写在 DLL 自身目录, 同时经 `OutputDebugStringA` 进 `UE4SS.log`
-(UE4SS 会捕获, 前缀 `[DGLab_IDAC]`)。
-
----
-
-## 6. 当前状态
-
-| 阶段 | 状态 |
+| 日志里应该出现 | 含义 |
 |---|---|
-| 逆向: 定位挂钩点与 ABI | ✅ 完成 (`re/indrun_hook_mechanics.md`) |
-| 逆向: 郊狼协议 | ✅ 完成 (`docs/research-*.md`, 官方文档副本见 `re/reference/dglab-bluetooth-protocol/`) |
-| 构建: 编译 + 链接 + 部署 | ✅ 完成 |
-| ABI: 与本机 UE4SS `0196ef29` 对齐 | ✅ 完成 (曾因头文件版本不对而启动即崩) |
-| 阶段 1: 探针 | ✅ 完成 —— 5 个跳板**都有数据** |
-| 阶段 2: 郊狼真输出 | ✅ **A 通道已在真机上端到端验证通过**; B 通道待实测 |
+| `==== DGLab_IDAC 0.2.0 启动` | mod 被 UE4SS 加载了(看不到这行 = `mods.txt` 没生效或层级放错) |
+| `特征码校验通过: 5/5` | 挂钩点与当前游戏版本对得上 |
+| `hooks=OK` | 5 个跳板都挂上了 |
+| `BLE: 链路就绪 (A/B 期望强度上限 30)` | 连上郊狼主机了 |
+| `强度已确认 seq=..` (或 `B1` 回执行) | 设备回执了, 强度真的下发了 |
+| `[hb]` 每秒一行、`[tx]` 每 10 秒一行 | 主循环与传输层都在跑 |
 
-阶段 1 的结论是当年那两种可能里的 **A**: 即使 `segatools.ini` 里 `[io4] mode=xinput`,
-游戏照样按街机逻辑生成力反馈并经 FFB 板下发给 IndRun.dll。一次完整计时赛的实测计数:
-
-```
-torque=947 次   mag[0..18]   dir[-1..1]
-visc=10868 次   b[2..40]     (几乎每 tick 都有值)
-vib=136 次      b[0..29]     (只在事件发生时)
-servo on/off = 1/1, state=1
-```
-
-阶段 2 的真机验证结果 (设备回的 B1 与请求逐字节一致):
-
-```
-请求   B0 1F 0F 0A ...   ->  A=15 B=10
-设备回 B1 01 0F 0A       ->  A=15 B=10   ✓
-```
-
-**已知未实现**: `[safety] watchdog_ms` 配了不生效 —— 没有任何代码读它。当前唯一的
-静默保护是"超过 20 秒没有力反馈回调就打一条 WARN 日志", 那是告警不是归零。真正在
-起作用的闸门是 `clamp_strength` / `max_strength` / slew 限速 / 设备 BF 软上限。
+**关于设备上的指示灯**: 那是**电流指示灯**, 电流要有外部回路才有 —— 电极没接、或者
+没贴在身上时不亮是正常的, 不代表链路有问题。判断链路看日志里的 B1 回执。
 
 ---
 
-## 7. 安全
+## 4. 配置速查
 
-⚠ **无论游戏请求什么, 自己再设一道硬上限。** 出厂 `max_strength=40` (郊狼上限 200)。
+配置文件是 `Mods\DGLab_IDAC\dlls\DGLab_IDAC.ini`, **每个键上面都有中文注释**,
+下面是常用的 6 个:
+
+| 键 | 出厂值 | 含义 |
+|---|---|---|
+| `[link] mode` | `ble` | `ble` = 直连郊狼; `disabled` = 只跑不连(排障用) |
+| `[safety] dry_run` | `0` | `1` = 算但不发, 连 BLE 都不建立 |
+| `[channel_a] source` | `torque` | A 通道取哪个力反馈。`torque` 最活跃也最稳定 |
+| `[channel_a] base_strength` | `15` | A 通道强度(0–200 量纲, 受 `max_strength` 封顶) |
+| `[safety] max_strength` | `30` | **硬上限**, 同时作为设备的 BF 软限位下发 |
+| `[safety] viscosity_hold_ms` | `2000` | 只有用 `viscosity` 源时才有意义, 见 5.1 |
+
+出厂是 **A = 方向盘扭矩 15 / B = 振动 10 / 上限 30**, 这个组合最保守, 先用它跑。
+想调轻: 先降 `base_strength`, 再考虑降 `max_strength`。
+
+`B` 通道接的是 `vibration`, 它是**事件型**信号 —— 只在压路肩、碰撞这类判定时给一下,
+直道上安静是设计如此, 不是坏了。
+
+> 改完配置**必须重启游戏**(`main.dll` 在进程生命周期内保持映射, 热重载对 C++ mod 无效)。
+
+---
+
+## 5. 已知风险与使用须知
+
+这一节是"模组本身消除不了、但用之前必须知道"的行为。有实测依据的会写明实测值。
+
+### 5.1 `viscosity` 的保持超时（已有保护，但有副作用）
+
+`viscosity` 的回调是"值变了才回调"（`FfbState` 里有变化缓存）。**强制退出比赛回到
+菜单时**，游戏会把阻尼停在一个非零值上然后不再回调 —— 停住的值会被当成"当前状态"
+一直输出。实测就是这样：两次退出比赛后 `visc` 计数都停住不动，最后值被原样
+输出（t=299 s 起 `visc_b=10` → 脉冲 42/100；t=411 s 起 `visc_b=4` → 脉冲 16/100，
+测试强度只有 8，人体无感但设备的电流指示灯亮着）。
+
+**现在有保护了**：`[safety] viscosity_hold_ms`（默认 2000，0 = 关闭）—— 超过这个
+毫秒数没有新的粘度回调，就把该通道的原始值按 0 处理，源一更新立刻恢复。判定做在
+"取原始值"这一层，所以增益包络和映射看到的是同一个 0；通道强度字节不动（static
+模式下它是用户设定的"音量"），归零靠脉冲振幅为 0。只影响 `source=viscosity` /
+`viscosity_a` 的通道，另一个通道完全不受影响。
+
+⚠ **副作用**：原地不动的时段也会被归零 —— **发车倒计时、暂停、以及任何"车停着但
+阻尼有值"的时刻**。这是它的工作原理，不是 bug：程序没法区分"游戏停更了"和"车真的
+没动"。想在**发车倒计时、停车**这类时段保留阻尼手感，就把 `viscosity_hold_ms` 设成 0（等于关掉保护）。
+
+默认配置仍然用 `torque` + `vibration`，不碰 `viscosity`；如果你手动改，
+`load_config` 会打一条 WARN 提醒（判定函数 `is_held_risk_source()` 有离线用例覆盖）。
+
+### 5.2 退出方式只有杀进程, 所以没有"归零帧"这道保险
+
+街机版没有游戏内退出, 只能杀进程; `TerminateProcess` 不会执行 DLL 卸载/清理,
+所以传输层"正常停止前发一帧归零"那段代码走不到。
+它只是一条**尽力而为**的路径, 不是安全保证。
+
+设备在进程被杀后的实际表现**已实测**(`bleprobe --live` 稳定输出中
+`taskkill /F`, 3/3 次): 输出几乎立刻停止, 延迟不超过 0.5 s。合理解释是进程消失时
+BLE 链路跟着断, 设备判定断连就归零 —— 不是因为我们发了归零帧。
+建议仍然是: 杀进程前先在设备上关掉通道, 或者先取下电极。
+
+### 5.3 游戏卡住时设备会自己停
+
+本作的物理与渲染在同一帧推进。拖动/选中 UE4SS 控制台窗口里的内容会让整个进程卡住,
+此时挂钩、管线、BLE 发送线程**一起**停, 传输层根本没机会发静默帧。
+
+不过**卡住的那段时间设备是安静的**: 实测(3/3 次)挂起进程后输出归零, 通道电流指示灯
+熄灭, 解冻后重新爬坡。也就是说设备收不到 B0 时会自己停, 不会一直保持最后的强度 ——
+这一条的真实风险等级低于"本程序管不到"字面上的担心。
+
+需要注意的后果只剩两个: 卡住期间游戏本身也不动了; 恢复后有一段预热(见 5.5)。
+
+建议:
+- 游戏运行时别拖动、也别选中控制台里的内容;
+- 在控制台窗口属性里关掉"快速编辑模式"(选中即暂停输出, 正是卡住的来源);
+- 日常使用可以在部署目录的 `UE4SS-settings.ini` 里关掉控制台(`[Debug]` 段的
+  `ConsoleEnabled` / `GuiConsoleEnabled`, 键名以那份文件为准), 排错时再打开。
+
+### 5.4 兜底手段
+
+- `[safety] max_strength` 会同时作为**设备的 BF 软限位**下发, 设备断电后仍保持;
+  按自己能接受的上限设置它, 它比 B0 里的强度字节更硬(滚轮和 B0 都突破不了)。
+- `dry_run=1` 是配置层的硬开关: 走空输出, 连 BLE 都不建立。
+- **硬件开关始终放在手边** —— 上面这些全在软件里, 软件卡死时只有拔电可靠。
+
+### 5.5 其它已经实测过的行为
+
+- **卡顿恢复后会有一段时间没有输出**: 管线检测到停顿会清零强度累积并**重新走一遍
+  `warmup_ms`**(出厂 5000), 也就是约 **5 s** 没有输出, 之后才按 `slew_per_second`
+  爬回去。这是刻意的(避免恢复瞬间一帧跳到满力)。想缩短就调小 `warmup_ms`。
+- **`vibration` 是事件型信号**: 一轮约 160 次调用, 非零样本只有个位数; 两个通道都接它,
+  直道上几乎没有手感。
+- **`torque` 取的是幅值**: 左转与右转输出同样的力(方向参数是齿轮/档位索引, 不是左右,
+  详见仓库里的逆向记录), 实测峰值只到 18/127。
+- **力反馈回调是边沿触发的**: "方向盘稳住几秒没有新回调"属于正常现象, 不是掉线;
+  卡死恢复后也不需要重启游戏。
+
+---
+
+## 6. 安全
+
+⚠ **无论游戏请求什么, 自己再设一道硬上限。** 出厂 `max_strength=30` (郊狼上限 200)。
 
 - 电极**绝不能跨过心脏/胸部或越过身体中线**
 - 建议 500 Ω 下 r.m.s. 电流远低于 50 mA、单次 ~30 min、变换频率、插入休息期
 - 郊狼的 **BF 软上限**是最后一道安全阀 (滚轮和 B0 都无法突破), 但它**断电保存**,
   且每次重连后都必须重发
-- 断链时设备对通道强度是保持还是归零**未文档化** —— 按"保持"设计:
-  看门狗归零 + BF 软上限 + 手边留硬件开关
+- **官方未说明**断链时设备对通道强度是保持还是归零。**实测**(见 5.2 与 5.3)断链、
+  以及设备收不到 B0 这两件事都会让输出停下来; 但程序**仍按最坏情况(保持)设计兜底**:
+  1. **看门狗** (`[safety] watchdog_ms`, 默认 500, 下限 `3*frame_ms`, 上限 2000): 管线超过这个
+     时间没提交新帧, 传输层就不再发上一帧, 改发**静默帧** (强度字节 0、无脉冲); 管线自身停顿
+     超时也会清零强度累积并重新预热, 避免恢复瞬间一帧跳到满力。上限 2000 是刻意的: 再长就
+     失去兜底意义 (见第 5.3 节它兜不住的场景)。
+  2. **BF 软上限** (`max_strength`), 设备侧硬顶, 滚轮和 B0 都突破不了。
+  3. **手边留物理断电开关** —— 前面两条都在软件里, 软件卡死时只有拔电可靠。
+  `dry_run=1` 是配置层的硬开关, 走空输出, 连 BLE 都不建立。
 
 ---
 
-## 8. 协议要点 (郊狼 V3)
+## 7. 排错
 
-- 服务 `0000180C-…`, 写 `0000150A-…` (≤20 B), 通知 `0000150B-…`, 电量 `0000180A→00001500`
-- `B0` 指令 20 字节, **每 100 ms 一帧**: seq(4bit) + A/B 强度解读方式(各 2bit) +
-  A/B 强度(1 B each) + A 频率×4 + A 波形强度×4 + B 频率×4 + B 波形强度×4
-- 每通道 4 组, **每组 25 ms**; 通道强度 0–200 (越界按 0); 波形频率 10–240; 波形强度 0–100
-- **某通道 8 个值里只要有 1 个越界, 该通道 4 组全部丢弃**
-- 只输出单通道时给另一通道塞一个非法值 (例如波形强度 101)
-- 强度变化时序列号非 0, 且**要等 B1 回来**才能发下一次强度修改
-- 官方仓库 [`dungeonlab-open/dglab-bluetooth-protocol`](https://github.com/dungeonlab-open/dglab-bluetooth-protocol)
-  只有 **BLE** 规范 (`coyote/v3/README.md`)
-- 另有 **SOCKET (WebSocket) 控制协议**, 在另一个官方仓库
-  [`dungeonlab-open/dglab-websocket-simple`](https://github.com/dungeonlab-open/dglab-websocket-simple)
-  的 `socket/` 目录 (**该仓库已归档**), 中继服务器是
-  [`dungeonlab-open/dglab-websocket-server`](https://github.com/dungeonlab-open/dglab-websocket-server)。
-  它**不是 BLE 的替代品**: 走那条路时手机 APP 仍是 BLE 中枢, PC 只是通过服务器把排好队的
-  数据交给 APP 转发, 且必须扫码配对。本项目选 BLE 直连的理由见 `docs/research-dglab-transport.md` 第 1.1 节
+日志 `DGLab_IDAC.log` 写在 DLL 自身目录, 同时经 `OutputDebugStringA` 进 `UE4SS.log`
+(前缀 `[DGLab_IDAC]`)。几个有用的前缀:
 
-  项目后续可能会提供使用Socket连接方案的替代版本
+| 前缀 | 频率 | 内容 |
+|---|---|---|
+| `[hb]` | 1 s | 各来源的调用次数与值域、servo 状态; 末尾 `now:` 段是**当前值**(`tq_m`/`visc_b`/`vib_b`)、三个来源距上次回调的 `age`(秒, -1 = 从未回调)以及最近一帧的 `out A=通道强度/脉冲振幅` |
+| `[probe]` | 变化时 / 前 10 s 每帧 | 原始力反馈值(排查映射问题时看这个) |
+| `[tx]` | 10 s | 传输层: 取帧间隔、覆盖率与看门狗触发次数 |
+| `[ffbgap]` | 60 s | 诊断用: 回调间隔分布与"当前还没结束的间隔" `open` |
+
+按现象查:
+
+| 现象 | 先看这里 |
+|---|---|
+| 完全没有日志文件 | `mods.txt` 那行没生效, 或层级不对(必须是 `Mods\DGLab_IDAC\dlls\main.dll`) |
+| 有日志但没有任何 `BLE:` 行 | `[link] mode` 不是 `ble`, 或者 `dry_run=1` |
+| BLE 连不上 | 主机没开机、电量低、已被手机 APP 占用、距离太远; 日志里搜 `BLE:` |
+| 有输出但没什么感觉 | `base_strength` 太低; 或者方向盘停住不动(回调是边沿触发, 力不变就不回调) |
+| 回到菜单后一直有输出 | 用了 `viscosity` 源, 见 5.1 |
+| 游戏启动即崩 | 自定义 BGM 模组更新后换了 UE4SS 版本, 见第 1 节, 开 issue 附 `UE4SS.log` 前 20 行 |
+| 左转右转力度一样 | 设计如此: 取的是扭矩的**幅值**, 方向不进输出(见 5.5) |
+| 指示灯不亮 | 电流指示灯, 不接电极就没有回路, 正常(见第 3 节) |
+
+---
+
+## 8. 反馈
+
+开 issue 时请带上:
+
+- `Mods\DGLab_IDAC\dlls\DGLab_IDAC.log`(整份, 不是截图)
+- `ue4ss\UE4SS.log` 开头带版本号的十几行
+- 你的 `DGLab_IDAC.ini`(删掉个人信息再贴)
+- 一句"当时在干什么"(进比赛 / 回菜单 / 刚连上 / 跑了多久)
 
 ---
 
@@ -305,14 +269,15 @@ servo on/off = 1/1, state=1
 
 本项目自身以 **MIT** 许可发布, 全文见 [LICENSE](LICENSE)。
 
-第三方依赖与资料:
+发布包里另有一份 **`THIRD_PARTY_NOTICES.txt`**, 把下面三个组件的许可全文原样附在一起。
 
-| | 许可 |
-|---|---|
-| [MinHook](https://github.com/TsudaKageyu/minhook) | MIT |
-| [RE-UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) | MIT |
-| `_ue4ss_ref/ue4ss_0196ef29*/` (UE4SS 头文件) | MIT (同 RE-UE4SS) |
-| [dglab-bluetooth-protocol](https://github.com/dungeonlab-open/dglab-bluetooth-protocol) | 上游无 LICENSE 文件, 见下方说明 |
+| | 许可 | 怎么用到的 |
+|---|---|---|
+| [MinHook](https://github.com/TsudaKageyu/minhook) | **BSD 2-Clause** | 编译进 `dlls\main.dll` |
+| [RE-UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) | MIT | 运行在其框架下, 用它的公开头文件 |
+| [{fmt}](https://github.com/fmtlib/fmt) 11.2.0 | MIT | 编译进 `dlls\main.dll` |
+| `_ue4ss_ref/ue4ss_0196ef29*/` (UE4SS 头文件) | MIT (同 RE-UE4SS) | 对齐 ABI 的头文件 |
+| [dglab-bluetooth-protocol](https://github.com/dungeonlab-open/dglab-bluetooth-protocol) | 上游无 LICENSE 文件, 见下方说明 | 只引用文档, 不随包分发 |
 
 > ⚠ 郊狼协议文档对爱好者免费, 但**商用需事先授权**。
 > 上游没有 LICENSE 文件, 所以 `re/reference/dglab-bluetooth-protocol/` 里那四份官方文档的

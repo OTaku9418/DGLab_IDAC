@@ -19,7 +19,9 @@
 //   构建配置**。所以:
 //     * 必须 Release 构建(UE4SS.dll 是 Game__Shipping__Win64 (MSVC))
 //     * 必须 /MD(它导入 msvcp140.dll / vcruntime140.dll)
-//     * CppUserModBase 的 vtable 布局必须完全一致 —— 所以我们锁死 v3.0.1
+//     * CppUserModBase 的 vtable 布局必须完全一致 —— 所以我们锁死的是
+//       _ue4ss_ref/ue4ss_0196ef29 这份对齐头文件(commit 0196ef294f852), 它
+//       不是上游 tag v3.0.1(d935b5b), 两者相差 944 个提交、vtable 槽位不同。
 //   下面的 static_assert 与运行期自检就是为了让"配错了"变成可见的失败,
 //   而不是随机崩溃。
 // ---------------------------------------------------------------------------
@@ -42,6 +44,7 @@
 
 #include "bisect_logger.hpp"
 #include "config.hpp"
+#include "ffb_gap_stats.hpp"
 #include "logger.hpp"
 #include "pipeline.hpp"
 #include "source/indrun_hook_source.hpp"
@@ -76,6 +79,7 @@ namespace {
 // ---------------------------------------------------------------------------
 constexpr double kHeartbeatSeconds = 1.0;
 constexpr double kProbeDetailSeconds = 10.0;   // 前 10 秒每次都打原始值
+
 
 double now_seconds() {
     using clock = std::chrono::steady_clock;
@@ -149,7 +153,7 @@ class DGLabIdacMod final : public RC::CppUserModBase {
 public:
     DGLabIdacMod() {
         ModName = STR("DGLab_IDAC");
-        ModVersion = STR("0.1.0");
+        ModVersion = DGLAB_VERSION_W;  // 版本号只有 CMake 里那一处
         ModDescription = STR("Initial D The Arcade 力反馈 -> 郊狼(DG-LAB) 波形输出");
         ModAuthors = STR("DGLab_IDAC");
         ModIntendedSDKVersion = STR("3.0.1");
@@ -236,7 +240,7 @@ private:
 
         if (stage_ < 3) { dglab_idac::bisect_note("A9  stage<3: 到此为止"); return; }
 
-        dglab_idac::log_info("==== DGLab_IDAC %s 启动 (bisect stage=%d) ====", "0.1.0", stage_);
+        dglab_idac::log_info("==== DGLab_IDAC %s 启动 (bisect stage=%d) ====", DGLAB_VERSION_A, stage_);
         dglab_idac::log_info("日志文件: %s", dglab_idac::log_path());
         dglab_idac::log_info("配置文件: %s", ini.c_str());
         dglab_idac::bisect_note("A4  logger 头几行已写");
@@ -451,10 +455,43 @@ private:
 
         auto next = clock::now();
         double last_heartbeat = 0.0;
+        // [tx] 另一条独立的 10 秒计时: 心跳是每秒一次的, 传输层状态没必要跟着刷。
+        double last_tx_report = 0.0;
+        // "一直没有力反馈回调"告警的限流状态 (T13b): 第一次超 20 s 打一次,
+        // 之后每 60 s 最多一次; warned_no_ffb 用来判断稍后要不要打"首次收到"。
+        bool warned_no_ffb = false;
+        bool logged_first_ffb = false;
+        double last_noffb_warn = 0.0;
         double start_time = now_seconds();
 
         uint64_t frames = 0;
         uint64_t prev_torque = 0, prev_visc = 0, prev_vib = 0;
+
+        // [ffbgap] (T9): 60 秒一行。故意比心跳(1 s)稀疏得多 —— 这是长期统计,
+        // 不是实时状态, 打太密只会让日志变贵。
+        //
+        // T14a: 再接一份 viscosity 的间隔统计。理由: T17(阻尼保持超时淡出)的
+        // 阈值要由"比赛中 viscosity 的最大回调间隔"决定, 而这个问题只有
+        // 实机数据能回答。两份统计各打一行, 用 src= 区分, 分桶口径完全相同。
+        dglab_idac::FfbGapStats gap_stats;
+        dglab_idac::FfbGapStats visc_gap_stats;
+        double last_gap_report = now_seconds();
+        constexpr double kGapReportSeconds = 60.0;
+        // T18: 打完不清"上一次回调的时刻", 只清计数 —— 跨过 60 s 边界的间隔
+        // 才是真正想抓的那一类(菜单里停更), 清掉时间戳等于把它整段丢掉。
+        auto report_gap = [](const char* src, double t, double start, dglab_idac::FfbGapStats& g) {
+            const uint64_t total = g.n_lt_05 + g.n_05_2 + g.n_2_5 + g.n_gt_5;
+            dglab_idac::log_info(
+                "[ffbgap] src=%s t=%.0fs intervals=%llu <0.5s=%llu 0.5-2s=%llu "
+                "2-5s=%llu >5s=%llu max=%.2fs open=%.2fs zero_stops=%llu",
+                src, t - start, static_cast<unsigned long long>(total),
+                static_cast<unsigned long long>(g.n_lt_05),
+                static_cast<unsigned long long>(g.n_05_2),
+                static_cast<unsigned long long>(g.n_2_5),
+                static_cast<unsigned long long>(g.n_gt_5), g.max_gap,
+                g.open_seconds(t), static_cast<unsigned long long>(g.stops));
+            g.reset_counts();
+        };
 
         while (running_) {
             next += period;
@@ -486,18 +523,55 @@ private:
                         static_cast<unsigned long long>(ffb.vibration_calls),
                         ffb.servo_on ? 1 : 0);
                 }
+                // ---- [ffbgap] 诊断: 只在"有新回调"时记一次 ----
+                // 用 torque_calls 的增量判断, 而不是每 tick 都记 —— 否则
+                // 采样频率就变成了主循环频率, 统计出来的东西没有意义。
+                if (ffb.torque_calls != prev_torque) {
+                    gap_stats.on_torque(t, ffb.torque_magnitude);
+                }
+                // viscosity 用 b 参数当"幅值"(a 是符号, 见 ffb_types.hpp):
+                // b>0 才算"在施阻尼", 归 0 时该段区间结束。
+                if (ffb.viscosity_calls != prev_visc) {
+                    visc_gap_stats.on_torque(t, ffb.viscosity_b);
+                }
+                if (t - last_gap_report >= kGapReportSeconds) {
+                    last_gap_report = t;
+                    report_gap("torque", t, start_time, gap_stats);
+                    report_gap("visc", t, start_time, visc_gap_stats);
+                }
+
                 prev_torque = ffb.torque_calls;
                 prev_visc = ffb.viscosity_calls;
                 prev_vib = ffb.vibration_calls;
 
                 // ---- 周期心跳: 这是判断"游戏到底发不发 FFB"的关键证据 ----
+                // T14b: 末尾再补一段"当前状态"。原因是上面那些 mag/b 都只是
+                // 累计 min/max, 菜单里阻尼停住时根本看不出"现在是多少"; 而
+                // [probe] 只在回调到来时打, 停住时也没有。
+                // age 的时钟已核对过: FfbState::*_at 与这里的 now_seconds()
+                // 都是 steady_clock 的 time_since_epoch 秒, 同一个起点。
                 if (t - last_heartbeat >= kHeartbeatSeconds) {
                     last_heartbeat = t;
                     const dglab_idac::FfbState s = source_->snapshot();
+                    auto age_of = [t](double at) { return at > 0.0 ? (t - at) : -1.0; };
+                    auto max_pulse = [](const dglab_idac::ChannelFrame& ch) {
+                        int m = 0;
+                        for (int i = 0; i < dglab_idac::kSlotsPerFrame; ++i) {
+                            if (static_cast<int>(ch.slots[i].pulse_intensity) > m) {
+                                m = static_cast<int>(ch.slots[i].pulse_intensity);
+                            }
+                        }
+                        return m;
+                    };
+                    const int out_a_s = have_frame ? frame.a.strength : -1;
+                    const int out_b_s = have_frame ? frame.b.strength : -1;
+                    const int out_a_p = have_frame ? max_pulse(frame.a) : -1;
+                    const int out_b_p = have_frame ? max_pulse(frame.b) : -1;
                     dglab_idac::log_info(
                         "[hb] t=%.0fs frames=%llu | torque=%llu mag[%d..%d] dir[%d..%d] | "
                         "visc=%llu b[%d..%d] | vib=%llu b[%d..%d] | servo on/off=%llu/%llu=%d | "
-                        "%s | %s",
+                        "%s | %s | now: tq_m=%d visc_b=%d vib_b=%d "
+                        "age(tq/visc/vib)=%.1f/%.1f/%.1fs servo=%d out A=%d/%d B=%d/%d",
                         t - start_time,
                         static_cast<unsigned long long>(frames),
                         static_cast<unsigned long long>(s.torque_calls),
@@ -515,16 +589,42 @@ private:
                         static_cast<unsigned long long>(s.servo_off_calls),
                         s.servo_on ? 1 : 0,
                         source_->status_report().c_str(),
-                        pipeline_ ? pipeline_->gain_summary().c_str() : "pipeline=null");
+                        pipeline_ ? pipeline_->gain_summary().c_str() : "pipeline=null",
+                        s.torque_magnitude, s.viscosity_b, s.vibration_b,
+                        age_of(s.torque_at), age_of(s.viscosity_at), age_of(s.vibration_at),
+                        s.servo_on ? 1 : 0, out_a_s, out_a_p, out_b_s, out_b_p);
+
+                    // ---- 传输层状态: 每 10 秒一行(不是每秒, 否则日志本身就成了负担) ----
+                    // 为什么要单独打这个: 传输层的计数(submitted/repeated/overwritten)
+                    // 从来没进过周期日志, 而它正是"管线与传输两个线程的相位对不对"
+                    // 的唯一证据。repeated 高说明传输比管线快、在重发旧帧; overwritten
+                    // 高说明传输跟不上、帧被丢弃。两者都高就是相位打架。
+                    if (transport_ != nullptr && t - last_tx_report >= 10.0) {
+                        last_tx_report = t;
+                        dglab_idac::log_info("[tx] %s", transport_->status().c_str());
+                    }
 
                     // 明确告警: 挂了 hook 但一次回调都没有 —— 说明要么还没进
                     // 游戏, 要么力反馈通路在 mode=xinput 下根本不走。
+                    // ★ 限流 (T13b) ★ 这条告警在"一直停在菜单里"时会持续成立,
+                    // 每秒一条会把日志冲干净。改成: 第一次超过 20 s 打一次, 之后
+                    // 每 60 s 最多一次; 一旦真收到回调, 再打一条 INFO 收尾。
                     if (!s.ever_updated && (t - start_time) > 20.0) {
-                        dglab_idac::log_warn(
-                            "[hb] 已经 %.0f 秒没有任何力反馈回调。可能原因: "
-                            "(a) 还没进游戏; (b) 游戏在 xinput 模式下不生成力反馈; "
-                            "(c) 增益 [manager+0x4E4] 恒为 0(见 ffb_types.hpp 的说明)。",
-                            t - start_time);
+                        if (!warned_no_ffb || (t - last_noffb_warn) >= 60.0) {
+                            warned_no_ffb = true;
+                            last_noffb_warn = t;
+                            dglab_idac::log_warn(
+                                "[hb] 已经 %.0f 秒没有任何力反馈回调。可能原因: "
+                                "(a) 还没进游戏; (b) 游戏在 xinput 模式下不生成力反馈; "
+                                "(c) 增益 [manager+0x4E4] 恒为 0(见 ffb_types.hpp 的说明)。"
+                                "(之后每 60 s 提醒一次)",
+                                t - start_time);
+                        }
+                    } else if (warned_no_ffb && !logged_first_ffb && s.ever_updated) {
+                        // 这条 INFO 很重要: 它把"告警是在等什么"闭合掉, 否则日志里
+                        // 只有一串告警、看不出后来到底通没通。
+                        logged_first_ffb = true;
+                        dglab_idac::log_info("首次收到力反馈回调 (t=%.0fs)", t - start_time);
                     }
                 }
             }
@@ -598,7 +698,7 @@ DGLAB_MOD_API void uninstall_mod(RC::CppUserModBase* mod) {
 DGLAB_MOD_API const char* dglab_status_string() {
     static thread_local char buf[512];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                "DGLab_IDAC 0.1.0 (probe stage) log=%s", dglab_idac::log_path());
+                "DGLab_IDAC " DGLAB_VERSION_A " (probe stage) log=%s", dglab_idac::log_path());
     return buf;
 }
 

@@ -248,22 +248,7 @@ HRESULT activate_instance_and_qi(const wchar_t* runtime_class, REFIID iid, void*
     inst->Release();
     return hr;
 }
-// "静默帧": 全 0 强度 + 10 频率。绝不发未初始化的字节。
-Frame make_idle_frame() {
-    Frame f;
-    f.servo_on = false;
-    f.muted = true;
-    f.mute_reason = "ble-idle";
-    for (int i = 0; i < kSlotsPerFrame; ++i) {
-        f.a.slots[i].pulse_intensity = 0;
-        f.a.slots[i].pulse_frequency = 10;
-        f.b.slots[i].pulse_intensity = 0;
-        f.b.slots[i].pulse_frequency = 10;
-    }
-    f.a.strength = 0;
-    f.b.strength = 0;
-    return f;
-}
+// (静默帧构造已上移到 transport.cpp 的 make_idle_frame(const char*), 便于离线测试)
 
 // ---------------------------------------------------------------------------
 // 事件回调与工作线程共享的状态。
@@ -446,6 +431,8 @@ private:
     bool connect_and_setup();
     bool subscribe_notify_and_conn();
     bool send_bf();
+    // 停止前尽力发一帧归零。失败只记日志, 不抛也不重试 —— 它跑在退出路径上。
+    void send_shutdown_idle();
     void send_loop();
     void teardown_link();
     void wait_ms(DWORD ms) const;
@@ -469,11 +456,8 @@ private:
     std::atomic<bool> running_{false};
     std::shared_ptr<SharedState> shared_;
 
-    // 信箱: 深度 1, 覆盖式。读的时候不清空 —— 否则提交频率低于帧率时会
-    // 在"真帧"和"静默帧"之间来回跳。
-    mutable std::mutex frame_mu_;
-    Frame pending_{};
-    bool ever_submitted_ = false;
+    // 信箱: 深度 1, 覆盖式, 内含 [safety] watchdog_ms 的看门狗。
+    FrameMailbox mailbox_;
 
     // 诊断(互斥量保护, status() 可能从游戏线程调用)
     mutable std::mutex stat_mu_;
@@ -608,23 +592,29 @@ void BleWinRtTransport::stop() {
 }
 
 void BleWinRtTransport::submit(const Frame& f) {
-    std::lock_guard<std::mutex> lk(frame_mu_);
-    pending_ = f;  // 深度 1, 直接覆盖
-    ever_submitted_ = true;
+    mailbox_.put(f, steady_now_ms());
 }
 
 std::string BleWinRtTransport::status() const {
     std::lock_guard<std::mutex> lk(stat_mu_);
-    char buf[320]{};
+    char buf[448]{};
     // 把 B1 计数放进 status: "设备到底会不会发 B1" 是判链路语义的关键问题,
     // 而它只能靠这个数字回答 —— 只写日志的话得等跑完翻文件才能看见。
     const uint64_t b1c = shared_ ? shared_->b1_count : 0;
     const int b1a = shared_ ? shared_->b1_last_a : -1;
     const int b1b = shared_ ? shared_->b1_last_b : -1;
+    // 看门狗与信箱计数: trips>0 说明管线侧真的断过, over>0 说明传输跟不上。
+    // 这两个数字是判断"到底是谁卡住了"的唯一凭据。
+    const MailboxStats ms = mailbox_.stats();
     std::snprintf(buf, sizeof(buf),
-                  "BLE state=%s rssi=%d writes=%llu errors=%llu b1=%llu lastA=%d lastB=%d", state_.c_str(),
-                  last_rssi_, static_cast<unsigned long long>(writes_), static_cast<unsigned long long>(errors_),
-                  static_cast<unsigned long long>(b1c), b1a, b1b);
+                  "BLE state=%s rssi=%d writes=%llu errors=%llu b1=%llu lastA=%d lastB=%d "
+                  "wd=%d trips=%llu dup=%llu over=%llu over_pre=%llu idle=%llu",
+                  state_.c_str(), last_rssi_, static_cast<unsigned long long>(writes_),
+                  static_cast<unsigned long long>(errors_), static_cast<unsigned long long>(b1c), b1a, b1b,
+                  ms.watchdog_trips > 0 ? 1 : 0, static_cast<unsigned long long>(ms.watchdog_trips),
+                  static_cast<unsigned long long>(ms.repeated), static_cast<unsigned long long>(ms.overwritten),
+                  static_cast<unsigned long long>(ms.overwritten_pre),
+                  static_cast<unsigned long long>(ms.idle_sent));
     return std::string(buf);
 }
 
@@ -722,6 +712,10 @@ void BleWinRtTransport::worker_entry() {
             set_state("connected", true);
             log_info("BLE: 链路就绪 (A/B 期望强度上限 %d)", bf_limit());
 
+            // 从这里开始才真正逐帧取帧 —— 之前(~3 s 握手期)管线提交的帧会被
+            // 覆盖, 那些覆盖记在 overwritten_pre, 不算"传输跟不上"(T13c)。
+            mailbox_.set_consumer_ready(true);
+
             // --- (f) 发送循环 ---
             {
                 auto next_deadline = std::chrono::steady_clock::now() + frame_dur;
@@ -732,12 +726,11 @@ void BleWinRtTransport::worker_entry() {
                         break;
                     }
 
-                    // 取最新一帧; 从没提交过就用静默帧
-                    Frame f;
-                    {
-                        std::lock_guard<std::mutex> lk(frame_mu_);
-                        f = ever_submitted_ ? pending_ : make_idle_frame();
-                    }
+                    // 取最新一帧。从没提交过、或管线超过 watchdog_ms 没提交,
+                    // 信箱内部会自动给静默帧 —— 所以这里拿到的永远是可以安全
+                    // 下发的帧, 不需要在这里判空。
+                    const MailboxTake tk = mailbox_.take(steady_now_ms(), cfg_.watchdog_ms);
+                    const Frame& f = tk.frame;
 
                     const int want_a = clamp_strength(f.a.strength);
                     const int want_b = clamp_strength(f.b.strength);
@@ -874,7 +867,24 @@ void BleWinRtTransport::worker_entry() {
                 }
             }
 
+            // --- (f2) 正常停止: 尽力把强度归零 ---
+            // 发送循环退出有两种原因: 链路死了(break) 或 running_ 被 stop() 置 false。
+            // 后一种是正常退出, 此时链路还通 —— 必须主动发一帧 0。
+            //
+            // 为什么不能靠"下次连接再说": 断链时设备是保持强度还是归零, 官方
+            // 文档没写(README §7), 按"保持"设计。人手边不一定有硬件开关。
+            //
+            // 只发 1 帧、不等 B1 应答、失败只记日志: 这跑在退出路径上, 不能让
+            // 一次写超时把 stop() 的 join 拖住。
+            if (!running_.load(std::memory_order_acquire) && shared_ != nullptr &&
+                !shared_->link_down.load(std::memory_order_acquire)) {
+                send_shutdown_idle();
+            }
+
             // --- (g) 重连 ---
+            // 链路要拆了: 之后直到下次握手完成, 管线提交的帧都会被覆盖, 那些
+            // 覆盖属于 overwritten_pre, 不是"传输跟不上"(T13c)。
+            mailbox_.set_consumer_ready(false);
             teardown_link();
             if (!running_.load(std::memory_order_acquire)) break;
 
@@ -1436,6 +1446,48 @@ bool BleWinRtTransport::send_bf() {
     }
     log_info("BLE: 已发送 BF 软限位 A=B=%d", lim);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 停止前把强度归零。
+//
+// 场景: stop() 把 running_ 置 false, 发送循环退出, 接着 teardown_link() 断链。
+// 如果最后发出去的那一帧带着强度, 而设备在断链后保持强度, 用户就处在一个
+// "程序已经关了、电极还在输出"的状态 —— 这是本项目最不能接受的状态。
+//
+// ★ 这只是一条尽力而为的路径, 不是安全保证 ★
+// 街机版没有游戏内退出, 只能杀进程; TerminateProcess 不会执行 DLL 卸载, 也就
+// 走不到这里。它真正能生效的场景只有"mod 自己被正常停用/卸载"(例如 UE4SS 模块
+// 重载)。所以别指望它兜底 —— 兜底是 BF 软限位 + 手边的物理断电开关。
+//
+// 为什么用 StrengthMode::Unchanged 传进去: encode_b0 里强度为 0 的通道会被
+// 强制提升成"绝对设置"(见 protocol_check 的静音路径用例)。传 Unchanged 是
+// 为了让那个强制逻辑生效, 而不是赌它 —— 真按 Unchanged 编出去的话设备会
+// **保持旧强度**, 正是我们要避免的结果。
+// ---------------------------------------------------------------------------
+void BleWinRtTransport::send_shutdown_idle() {
+    bool valid_a = false;
+    bool valid_b = false;
+    const Frame idle = make_idle_frame("shutdown");
+    const B0 cmd = encode_b0(idle, StrengthMode::Unchanged, StrengthMode::Unchanged, 0, &valid_a, &valid_b);
+
+    const int frame_ms = cfg_.frame_ms > 0 ? cfg_.frame_ms : 100;
+    // 上限 200 ms: 正常一帧的写只要几毫秒, 这里给两倍帧周期已经够宽松。
+    // 卡住的时候宁可放弃归零也不能让退出流程停在这里。
+    const DWORD write_timeout = static_cast<DWORD>((std::min)(200, frame_ms * 2));
+
+    const HRESULT hr = write_bytes(cmd.bytes, static_cast<uint32_t>(kB0Size), write_timeout);
+    if (FAILED(hr)) {
+        const std::string e = hresult_hex(hr);
+        log_warn("BLE: 停止归零帧发送失败 (HRESULT=%s) —— 设备可能仍保持最后的强度, "
+                 "请手动关闭通道或断开电极", e.c_str());
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(stat_mu_);
+        ++writes_;
+    }
+    log_info("BLE: 已发送停止归零帧 %s", cmd.to_hex().c_str());
 }
 
 HRESULT BleWinRtTransport::get_buffer(uint32_t len, IBuffer** out) {
