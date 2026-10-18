@@ -219,8 +219,11 @@ UE4SS **只认 `<mod>\dlls\main.dll`**, 所以部署时改名:
 `tools\build.cmd -Deploy` 会自动做这件事。
 启用方式二选一 (UE4SS v3.0.1 实测行为):
 
-1. 往 `Mods\mods.txt` 加一行 `DGLab_IDAC : 1` —— **推荐, 有加载顺序**
-2. 丢一个空的 `enabled.txt` 进 mod 目录 —— 内容从不被读取, 只看文件存不存在
+1. 往 `Mods\mods.txt` 加一行 `DGLab_IDAC : 1` —— **推荐, 有加载顺序**。
+   位置必须在 `; Built-in keybinds, do not move up!` 上方(即 `Keybinds : 1` 之前);
+   写在文件末尾会排到内置按键绑定后面, 加载顺序就不对了。
+2. 丢一个空的 `enabled.txt` 进 mod 目录 —— 内容从不被读取, 只看文件存不存在。
+   `Mods\LocalRadio\` 就是这么启用的; 启动器重写 `mods.txt` 时这条路不受影响。
 
 **不需要改 `UE4SS-settings.ini`。**
 
