@@ -417,6 +417,53 @@ void test_ffb_gap_stats() {
     check_eq(static_cast<int>(g.total()), 0, "reset 清空计数");
     check(g.max_gap == 0.0 && g.stops == 0 && !g.armed(),
           "reset 也清掉 max_gap / stops 与区间状态");
+
+    // ---- T18: 60 s 窗口打印后只清计数, 不抹掉"上一次回调的时刻" ----
+    //
+    // 这一段复现第二轮那局里真实发生的事: viscosity 在菜单里停了 52.5 s,
+    // 起点 298.0 s, 而 300 s 那次打印恰好落在停更中间。旧实现把起点抹平,
+    // 于是这段间隔在恢复后的下一档里彻底消失 —— 报告里只看到 9.50 s。
+    {
+        FfbGapStats w;
+        w.on_torque(298.0, 10);                       // 停更前最后一次回调
+        check(w.open_seconds(300.0) > 1.9 && w.open_seconds(300.0) < 2.1,
+              "停更中 open 随时间增长 (2.0 s)");
+
+        w.reset_counts();                             // 300 s 那次打印
+        check_eq(static_cast<int>(w.total()), 0, "reset_counts 清掉计数");
+        check(w.armed(), "reset_counts 保留区间状态");
+        check(w.open_seconds(350.5) > 52.4 && w.open_seconds(350.5) < 52.6,
+              "打印之后 open 继续累积到 52.5 s");
+
+        w.on_torque(350.5, 19);                        // 停更结束, 第一个新回调
+        check_eq(static_cast<int>(w.n_gt_5), 1,
+                 "52.5 s 的间隔完整落进 >5s 档 (跨窗口也不丢)");
+        check(w.max_gap > 52.4 && w.max_gap < 52.6, "max_gap 记下 52.5 s");
+
+        // 反例: 整体重来会把这段丢掉 —— 用它说明两种清法的差别。
+        FfbGapStats r;
+        r.on_torque(298.0, 10);
+        r.reset();
+        r.on_torque(350.5, 19);
+        check_eq(static_cast<int>(r.total()), 0,
+                 "整体 reset 之后同样的 52.5 s 会消失 (旧实现的缺陷)");
+        check(r.open_seconds(350.5) == 0.0, "整体 reset 之后 open 也是 0");
+    }
+
+    // ---- T18: 没有新回调的窗口照样打印 ----
+    //
+    // 旧实现"只在有新回调时打印"会把停更期间的行整段吞掉(第二轮 t=360 s
+    // 那一行 src=visc 直接缺失), 于是最需要看的那段时间恰好没有日志。
+    {
+        FfbGapStats quiet;
+        quiet.on_torque(400.0, 5);
+        quiet.reset_counts();
+        const uint64_t total = quiet.n_lt_05 + quiet.n_05_2 + quiet.n_2_5 + quiet.n_gt_5;
+        check_eq(static_cast<int>(total), 0, "没有新回调时计数全 0 (但仍要打印)");
+        check(quiet.open_seconds(460.0) > 59.9 && quiet.open_seconds(460.0) < 60.1,
+              "60 s 没有回调时 open=60 s, 这一行能把停更指认出来");
+        check(quiet.open_seconds(399.0) == 0.0, "早于最后一次回调的时间不给负 open");
+    }
 }
 
 // ---------------------------------------------------------------------------

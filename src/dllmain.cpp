@@ -477,20 +477,20 @@ private:
         dglab_idac::FfbGapStats visc_gap_stats;
         double last_gap_report = now_seconds();
         constexpr double kGapReportSeconds = 60.0;
+        // T18: 打完不清"上一次回调的时刻", 只清计数 —— 跨过 60 s 边界的间隔
+        // 才是真正想抓的那一类(菜单里停更), 清掉时间戳等于把它整段丢掉。
         auto report_gap = [](const char* src, double t, double start, dglab_idac::FfbGapStats& g) {
             const uint64_t total = g.n_lt_05 + g.n_05_2 + g.n_2_5 + g.n_gt_5;
             dglab_idac::log_info(
                 "[ffbgap] src=%s t=%.0fs intervals=%llu <0.5s=%llu 0.5-2s=%llu "
-                "2-5s=%llu >5s=%llu max=%.2fs zero_stops=%llu",
+                "2-5s=%llu >5s=%llu max=%.2fs open=%.2fs zero_stops=%llu",
                 src, t - start, static_cast<unsigned long long>(total),
                 static_cast<unsigned long long>(g.n_lt_05),
                 static_cast<unsigned long long>(g.n_05_2),
                 static_cast<unsigned long long>(g.n_2_5),
                 static_cast<unsigned long long>(g.n_gt_5), g.max_gap,
-                static_cast<unsigned long long>(g.stops));
-            // 每 60 秒清零一次: 想知道"最近 60 秒有没有卡", 而不是被整局
-            // 平均值的稀释掉。
-            g.reset();
+                g.open_seconds(t), static_cast<unsigned long long>(g.stops));
+            g.reset_counts();
         };
 
         while (running_) {
