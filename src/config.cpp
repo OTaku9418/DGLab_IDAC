@@ -206,6 +206,10 @@ const char* to_string(MapMode m) {
     return "?";
 }
 
+bool is_held_risk_source(const std::string& src) {
+    return ieq(src, "viscosity") || ieq(src, "viscosity_a");
+}
+
 Config load_config(const std::string& ini_path) {
     Config cfg{};
 
@@ -312,6 +316,22 @@ Config load_config(const std::string& ini_path) {
 
     read_channel(ini_path, "channel_a", cfg.channel_a);
     read_channel(ini_path, "channel_b", cfg.channel_b);
+
+    // ★ 已知风险源告警 ★
+    // viscosity 的回调是"值变了才回调", 而强制退出比赛回到菜单时游戏会把阻尼
+    // 停在一个可感的值上却不再回调 —— 本程序没有"源数据陈旧"判定, 那个值会被
+    // 一直输出。默认配置不用它, 但用户有权选, 所以只在"启用 + 真会输出"时提醒
+    // 一次(不阻止)。判定逻辑本身在 is_held_risk_source(), 有离线自检。
+    if (cfg.channel_a.enable && cfg.channel_a.base_strength > 0 &&
+        is_held_risk_source(cfg.channel_a.source)) {
+        log_warn("[channel_a] source=%s: 强制退出比赛回到菜单后阻尼可能停在可感的值上并持续输出, "
+                 "不推荐作为输出源 (见 README 已知风险)", cfg.channel_a.source.c_str());
+    }
+    if (cfg.channel_b.enable && cfg.channel_b.base_strength > 0 &&
+        is_held_risk_source(cfg.channel_b.source)) {
+        log_warn("[channel_b] source=%s: 强制退出比赛回到菜单后阻尼可能停在可感的值上并持续输出, "
+                 "不推荐作为输出源 (见 README 已知风险)", cfg.channel_b.source.c_str());
+    }
 
     // ---- [safety] ----
     cfg.max_strength        = read_int(ini_path, "safety", "max_strength", cfg.max_strength);
@@ -513,11 +533,14 @@ bool write_default_config(const std::string& ini_path) {
     //   torque    方向盘回正扭矩的幅值(= abs(游戏扭矩), 域 0..127), 实测最活跃。
     //             左转与右转都输出力, 但取的是幅值, 本程序不区分左右。
     //   viscosity 转向阻尼, 几乎全程有值
+    //             ⚠ 不推荐作为输出源: 强制退出比赛回到菜单后, 游戏可能把阻尼停在
+    //             一个可感的值上; 这个回调只在值变化时触发, 停住的值会一直输出,
+    //             直到下一次变化。
     //   vibration 振动/路肩, 只在事件发生时给一次
     //   static    恒定输出, 不看游戏数据
     // 另有 torque_signed(按 direction 恢复符号): 逆向证实该参数是齿轮/档位索引
     // (域 0..255), 不是左右方向, 当前不要用 —— 见 re/indrun_hook_mechanics.md 4.1/5。
-    // 建议 A 用 torque 或 viscosity。
+    // 建议 A 用 torque。
     // 字段范围: enable 0/1; map_mode {abs_linear,linear,abs_sqrt,sqrt};
     // in_min 0~200; in_max 1~200(auto_gain=1 时只当启动初值);
     // level 0.0~1.0; base_strength 0~200(再受 [safety] max_strength 钳制);
@@ -534,7 +557,7 @@ bool write_default_config(const std::string& ini_path) {
     w("channel_a", "strength_source", "static");
     w("channel_b", "enable", "1");
     // B 当前接 vibration, 它是事件型信号: 只在压路肩/碰撞等判定发生时给一次
-    // 短促输出, 其余时间安静。希望 B 也有持续可感的东西就改成 viscosity。
+    // 短促输出, 其余时间安静。不建议改成 viscosity(原因见上面的来源表)。
     // 想分辨"是哪个通道在动", 让两个通道 base_strength 不同即可。
     w("channel_b", "source", "vibration");
     w("channel_b", "map_mode", "abs_linear");

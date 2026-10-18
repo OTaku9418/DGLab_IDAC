@@ -416,6 +416,29 @@ void test_ffb_gap_stats() {
           "reset 也清掉 max_gap / stops 与区间状态");
 }
 
+// ---------------------------------------------------------------------------
+// 10. 已知风险源判定 (T11b)
+//
+// 这个函数决定配置加载时要不要打"viscosity 不推荐作为输出源"的告警。名单写错
+// 的两种后果都不轻: 漏掉 viscosity 等于把 README 里那条风险提示变成空话;
+// 把 torque 也列进去则会让告警变成常态噪声, 真出问题时反而被忽略。
+// ---------------------------------------------------------------------------
+void test_held_risk_source() {
+    group("[已知风险] 只有 viscosity 系算");
+
+    check(is_held_risk_source("viscosity"), "viscosity => true");
+    check(is_held_risk_source("viscosity_a"), "viscosity_a => true");
+    check(is_held_risk_source("VISCOSITY"), "大小写不敏感");
+
+    check(!is_held_risk_source("torque"), "torque => false");
+    check(!is_held_risk_source("torque_signed"), "torque_signed => false");
+    check(!is_held_risk_source("vibration"), "vibration => false");
+    check(!is_held_risk_source("vibration_a"), "vibration_a => false");
+    check(!is_held_risk_source("const"), "const => false");
+    check(!is_held_risk_source("servo"), "servo => false");
+    check(!is_held_risk_source(""), "空串 => false");
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -431,6 +454,7 @@ int main() {
     test_pipeline_stall();
     test_pipeline_warmup();
     test_ffb_gap_stats();
+    test_held_risk_source();
 
     std::printf("\n-------------------------------------------\n");
     std::printf("通过 %d, 失败 %d\n", g_pass, g_fail);

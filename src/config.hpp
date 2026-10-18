@@ -191,4 +191,14 @@ const char* to_string(LinkMode m);
 const char* to_string(ProtocolVersion v);
 const char* to_string(MapMode m);
 
+// 这个输入源有没有"停住的值会被一直输出"的风险(见 README「已知风险与使用须知」)。
+//
+// 目前只有 viscosity / viscosity_a: 它的回调是**值变了才回调**(IndRun 内部有
+// 变化缓存), 而强制退出比赛回到菜单时, 游戏会把阻尼停在一个可感的值上却不再
+// 回调 —— 本程序没有"源数据陈旧"判定, 于是那个值会被管线一直输出, 直到下一次
+// 变化。torque/vibration 在回菜单时会被游戏压到接近 0, 所以不在名单里。
+//
+// 纯函数, 供 load_config 告警与离线自检共用。
+bool is_held_risk_source(const std::string& src);
+
 }  // namespace dglab_idac

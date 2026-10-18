@@ -493,6 +493,7 @@ add_executable(logic_check
     tools/logic_check.cpp
     ${DGLAB_PROTOCOL_SRC}
     src/pipeline.cpp
+    src/config.cpp          # is_held_risk_source() 在这里, 告警名单也要被离线覆盖
     src/logger.cpp
 )
 
