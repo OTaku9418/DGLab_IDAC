@@ -469,9 +469,29 @@ private:
 
         // [ffbgap] (T9): 60 秒一行。故意比心跳(1 s)稀疏得多 —— 这是长期统计,
         // 不是实时状态, 打太密只会让日志变贵。
+        //
+        // T14a: 再接一份 viscosity 的间隔统计。理由: T17(阻尼保持超时淡出)的
+        // 阈值要由"比赛中 viscosity 的最大回调间隔"决定, 而这个问题只有
+        // 实机数据能回答。两份统计各打一行, 用 src= 区分, 分桶口径完全相同。
         dglab_idac::FfbGapStats gap_stats;
+        dglab_idac::FfbGapStats visc_gap_stats;
         double last_gap_report = now_seconds();
         constexpr double kGapReportSeconds = 60.0;
+        auto report_gap = [](const char* src, double t, double start, dglab_idac::FfbGapStats& g) {
+            const uint64_t total = g.n_lt_05 + g.n_05_2 + g.n_2_5 + g.n_gt_5;
+            dglab_idac::log_info(
+                "[ffbgap] src=%s t=%.0fs intervals=%llu <0.5s=%llu 0.5-2s=%llu "
+                "2-5s=%llu >5s=%llu max=%.2fs zero_stops=%llu",
+                src, t - start, static_cast<unsigned long long>(total),
+                static_cast<unsigned long long>(g.n_lt_05),
+                static_cast<unsigned long long>(g.n_05_2),
+                static_cast<unsigned long long>(g.n_2_5),
+                static_cast<unsigned long long>(g.n_gt_5), g.max_gap,
+                static_cast<unsigned long long>(g.stops));
+            // 每 60 秒清零一次: 想知道"最近 60 秒有没有卡", 而不是被整局
+            // 平均值的稀释掉。
+            g.reset();
+        };
 
         while (running_) {
             next += period;
@@ -509,24 +529,15 @@ private:
                 if (ffb.torque_calls != prev_torque) {
                     gap_stats.on_torque(t, ffb.torque_magnitude);
                 }
+                // viscosity 用 b 参数当"幅值"(a 是符号, 见 ffb_types.hpp):
+                // b>0 才算"在施阻尼", 归 0 时该段区间结束。
+                if (ffb.viscosity_calls != prev_visc) {
+                    visc_gap_stats.on_torque(t, ffb.viscosity_b);
+                }
                 if (t - last_gap_report >= kGapReportSeconds) {
                     last_gap_report = t;
-                    const uint64_t total = gap_stats.n_lt_05 + gap_stats.n_05_2 +
-                                           gap_stats.n_2_5 + gap_stats.n_gt_5;
-                    dglab_idac::log_info(
-                        "[ffbgap] t=%.0fs intervals=%llu <0.5s=%llu 0.5-2s=%llu "
-                        "2-5s=%llu >5s=%llu max=%.2fs zero_stops=%llu",
-                        t - start_time,
-                        static_cast<unsigned long long>(total),
-                        static_cast<unsigned long long>(gap_stats.n_lt_05),
-                        static_cast<unsigned long long>(gap_stats.n_05_2),
-                        static_cast<unsigned long long>(gap_stats.n_2_5),
-                        static_cast<unsigned long long>(gap_stats.n_gt_5),
-                        gap_stats.max_gap,
-                        static_cast<unsigned long long>(gap_stats.stops));
-                    // 每 60 秒清零一次: 想知道"最近 60 秒有没有卡", 而不是
-                    // 被整局平均值的稀释掉。
-                    gap_stats.reset();
+                    report_gap("torque", t, start_time, gap_stats);
+                    report_gap("visc", t, start_time, visc_gap_stats);
                 }
 
                 prev_torque = ffb.torque_calls;
@@ -534,13 +545,33 @@ private:
                 prev_vib = ffb.vibration_calls;
 
                 // ---- 周期心跳: 这是判断"游戏到底发不发 FFB"的关键证据 ----
+                // T14b: 末尾再补一段"当前状态"。原因是上面那些 mag/b 都只是
+                // 累计 min/max, 菜单里阻尼停住时根本看不出"现在是多少"; 而
+                // [probe] 只在回调到来时打, 停住时也没有。
+                // age 的时钟已核对过: FfbState::*_at 与这里的 now_seconds()
+                // 都是 steady_clock 的 time_since_epoch 秒, 同一个起点。
                 if (t - last_heartbeat >= kHeartbeatSeconds) {
                     last_heartbeat = t;
                     const dglab_idac::FfbState s = source_->snapshot();
+                    auto age_of = [t](double at) { return at > 0.0 ? (t - at) : -1.0; };
+                    auto max_pulse = [](const dglab_idac::ChannelFrame& ch) {
+                        int m = 0;
+                        for (int i = 0; i < dglab_idac::kSlotsPerFrame; ++i) {
+                            if (static_cast<int>(ch.slots[i].pulse_intensity) > m) {
+                                m = static_cast<int>(ch.slots[i].pulse_intensity);
+                            }
+                        }
+                        return m;
+                    };
+                    const int out_a_s = have_frame ? frame.a.strength : -1;
+                    const int out_b_s = have_frame ? frame.b.strength : -1;
+                    const int out_a_p = have_frame ? max_pulse(frame.a) : -1;
+                    const int out_b_p = have_frame ? max_pulse(frame.b) : -1;
                     dglab_idac::log_info(
                         "[hb] t=%.0fs frames=%llu | torque=%llu mag[%d..%d] dir[%d..%d] | "
                         "visc=%llu b[%d..%d] | vib=%llu b[%d..%d] | servo on/off=%llu/%llu=%d | "
-                        "%s | %s",
+                        "%s | %s | now: tq_m=%d visc_b=%d vib_b=%d "
+                        "age(tq/visc/vib)=%.1f/%.1f/%.1fs servo=%d out A=%d/%d B=%d/%d",
                         t - start_time,
                         static_cast<unsigned long long>(frames),
                         static_cast<unsigned long long>(s.torque_calls),
@@ -558,7 +589,10 @@ private:
                         static_cast<unsigned long long>(s.servo_off_calls),
                         s.servo_on ? 1 : 0,
                         source_->status_report().c_str(),
-                        pipeline_ ? pipeline_->gain_summary().c_str() : "pipeline=null");
+                        pipeline_ ? pipeline_->gain_summary().c_str() : "pipeline=null",
+                        s.torque_magnitude, s.viscosity_b, s.vibration_b,
+                        age_of(s.torque_at), age_of(s.viscosity_at), age_of(s.vibration_at),
+                        s.servo_on ? 1 : 0, out_a_s, out_a_p, out_b_s, out_b_p);
 
                     // ---- 传输层状态: 每 10 秒一行(不是每秒, 否则日志本身就成了负担) ----
                     // 为什么要单独打这个: 传输层的计数(submitted/repeated/overwritten)
