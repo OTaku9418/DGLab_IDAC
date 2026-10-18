@@ -371,7 +371,10 @@ if(MSVC)
     #   有 4 个字节不同(实测: 文件头 TimeDateStamp 与 CodeView 记录各一处),
     #   md5 就失去"验证同一份代码"的意义。
     # /PDBALTPATH: DLL 里只记文件名, 不把构建机路径(D:\INDAC\...)写进发布产物。
-    target_link_options(${PROJECT_NAME} PRIVATE /DEBUG /Brepro "/PDBALTPATH:DGLab_IDAC.pdb")
+    # /OPT:REF /OPT:ICF 必须显式写出: 链接器在 /DEBUG 下默认关掉它们(即使 Release 配置),
+    # 会把没被引用的函数全塞进镜像 —— 实测不加这两项, DLL 从 268 KB 涨到 1.18 MB。
+    target_link_options(${PROJECT_NAME} PRIVATE
+        /DEBUG /Brepro /OPT:REF /OPT:ICF "/PDBALTPATH:DGLab_IDAC.pdb")
 endif()
 
 # 输出名: UE4SS 只找 <mod>/dlls/main.dll, 所以交付时改名。
