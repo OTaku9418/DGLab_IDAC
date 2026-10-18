@@ -518,6 +518,88 @@ void test_mailbox_consumer_ready() {
     check_eq(static_cast<int>(s.overwritten_pre), 3, "撤回后覆盖回到 over_pre");
 }
 
+// ---------------------------------------------------------------------------
+// 14. viscosity 保持超时 (T17)
+//
+// 场景就是实测到的那一段: 退出比赛回菜单后粘度源不再回调, 最后的值被当成
+// "当前状态"一直输出(实测脉冲 42/100, 指示灯亮着)。保护做在"取原始值"那一层,
+// 所以要看的是脉冲强度, 不是通道强度 —— static 模式下通道强度是用户设定的音量,
+// 归零靠脉冲振幅为 0。
+// ---------------------------------------------------------------------------
+void test_viscosity_hold() {
+    group("[T17] viscosity 保持超时");
+
+    Config cfg = make_test_config();
+    cfg.viscosity_hold_ms = 2000;
+    cfg.channel_a.source = "torque";
+    cfg.channel_b.source = "viscosity";
+
+    Pipeline p(cfg);
+    FfbState ffb = make_ffb();
+    ffb.torque_magnitude = 64;
+    ffb.torque_at = 1.0;
+    ffb.viscosity_b = 32;
+    ffb.viscosity_at = 1.0;   // 1.0 s 时刚更新过
+
+    Frame out;
+    int pulse_19 = -1;   // now=2.9s, 停更 1.9s
+    int pulse_21 = -1;   // now=3.1s, 停更 2.1s
+    int a_pulse_21 = -1;
+    int strength_21 = -1;
+    // 10 Hz 推进, dt 保持 0.1 s —— 否则会撞上管线自己的停顿判定, 干扰结果。
+    for (int i = 0; i <= 21; ++i) {
+        const double now = 1.0 + static_cast<double>(i) * 0.1;
+        p.tick(now, ffb, out);
+        if (i == 0) check(out.b.slots[0].pulse_intensity > 0, "刚更新过 => B 有脉冲");
+        if (i == 19) pulse_19 = out.b.slots[0].pulse_intensity;
+        if (i == 21) {
+            pulse_21 = out.b.slots[0].pulse_intensity;
+            a_pulse_21 = out.a.slots[0].pulse_intensity;
+            strength_21 = out.b.strength;
+        }
+    }
+    check(pulse_19 > 0, "停更 1.9s < 2000ms => 仍然输出");
+    check_eq(pulse_21, 0, "停更 2.1s > 2000ms => 脉冲归零");
+    check_eq(strength_21, 10, "归零发生在脉冲层, static 的通道强度保持");
+    check(a_pulse_21 > 0, "另一通道(torque)不受影响");
+
+    // 源一更新就立刻恢复 —— 不做渐变(保持超时是"没数据", 不是"要淡出")。
+    ffb.viscosity_at = 3.2;
+    p.tick(3.2, ffb, out);
+    check(out.b.slots[0].pulse_intensity > 0, "源更新 => 下一帧就恢复");
+
+    // 0 = 关闭: 一直输出停住的值(这是显式选择, 不是 bug)
+    Config off_cfg = cfg;
+    off_cfg.viscosity_hold_ms = 0;
+    Pipeline p_off(off_cfg);
+    FfbState stale = ffb;
+    stale.viscosity_at = 1.0;
+    for (int i = 0; i <= 100; ++i) {
+        p_off.tick(1.0 + static_cast<double>(i) * 0.1, stale, out);
+    }
+    check(out.b.slots[0].pulse_intensity > 0, "viscosity_hold_ms=0 => 不判定, 照旧输出");
+
+    // 非 viscosity 源不受影响(vibration 在默认配置里是 B 的源)
+    Config vib_cfg = cfg;
+    vib_cfg.channel_b.source = "vibration";
+    Pipeline p_vib(vib_cfg);
+    FfbState v = make_ffb();
+    v.vibration_b = 40;
+    v.vibration_at = 1.0;
+    for (int i = 0; i <= 100; ++i) {
+        p_vib.tick(1.0 + static_cast<double>(i) * 0.1, v, out);
+    }
+    check(out.b.slots[0].pulse_intensity > 0, "vibration 源不做保持超时判定");
+
+    // 纯函数折算: 0 关闭, 其余钳到 500..10000
+    check_eq(effective_viscosity_hold_ms(0), 0, "0 = 关闭, 原样");
+    check_eq(effective_viscosity_hold_ms(2000), 2000, "区间内不动");
+    check_eq(effective_viscosity_hold_ms(500), 500, "恰好 500 不动");
+    check_eq(effective_viscosity_hold_ms(10000), 10000, "恰好 10000 不动");
+    check_eq(effective_viscosity_hold_ms(100), 500, "<500 抬到 500");
+    check_eq(effective_viscosity_hold_ms(50000), 10000, ">10000 降到 10000");
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -536,6 +618,7 @@ int main() {
     test_held_risk_source();
     test_effective_watchdog_ms();
     test_effective_frame_ms();
+    test_viscosity_hold();
     test_mailbox_consumer_ready();
 
     std::printf("\n-------------------------------------------\n");

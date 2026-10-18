@@ -107,7 +107,9 @@ public:
 
 private:
     // 单通道: 把原始信号映射成 0..1
-    double map_input(const ChannelMapping& m, const FfbState& ffb) const;
+    // raw_zeroed: 源被判定为"保持超时"(T17), 此时原始值按 0 处理 —— 归一化、
+    //   映射、增益包络必须看到同一个 0, 否则脉冲归零了而包络还记着旧峰值。
+    double map_input(const ChannelMapping& m, const FfbState& ffb, bool raw_zeroed) const;
     // 单通道: 把原始信号映射成帧
     void fill_channel(const ChannelMapping& m, double v, ChannelFrame& out);
     // 单通道: 本帧的目标强度(static = 固定 base_strength, level = 按 v 缩放)
@@ -117,12 +119,18 @@ private:
     bool evaluate_safety(double now, const FfbState& ffb, const char*& reason);
     int  clamp_strength(int want) const;
 
+    // T17: 该通道的 viscosity 源是否"保持超时"(超过 viscosity_hold_ms 没有新回调)。
+    // held_ms_out 返回当前已经停更了多久, 供进入/退出时那条日志用。
+    bool viscosity_hold_expired(const ChannelMapping& m, const FfbState& ffb, double now,
+                                double* held_ms_out) const;
+
     // 本帧该用的归一化上界: auto_gain 关闭时就是 m.in_max
     double effective_in_max(const ChannelMapping& m, const FfbState& ffb) const;
 
     // 自动增益: 每个 tick 用当前原始值推进一次包络, 返回本帧的有效 in_max
+    // raw_zeroed 含义同 map_input。
     double update_gain(GainTracker& t, const ChannelMapping& m,
-                       const FfbState& ffb, double now);
+                       const FfbState& ffb, double now, bool raw_zeroed);
 
     Config cfg_;
     SafetyState safety_{};
@@ -143,6 +151,10 @@ private:
     double last_tick_        = 0.0;
     bool   started_          = false;
     bool   last_muted_       = false;
+
+    // T17: viscosity 保持超时的边沿状态(只用来决定"进入/退出时各打一条日志")
+    bool   hold_zero_a_      = false;
+    bool   hold_zero_b_      = false;
 
     // 启动时刻, 用于 warmup
     double boot_time_        = 0.0;

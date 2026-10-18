@@ -237,6 +237,23 @@ int effective_frame_ms(int requested_ms, LinkMode link) {
     return 100;
 }
 
+int effective_viscosity_hold_ms(int requested_ms) {
+    // 0 是唯一表示"关闭"的值 —— 这是用户可选的取舍(有人就想要停住的阻尼),
+    // 所以不把它当成"配错"抬到下限。
+    if (requested_ms == 0) return 0;
+    if (requested_ms < 500) {
+        log_warn("[safety] viscosity_hold_ms(%d) < 500, 会把正常行驶中的短暂间隙误判为停更, 已抬到 500",
+                 requested_ms);
+        return 500;
+    }
+    if (requested_ms > 10000) {
+        log_warn("[safety] viscosity_hold_ms(%d) > 10000, 残值会先被感知到才归零, 已降到 10000",
+                 requested_ms);
+        return 10000;
+    }
+    return requested_ms;
+}
+
 int effective_watchdog_ms(int requested_ms, int frame_ms) {
     const int fm = (frame_ms < 20) ? 20 : frame_ms;
     const int wd_floor = fm * 3;
@@ -393,6 +410,8 @@ Config load_config(const std::string& ini_path) {
     cfg.zero_when_servo_off = read_bool(ini_path, "safety", "zero_when_servo_off",
                                         cfg.zero_when_servo_off);
     cfg.warmup_ms           = read_int(ini_path, "safety", "warmup_ms", cfg.warmup_ms);
+    cfg.viscosity_hold_ms   = read_int(ini_path, "safety", "viscosity_hold_ms",
+                                        cfg.viscosity_hold_ms);
     const bool has_dry_run_key = has_key(ini_path, "safety", "dry_run");
     cfg.dry_run             = read_bool(ini_path, "safety", "dry_run", cfg.dry_run);
     // dry_run 缺键必须说清楚: 它是"要不要真的通电"的总开关, 静默取默认值
@@ -432,6 +451,8 @@ Config load_config(const std::string& ini_path) {
     // 与 frame_ms 绑定的约束, 且必须能被离线用例覆盖(T13a), 所以不再用
     // clamp_int + 就地抬 floor 的写法。
     cfg.watchdog_ms = effective_watchdog_ms(cfg.watchdog_ms, cfg.frame_ms);
+    // T17: 0 = 关闭, 其他值钳到 500..10000(理由见 config.hpp 里那个字段)。
+    cfg.viscosity_hold_ms = effective_viscosity_hold_ms(cfg.viscosity_hold_ms);
     // 自动增益: floor 不能超过 ceiling, 否则归一化区间是负的, 会整体归零。
     clamp_int(cfg.gain_floor, 1, 200, "[output] gain_floor");
     clamp_int(cfg.gain_ceiling, 1, 200, "[output] gain_ceiling");
@@ -620,6 +641,9 @@ bool write_default_config(const std::string& ini_path) {
     w("safety", "watchdog_ms", "500");
     w("safety", "zero_when_servo_off", "1");
     w("safety", "warmup_ms", "1500");
+    // viscosity_hold_ms: viscosity 源停更多久就按 0 处理(T17)。0 = 关闭。
+    // 副作用: 发车倒计时等原地不动的时段也会被归零 —— 这是它的工作原理, 不是 bug。
+    w("safety", "viscosity_hold_ms", "2000");
     // dry_run=1 是硬开关: 不管 [link] mode 写什么, 一律走空输出, 绝不碰设备。
     // 想真实输出必须显式改成 0 —— 别把"干跑"和"接真机"混在一次改动里。
     w("safety", "dry_run", "1");

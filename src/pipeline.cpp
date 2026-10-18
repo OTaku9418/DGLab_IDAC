@@ -119,12 +119,15 @@ void Pipeline::reconfigure(const Config& cfg) {
 // 高速弯的重手感; 取全局最大值会让前半段全部糊在底部。所以要让它落回来。
 // ---------------------------------------------------------------------------
 double Pipeline::update_gain(GainTracker& t, const ChannelMapping& m,
-                             const FfbState& ffb, double now) {
+                             const FfbState& ffb, double now, bool raw_zeroed) {
     // 关闭时直接返回静态 in_max —— 自动增益完全不介入, 行为与加它之前一致。
     if (!cfg_.auto_gain) return static_cast<double>(m.in_max);
 
     bool ok = false;
-    const int32_t raw = pick_source(m.source, ffb, ok, cfg_.torque_negative_is_positive);
+    int32_t raw = pick_source(m.source, ffb, ok, cfg_.torque_negative_is_positive);
+    // T17: 源保持超时的值与"这个值是 0"必须对包络和映射一样 —— 否则脉冲归零了,
+    // 包络却还拿旧峰值当标定, 下一段恢复时会莫名变软。
+    if (raw_zeroed) raw = 0;
     const double v = ok ? static_cast<double>(raw < 0 ? -raw : raw) : 0.0;
 
     double hi = static_cast<double>(cfg_.gain_ceiling);
@@ -155,6 +158,34 @@ double Pipeline::update_gain(GainTracker& t, const ChannelMapping& m,
 }
 
 // ---------------------------------------------------------------------------
+// T17: viscosity 的"保持超时"判定。
+//
+// 为什么只对 viscosity 做: 它的回调是"值变了才回调"(IndRun 侧有变化缓存),
+// 而 torque/vibration 也不会在菜单里刷, 差别在于 —— 退出比赛回菜单时游戏会把
+// 阻尼停在一个非零值上然后不再回调, 于是那个值被当成"当前状态"一直输出。
+// 实测(第二轮 T16): 停住的 visc_b=10 会让脉冲停在 42/100, 人体无感但设备的
+// 电流指示灯亮着; 按默认 25/35 的强度用就会明显可感。
+//
+// 做法: 在"取原始值"这一层把它当 0 —— 不是给输出打补丁, 所以归一化、映射、
+// 增益包络看到的是同一个 0(见 map_input / update_gain 的 raw_zeroed 参数)。
+// 0 表示关闭(viscosity_hold_ms=0), 从不判定。
+// ---------------------------------------------------------------------------
+bool Pipeline::viscosity_hold_expired(const ChannelMapping& m, const FfbState& ffb,
+                                     double now, double* held_ms_out) const {
+    if (held_ms_out != nullptr) *held_ms_out = 0.0;
+    if (cfg_.viscosity_hold_ms <= 0) return false;   // 0 = 关闭
+    if (!m.enable) return false;                     // 关掉的通道本来就输出 0
+    if (!is_held_risk_source(m.source)) return false;  // 只有 viscosity / viscosity_a
+    // 还没收到过任何样本(游戏还没进比赛): 原始值本来就是 0, 不需要额外处理,
+    // 也不该在启动阶段打一条"保持超时"的日志。
+    if (ffb.viscosity_at <= 0.0) return false;
+
+    const double held_ms = (now - ffb.viscosity_at) * 1000.0;
+    if (held_ms_out != nullptr) *held_ms_out = held_ms > 0.0 ? held_ms : 0.0;
+    return held_ms > static_cast<double>(cfg_.viscosity_hold_ms);
+}
+
+// ---------------------------------------------------------------------------
 double Pipeline::effective_in_max(const ChannelMapping& m,
                                   const FfbState& ffb) const {
     const bool is_a = (&m == &cfg_.channel_a);
@@ -164,7 +195,8 @@ double Pipeline::effective_in_max(const ChannelMapping& m,
 }
 
 // ---------------------------------------------------------------------------
-double Pipeline::map_input(const ChannelMapping& m, const FfbState& ffb) const {
+double Pipeline::map_input(const ChannelMapping& m, const FfbState& ffb,
+                           bool raw_zeroed) const {
     if (!m.enable) return 0.0;
     if (m.mode == MapMode::Constant) return clamp01(m.level);
 
@@ -174,6 +206,8 @@ double Pipeline::map_input(const ChannelMapping& m, const FfbState& ffb) const {
         // 每个 tick 都刷屏没意义, 所以这里不打日志 —— 配置解析时就该发现。
         return 0.0;
     }
+    // T17: 见 update_gain 里同一条注释。
+    if (raw_zeroed) raw = 0;
 
     const double span = effective_in_max(m, ffb) - static_cast<double>(m.in_min);
     if (span <= 0.0) return clamp01(m.level);
@@ -325,18 +359,40 @@ bool Pipeline::tick(double now, const FfbState& ffb, Frame& out) {
     safety_.watchdog_tripped = stalled;
 
 
+    // ---- T17: viscosity 保持超时 ----
+    // 必须在 update_gain / map_input 之前, 它们两个都要看这个判定结果。
+    double held_a_ms = 0.0;
+    double held_b_ms = 0.0;
+    const bool hold_a = viscosity_hold_expired(cfg_.channel_a, ffb, now, &held_a_ms);
+    const bool hold_b = viscosity_hold_expired(cfg_.channel_b, ffb, now, &held_b_ms);
+    // 只在进入/退出时各打一条 —— 这个状态一次会话里会来回切换几十次(发车、
+    // 冲线、菜单), 每 tick 打一条就把日志淹了。
+    auto report_hold = [this](const char* name, bool now_zero, bool& was_zero, double held_ms) {
+        if (now_zero == was_zero) return;
+        was_zero = now_zero;
+        if (now_zero) {
+            log_info("[channel_%s] viscosity 已 %.0f ms 没有更新(保持超时 %d ms), 输出归零 —— "
+                     "原地不动的时段(菜单、发车倒计时)会这样, 源一更新就恢复",
+                     name, held_ms, cfg_.viscosity_hold_ms);
+        } else {
+            log_info("[channel_%s] viscosity 恢复更新, 输出恢复", name);
+        }
+    };
+    report_hold("A", hold_a, hold_zero_a_, held_a_ms);
+    report_hold("B", hold_b, hold_zero_b_, held_b_ms);
+
     // ---- 自动增益: 每 tick 推进一次包络, 供本帧的 A/B 两路归一化使用 ----
     // 必须在 map_input 之前, 因为 map_input 读的是本帧算出来的增益。
-    update_gain(gain_a_, cfg_.channel_a, ffb, now);
-    update_gain(gain_b_, cfg_.channel_b, ffb, now);
+    update_gain(gain_a_, cfg_.channel_a, ffb, now, hold_a);
+    update_gain(gain_b_, cfg_.channel_b, ffb, now, hold_b);
     last_gain_t_ = now;
 
     // ---- 目标通道强度 ----
     // 通道强度是慢变量, 每 100 ms 最多动 slew 允许的量; 快变化全部走
     // 脉冲强度(波形振幅)。默认 strength_source=static, 强度只由配置决定,
     // 游戏数据完全不参与 —— 见 config.hpp 里那个字段的注释。
-    const double v_a = map_input(cfg_.channel_a, ffb);
-    const double v_b = map_input(cfg_.channel_b, ffb);
+    const double v_a = map_input(cfg_.channel_a, ffb, hold_a);
+    const double v_b = map_input(cfg_.channel_b, ffb, hold_b);
     last_v_a_ = v_a;
     last_v_b_ = v_b;
 

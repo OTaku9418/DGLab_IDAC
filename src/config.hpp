@@ -159,6 +159,15 @@ struct Config {
     int         watchdog_ms         = 500;
     // servo off / 未就绪时是否强制归零
     bool        zero_when_servo_off = true;
+    // T17: viscosity 源的"保持超时"(毫秒)。
+    // viscosity 的回调是"值变了才回调", 退出比赛回菜单后游戏会把阻尼停在一个
+    // 非零值上不再更新 —— 那个值会被当成当前状态一直输出(实测停住的 visc_b=10
+    // 对应脉冲 42/100, 指示灯亮着)。超过这个毫秒数没有新回调就把该通道的原始值
+    // 按 0 处理, 源一更新立刻恢复。
+    //   0 = 关闭; 其他值钳到 500..10000(低于 500 会把正常行驶中的短暂间隙误判,
+    //   实测 viscosity 在驾驶时间隔几乎全 <0.5 s)。
+    // 只影响 source=viscosity / viscosity_a 的通道, 另一通道不受影响。
+    int         viscosity_hold_ms   = 2000;
     // 启动后前 N 毫秒强制输出 0, 让用户有时间确认连接
     int         warmup_ms           = 1500;
     // 全局总开关: 设为 false 时只记日志不发数据(干跑模式)
@@ -188,6 +197,13 @@ Config load_config(const std::string& ini_path);
 // 消费节拍错位(信箱覆盖率、看门狗阈值都跟着算错)。所以 BLE 模式下固定 100 ms,
 // 配成别的值打 WARN 并忽略。空输出/WebSocket 没有这个约束, 原样返回。
 int effective_frame_ms(int requested_ms, LinkMode link);
+
+// 把 INI 里写的 viscosity_hold_ms 折算成"实际生效值"(纯函数, 但会打 WARN)。
+//
+// 语义: 0 = 关闭保持超时; 非 0 时钳到 [500, 10000]。下限 500 ms 的理由是实测
+// viscosity 在正常驾驶时间隔几乎全 <0.5 s, 再小会把正常抖动当成"停更";
+// 上限 10 s 的理由是超过它以后残值已经被感知到很久了, 等于没做保护。
+int effective_viscosity_hold_ms(int requested_ms);
 
 // 把 INI 里写的 watchdog_ms 折算成"实际生效值"(纯函数, 但会打 WARN)。
 //

@@ -153,6 +153,13 @@ strength_margin=0.0
 ;                超过 2000 ms 会被压回 2000(再长就失去兜底意义)。
 ;                它只兜底"数据流断了", 真正的力道上限仍然是 max_strength
 ;                与设备侧的 BF 软限位。
+; viscosity_hold_ms : viscosity 源的保持超时(毫秒)。数值 0 = 关闭; 其他值 500~10000。
+;                viscosity 的回调是"值变了才回调", 退出比赛回菜单后游戏可能把阻尼
+;                停在一个非零值上不再更新, 那个值会被一直输出(实测脉冲 42/100,
+;                人体无感但设备指示灯亮着)。超过这个毫秒数没有新回调就把该通道的
+;                原始值按 0 处理, 源一更新立刻恢复。
+;                ★ 副作用: 发车倒计时、暂停等原地不动的时段也会被归零 ★
+;                只影响 source=viscosity / viscosity_a 的通道。
 ; zero_when_servo_off : 1=游戏伺服未就绪时强制归零, 0=不归零。数值 0 或 1。
 ; warmup_ms : 启动后多久内不输出, 给设备与链路留握手时间。数值是毫秒。
 ; dry_run : ★ 硬开关 ★ 1=不管 [link] mode 写什么, 一律走空输出, 绝不碰设备;
@@ -165,6 +172,7 @@ slew_per_second=40
 watchdog_ms=500
 zero_when_servo_off=1
 warmup_ms=5000
+viscosity_hold_ms=2000
 dry_run=0
 
 [debug]
