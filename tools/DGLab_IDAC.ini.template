@@ -2,9 +2,11 @@
 ; DGLab_IDAC 配置模板 —— 带注释的权威版本
 ; ============================================================================
 ; 用法: 拷到 mod 目录并改名为 DGLab_IDAC.ini
-;   <游戏>\GameProject\Binaries\Win64\ue4ss\Mods\DGLab_IDAC\dlls\DGLab_IDAC.ini
+;   <游戏>\WindowsNoEditor\GameProject\Binaries\Win64\ue4ss\Mods\DGLab_IDAC\dlls\DGLab_IDAC.ini
 ;
-; 写配置前先离线体检, 别靠读日志猜:
+; 发布包里这个文件已经放在正确位置并叫 DGLab_IDAC.ini, 一般不需要拷。
+;
+; 改配置前想先离线体检, 别靠读日志猜(conftest.exe 是仓库里的开发工具, 发布包不含):
 ;   tools\conftest.exe "<上面那个 ini 的完整路径>"
 ; 它会直接判定"会连真实设备吗 / 设备会有刺激吗"。dry_run 写错的表现是
 ; 日志一切正常、只是少做了一件事, 光看日志看不出来。
@@ -165,7 +167,9 @@ strength_margin=0.0
 ; dry_run : ★ 硬开关 ★ 1=不管 [link] mode 写什么, 一律走空输出, 绝不碰设备;
 ;                0=允许真实输出。数值 0 或 1。
 ;           这是"物理上不可能电到人"的唯一开关, 优先于 [link] mode。
-;           第一次跑新配置时先用 1 验证链路, 确认无误再改 0。
+;           用途是把"加载/挂钩"和"真实输出"分开验证:
+;             写 1 —— 只验证加载和挂钩(不建立 BLE, 设备不会连上);
+;             验证链路用 0, 并先不接电极(看日志里的 B1 回执即可)。
 max_strength=30
 clamp_strength=30
 slew_per_second=40
