@@ -62,7 +62,9 @@
 > 游戏由 Unreal Engine 4.24 驱动, 本模块以 **UE4SS C++ mod** 的形式接入,
 > 基于 ArcadeZone.cn 服务器所提供的 3.21 游戏版本(启动器 V2.11) + 自定义 BGM Mod
 > (引用自定义 BGM Mod 自带的 UE4SS 版本), 和 `.../Win64/ue4ss/Mods/` 下已有的 mod
-> 一起由 UE4SS 统一加载管理。用户侧的 UE4SS 框架由 LocalRadio 资源包提供。
+> 一起由 UE4SS 统一加载管理。用户侧的 UE4SS 框架由自定义 BGM 模组
+> (Custom BGM Mod Pack, 见 <https://arcadezone.cn/guide>) 提供, 装好后在
+> `Mods\` 下的目录名是 `LocalRadio`。
 
 ---
 
