@@ -11,6 +11,7 @@
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -120,7 +121,11 @@ struct MailboxTake {
 
 struct MailboxStats {
     uint64_t submitted      = 0;
-    uint64_t overwritten    = 0;   // 上一帧还没被取走就被新帧覆盖
+    uint64_t overwritten    = 0;   // 传输层就绪时, 上一帧还没被取走就被新帧覆盖
+    // 传输层**还没就绪**时发生的覆盖(典型: 连接建立的 ~3 s 里 BLE 线程不取帧,
+    // 管线照样 10 Hz 提交)。和 overwritten 分开计, 否则那 3 秒的 26 次覆盖会
+    // 把所有局的 over/submitted 比例都污染成"传输跟不上"(T13c)。
+    uint64_t overwritten_pre = 0;
     uint64_t taken_fresh    = 0;
     uint64_t repeated       = 0;   // 重复发送了旧帧
     uint64_t idle_sent      = 0;   // 发出的静默帧数
@@ -133,6 +138,11 @@ public:
     MailboxTake take(int64_t now_ms, int watchdog_ms);
     MailboxStats stats() const;
 
+    // "消费端就绪"标志: 传输线程真正开始逐帧取帧时置 true, 链路断了置 false。
+    // 只影响覆盖计数归到哪一栏, 不影响看门狗判定。
+    void set_consumer_ready(bool ready);
+    bool consumer_ready() const;
+
 private:
     mutable std::mutex mu_;
     Frame    pending_{};
@@ -141,6 +151,7 @@ private:
     uint64_t put_count_     = 0;   // put 的总次数
     uint64_t taken_count_   = 0;   // 已经被 take 走的 put 次数
     bool     tripped_       = false;
+    std::atomic<bool> consumer_ready_{false};
     MailboxStats stats_{};
 };
 

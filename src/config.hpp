@@ -154,7 +154,7 @@ struct Config {
     //     逐帧判断, 超时就换静默帧(这是真正"拉回 0"的那一层)。
     //   * src/pipeline.cpp 的 tick() —— 管线侧, 自己停顿超过这个值就清零强度
     //     累积并重新预热, 避免停顿结束后一帧跳到满力。
-    // 配置加载时会被抬到至少 3*frame_ms(见 src/config.cpp)。
+    // 取值由 effective_watchdog_ms() 折算: 抬到至少 3*frame_ms, 压到最多 2000。
     int         watchdog_ms         = 500;
     // servo off / 未就绪时是否强制归零
     bool        zero_when_servo_off = true;
@@ -179,6 +179,18 @@ struct Config {
 
 // 从 INI 读; 文件不存在时返回默认值并写日志
 Config load_config(const std::string& ini_path);
+
+// 把 INI 里写的 watchdog_ms 折算成"实际生效值"(纯函数, 但会打 WARN)。
+//
+// 三条约束, 都与帧周期绑定:
+//   * 下限 50 ms —— 再小没有意义;
+//   * 下限 3*frame_ms —— 管线按 frame_ms 提交, Windows 默认定时器精度约
+//     15.6 ms, 正常抖动会让帧间隔偶尔超过 frame_ms, 留两次迟到的余量;
+//   * 上限 2000 ms —— 看门狗的意义是"数据流断了就归零"。配得比 2 s 还大,
+//     等于容忍设备在卡死期间长时间保持最后的强度, 那就不是兜底了。
+// 如果 frame_ms 大到 3*frame_ms 超过 2000, 以 3*frame_ms 为准(否则约束自相矛盾),
+// 这条路径会打 WARN。0 不表示"关闭": 看门狗是安全阀, 不能靠一个数字失效。
+int effective_watchdog_ms(int requested_ms, int frame_ms);
 
 // 写一份带全部注释的默认 INI(首次运行时铺出来)
 bool write_default_config(const std::string& ini_path);

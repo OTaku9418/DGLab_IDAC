@@ -59,20 +59,35 @@ bool normalize_ini_line_endings(const std::string& path) {
         out.push_back(data[i]);
     }
 
-    HANDLE w = ::CreateFileA(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+    // ★ 原子写入 (T13d) ★
+    // 以前直接 CREATE_ALWAYS 覆盖原文件: 如果写到一半失败(磁盘满/被杀进程),
+    // 用户配置就变成一个残缺的 INI —— 而下次启动会把它当"合法配置"读, 每项
+    // 都可能回落到内置默认值(其中 base_strength 的默认值比用户配的大得多)。
+    // 所以先写 <path>.tmp, 再用 MoveFileEx 替换; 任何一步失败都保留原文件。
+    const std::string tmp = path + ".tmp";
+    HANDLE w = ::CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                              FILE_ATTRIBUTE_NORMAL, nullptr);
     if (w == INVALID_HANDLE_VALUE) {
-        log_warn("配置 %s 是 LF 行尾(Win32 INI API 会读不到内容), 但改写失败 —— 本次仍按默认值运行",
-                 path.c_str());
+        log_warn("配置 %s 是 LF 行尾(Win32 INI API 会读不到内容), 但临时文件建不出来 —— "
+                 "本次仍按默认值运行, 原文件未改动", path.c_str());
         return false;
     }
     DWORD wrote = 0;
     const BOOL wok = ::WriteFile(w, out.data(), static_cast<DWORD>(out.size()), &wrote, nullptr);
+    ::FlushFileBuffers(w);
     ::CloseHandle(w);
 
     if (!wok || wrote != out.size()) {
-        log_error("配置 %s 行尾归一化写入不完整 (%lu/%zu)", path.c_str(),
+        ::DeleteFileA(tmp.c_str());
+        log_error("配置 %s 行尾归一化写入不完整 (%lu/%zu), 已放弃改写, 原文件未改动", path.c_str(),
                   static_cast<unsigned long>(wrote), out.size());
+        return false;
+    }
+    if (!::MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD err = ::GetLastError();
+        ::DeleteFileA(tmp.c_str());
+        log_warn("配置 %s 行尾归一化没能替换原文件 (GetLastError=%lu), 原文件未改动 —— "
+                 "本次仍按默认值运行", path.c_str(), static_cast<unsigned long>(err));
         return false;
     }
 
@@ -208,6 +223,31 @@ const char* to_string(MapMode m) {
 
 bool is_held_risk_source(const std::string& src) {
     return ieq(src, "viscosity") || ieq(src, "viscosity_a");
+}
+
+int effective_watchdog_ms(int requested_ms, int frame_ms) {
+    const int fm = (frame_ms < 20) ? 20 : frame_ms;
+    const int wd_floor = fm * 3;
+    // 上限 2000, 但若 3*frame_ms 已经超过 2000(frame_ms > 666), 约束自相矛盾 ——
+    // 让下限优先, 因为"低于帧周期三倍"的看门狗会一直误触发。
+    const int wd_cap = (wd_floor > 2000) ? wd_floor : 2000;
+
+    int v = requested_ms;
+    if (v < 50) {
+        log_warn("[safety] watchdog_ms(%d) < 50, 已抬到 50", v);
+        v = 50;
+    }
+    if (v > wd_cap) {
+        log_warn("[safety] watchdog_ms(%d) 超过上限 %d ms, 已降到 %d —— 看门狗再长就失去兜底意义",
+                 v, wd_cap, wd_cap);
+        v = wd_cap;
+    }
+    if (v < wd_floor) {
+        log_warn("[safety] watchdog_ms(%d) < 3*frame_ms(%d), 会误触发, 已抬到 %d", v, wd_floor,
+                 wd_floor);
+        v = wd_floor;
+    }
+    return v;
 }
 
 Config load_config(const std::string& ini_path) {
@@ -373,19 +413,10 @@ Config load_config(const std::string& ini_path) {
     clamp_int(cfg.pulse_freq_min, 10, 240, "[output] pulse_freq_min");
     clamp_int(cfg.pulse_freq_max, 10, 240, "[output] pulse_freq_max");
     clamp_int(cfg.warmup_ms, 0, 60000, "[safety] warmup_ms");
-    clamp_int(cfg.watchdog_ms, 50, 60000, "[safety] watchdog_ms");
-    // watchdog_ms 必须明显大于帧周期: 管线按 frame_ms 节拍提交, 而 Windows
-    // 默认定时器精度约 15.6 ms, 正常的调度抖动会让帧间隔偶尔超过 frame_ms。
-    // 门槛取 3 倍是留够两次迟到的余量。不提供"0 = 关闭"—— 看门狗是安全阀,
-    // 不能因为配错一个数字就整条失效。
-    {
-        const int wd_floor = cfg.frame_ms * 3;
-        if (cfg.watchdog_ms < wd_floor) {
-            log_warn("[safety] watchdog_ms(%d) < 3*frame_ms(%d), 会误触发, 已抬到 %d",
-                     cfg.watchdog_ms, wd_floor, wd_floor);
-            cfg.watchdog_ms = wd_floor;
-        }
-    }
+    // watchdog_ms 的取舍逻辑在 effective_watchdog_ms() 里 —— 它有上下限两条
+    // 与 frame_ms 绑定的约束, 且必须能被离线用例覆盖(T13a), 所以不再用
+    // clamp_int + 就地抬 floor 的写法。
+    cfg.watchdog_ms = effective_watchdog_ms(cfg.watchdog_ms, cfg.frame_ms);
     // 自动增益: floor 不能超过 ceiling, 否则归一化区间是负的, 会整体归零。
     clamp_int(cfg.gain_floor, 1, 200, "[output] gain_floor");
     clamp_int(cfg.gain_ceiling, 1, 200, "[output] gain_ceiling");

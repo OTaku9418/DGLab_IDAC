@@ -457,6 +457,11 @@ private:
         double last_heartbeat = 0.0;
         // [tx] 另一条独立的 10 秒计时: 心跳是每秒一次的, 传输层状态没必要跟着刷。
         double last_tx_report = 0.0;
+        // "一直没有力反馈回调"告警的限流状态 (T13b): 第一次超 20 s 打一次,
+        // 之后每 60 s 最多一次; warned_no_ffb 用来判断稍后要不要打"首次收到"。
+        bool warned_no_ffb = false;
+        bool logged_first_ffb = false;
+        double last_noffb_warn = 0.0;
         double start_time = now_seconds();
 
         uint64_t frames = 0;
@@ -567,12 +572,25 @@ private:
 
                     // 明确告警: 挂了 hook 但一次回调都没有 —— 说明要么还没进
                     // 游戏, 要么力反馈通路在 mode=xinput 下根本不走。
+                    // ★ 限流 (T13b) ★ 这条告警在"一直停在菜单里"时会持续成立,
+                    // 每秒一条会把日志冲干净。改成: 第一次超过 20 s 打一次, 之后
+                    // 每 60 s 最多一次; 一旦真收到回调, 再打一条 INFO 收尾。
                     if (!s.ever_updated && (t - start_time) > 20.0) {
-                        dglab_idac::log_warn(
-                            "[hb] 已经 %.0f 秒没有任何力反馈回调。可能原因: "
-                            "(a) 还没进游戏; (b) 游戏在 xinput 模式下不生成力反馈; "
-                            "(c) 增益 [manager+0x4E4] 恒为 0(见 ffb_types.hpp 的说明)。",
-                            t - start_time);
+                        if (!warned_no_ffb || (t - last_noffb_warn) >= 60.0) {
+                            warned_no_ffb = true;
+                            last_noffb_warn = t;
+                            dglab_idac::log_warn(
+                                "[hb] 已经 %.0f 秒没有任何力反馈回调。可能原因: "
+                                "(a) 还没进游戏; (b) 游戏在 xinput 模式下不生成力反馈; "
+                                "(c) 增益 [manager+0x4E4] 恒为 0(见 ffb_types.hpp 的说明)。"
+                                "(之后每 60 s 提醒一次)",
+                                t - start_time);
+                        }
+                    } else if (warned_no_ffb && !logged_first_ffb && s.ever_updated) {
+                        // 这条 INFO 很重要: 它把"告警是在等什么"闭合掉, 否则日志里
+                        // 只有一串告警、看不出后来到底通没通。
+                        logged_first_ffb = true;
+                        dglab_idac::log_info("首次收到力反馈回调 (t=%.0fs)", t - start_time);
                     }
                 }
             }

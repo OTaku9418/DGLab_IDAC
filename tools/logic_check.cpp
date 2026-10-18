@@ -180,6 +180,9 @@ void test_mailbox_overwrite() {
     group("信箱: 深度 1, 新帧覆盖旧帧");
 
     FrameMailbox mb;
+    // 这个用例测的是"传输线程跟不上导致丢帧", 所以先让消费端就绪
+    // —— 未就绪时覆盖记进 over_pre(T13c), 那是另一栏。
+    mb.set_consumer_ready(true);
     mb.put(make_loud_frame(), 1000);
 
     Frame f2 = make_loud_frame();
@@ -439,6 +442,63 @@ void test_held_risk_source() {
     check(!is_held_risk_source(""), "空串 => false");
 }
 
+// ---------------------------------------------------------------------------
+// 11. watchdog_ms 的上下限折算 (T13a)
+//
+// 上下限是两条会互相打架的约束: 下限 3*frame_ms 保证不误触发, 上限 2000 ms
+// 保证"配得太大也不至于失去兜底意义"。frame_ms 一大, 两条就交叉了, 这里把
+// 边界逐个钉住 —— 否则改一次参数就可能悄悄把上限顶掉。
+// ---------------------------------------------------------------------------
+void test_effective_watchdog_ms() {
+    group("[watchdog] 上下限折算");
+
+    check_eq(effective_watchdog_ms(2500, 100), 2000, "2500 被压到上限 2000");
+    check_eq(effective_watchdog_ms(2000, 100), 2000, "正好 2000 不动");
+    check_eq(effective_watchdog_ms(500, 100), 500, "500 在区间内, 不动");
+    check_eq(effective_watchdog_ms(50, 100), 300, "50 < 3*frame_ms(300) => 抬到 300");
+    check_eq(effective_watchdog_ms(10, 100), 300, "低于 50 也最终落到 floor 300");
+    check_eq(effective_watchdog_ms(0, 100), 300, "0 不表示关闭, 仍然落到 floor");
+    check_eq(effective_watchdog_ms(2000, 20), 2000, "frame_ms=20 时 floor=60, 上限仍是 2000");
+    // frame_ms=1000(max) 时 3*frame_ms=3000 已经超过 2000: 让下限优先,
+    // 否则看门狗会低于帧周期的三倍而一直误触发。
+    check_eq(effective_watchdog_ms(3000, 1000), 3000, "floor 3000 > 上限 2000 时下限优先");
+    check_eq(effective_watchdog_ms(100, 1000), 3000, "frame_ms=1000 时低于 floor 仍抬到 3000");
+}
+
+// ---------------------------------------------------------------------------
+// 12. 覆盖计数分栏 (T13c)
+//
+// 链路建立前 BLE 线程不取帧, 管线照样 10 Hz 提交 —— 那些覆盖不是"传输跟不上"。
+// 混在一起会让每局开头的 20 多次覆盖把 over/submitted 的比例整体拉高。
+// ---------------------------------------------------------------------------
+void test_mailbox_consumer_ready() {
+    group("[信箱] 就绪前的覆盖单独计数");
+
+    FrameMailbox mb;
+    const Frame f = make_idle_frame("test");
+    mb.put(f, 1000);
+    mb.put(f, 1100);   // 未就绪: 覆盖第 1 次
+    mb.put(f, 1200);   // 未就绪: 覆盖第 2 次
+    MailboxStats s = mb.stats();
+    check_eq(static_cast<int>(s.submitted), 3, "未就绪时也照常记 submitted");
+    check_eq(static_cast<int>(s.overwritten), 0, "未就绪 => over 保持 0");
+    check_eq(static_cast<int>(s.overwritten_pre), 2, "未就绪 => over_pre=2");
+
+    mb.set_consumer_ready(true);
+    check(mb.consumer_ready(), "set_consumer_ready(true) 生效");
+    mb.put(f, 1300);   // 就绪: 覆盖第 1 次(上一帧仍未被取走)
+    mb.put(f, 1400);   // 就绪: 覆盖第 2 次
+    s = mb.stats();
+    check_eq(static_cast<int>(s.overwritten), 2, "就绪后覆盖计入 over");
+    check_eq(static_cast<int>(s.overwritten_pre), 2, "over_pre 不再增长");
+
+    mb.set_consumer_ready(false);
+    mb.put(f, 1500);
+    s = mb.stats();
+    check_eq(static_cast<int>(s.overwritten), 2, "就绪标志撤回后 over 不再增长");
+    check_eq(static_cast<int>(s.overwritten_pre), 3, "撤回后覆盖回到 over_pre");
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -455,6 +515,8 @@ int main() {
     test_pipeline_warmup();
     test_ffb_gap_stats();
     test_held_risk_source();
+    test_effective_watchdog_ms();
+    test_mailbox_consumer_ready();
 
     std::printf("\n-------------------------------------------\n");
     std::printf("通过 %d, 失败 %d\n", g_pass, g_fail);

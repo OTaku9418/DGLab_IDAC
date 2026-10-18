@@ -608,11 +608,12 @@ std::string BleWinRtTransport::status() const {
     const MailboxStats ms = mailbox_.stats();
     std::snprintf(buf, sizeof(buf),
                   "BLE state=%s rssi=%d writes=%llu errors=%llu b1=%llu lastA=%d lastB=%d "
-                  "wd=%d trips=%llu dup=%llu over=%llu idle=%llu",
+                  "wd=%d trips=%llu dup=%llu over=%llu over_pre=%llu idle=%llu",
                   state_.c_str(), last_rssi_, static_cast<unsigned long long>(writes_),
                   static_cast<unsigned long long>(errors_), static_cast<unsigned long long>(b1c), b1a, b1b,
                   ms.watchdog_trips > 0 ? 1 : 0, static_cast<unsigned long long>(ms.watchdog_trips),
                   static_cast<unsigned long long>(ms.repeated), static_cast<unsigned long long>(ms.overwritten),
+                  static_cast<unsigned long long>(ms.overwritten_pre),
                   static_cast<unsigned long long>(ms.idle_sent));
     return std::string(buf);
 }
@@ -710,6 +711,10 @@ void BleWinRtTransport::worker_entry() {
 
             set_state("connected", true);
             log_info("BLE: 链路就绪 (A/B 期望强度上限 %d)", bf_limit());
+
+            // 从这里开始才真正逐帧取帧 —— 之前(~3 s 握手期)管线提交的帧会被
+            // 覆盖, 那些覆盖记在 overwritten_pre, 不算"传输跟不上"(T13c)。
+            mailbox_.set_consumer_ready(true);
 
             // --- (f) 发送循环 ---
             {
@@ -877,6 +882,9 @@ void BleWinRtTransport::worker_entry() {
             }
 
             // --- (g) 重连 ---
+            // 链路要拆了: 之后直到下次握手完成, 管线提交的帧都会被覆盖, 那些
+            // 覆盖属于 overwritten_pre, 不是"传输跟不上"(T13c)。
+            mailbox_.set_consumer_ready(false);
             teardown_link();
             if (!running_.load(std::memory_order_acquire)) break;
 

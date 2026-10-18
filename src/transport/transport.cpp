@@ -45,12 +45,28 @@ void FrameMailbox::put(const Frame& f, int64_t now_ms) {
     std::lock_guard<std::mutex> lk(mu_);
     // 上一帧还没被取走就又来一帧 = 传输线程跟不上, 这一帧直接丢弃。
     // 队列深度必须是 1: 发"最新"的波形, 而不是排队发"过时"的。
-    if (has_pending_ && put_count_ > taken_count_) ++stats_.overwritten;
+    // 但"消费端还没就绪"(链路没连上)时的覆盖不是传输跟不上, 单独记一栏,
+    // 否则每局开头那 3 秒都会凭空贡献 20 多次 over(T13c)。
+    if (has_pending_ && put_count_ > taken_count_) {
+        if (consumer_ready_.load(std::memory_order_relaxed)) {
+            ++stats_.overwritten;
+        } else {
+            ++stats_.overwritten_pre;
+        }
+    }
     pending_ = f;
     has_pending_ = true;
     last_put_ms_ = now_ms;
     ++put_count_;
     ++stats_.submitted;
+}
+
+void FrameMailbox::set_consumer_ready(bool ready) {
+    consumer_ready_.store(ready, std::memory_order_relaxed);
+}
+
+bool FrameMailbox::consumer_ready() const {
+    return consumer_ready_.load(std::memory_order_relaxed);
 }
 
 MailboxTake FrameMailbox::take(int64_t now_ms, int watchdog_ms) {
