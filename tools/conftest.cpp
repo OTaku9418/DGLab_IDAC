@@ -123,6 +123,26 @@ int main(int argc, char** argv) {
             std::printf("  通道 B 强度     : %d\n", c.channel_b.base_strength);
         }
     }
+    // 持值风险 (T11b): 只提示, 不改变上面的判定 —— 用 viscosity 不是"错",
+    // 只是"退出比赛回菜单后可能留着一段可感的输出"。放在这里是因为它是
+    // 上线前唯一能在设备之外发现的途径: load_config 的 WARN 只写进日志。
+    {
+        const char* risky_a = (c.channel_a.enable && c.channel_a.base_strength > 0 &&
+                               is_held_risk_source(c.channel_a.source))
+                                  ? "A"
+                                  : "";
+        const char* risky_b = (c.channel_b.enable && c.channel_b.base_strength > 0 &&
+                               is_held_risk_source(c.channel_b.source))
+                                  ? "B"
+                                  : "";
+        if (risky_a[0] != '\0' || risky_b[0] != '\0') {
+            std::printf("  持值风险        : 通道 %s%s 用了 viscosity —— 强制退出比赛回菜单后\n",
+                        risky_a, risky_b);
+            std::printf("                    阻尼可能停在可感的值上并持续输出 (见 README 5.1)\n");
+        } else {
+            std::printf("  持值风险        : 无 (没有通道用 viscosity)\n");
+        }
+    }
     std::printf("======================================\n");
     return 0;
 }
