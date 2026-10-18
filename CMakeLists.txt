@@ -16,7 +16,7 @@
 #   tools\build.cmd -Deploy          —— 额外把产物铺到游戏 Mods 目录
 # ---------------------------------------------------------------------------
 cmake_minimum_required(VERSION 3.18)
-project(DGLab_IDAC VERSION 0.1.0 LANGUAGES CXX)
+project(DGLab_IDAC VERSION 0.2.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "只能构建 x64 —— 游戏是 64 位进程。")
@@ -322,6 +322,7 @@ if(MSVC)
         # 所以是 wchar_t, 前缀必须是 L(不是 u)。对了错都只是编译错误, 不会静默。
         "DGLAB_VERSION_W=L\"${PROJECT_VERSION}\""
         "DGLAB_VERSION_A=\"${PROJECT_VERSION}\""
+        "DGLAB_VERSION_DIAG=L\"${PROJECT_VERSION}-diag\""
     )
 endif()
 

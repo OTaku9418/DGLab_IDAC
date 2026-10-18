@@ -89,3 +89,4 @@ _ue4ss_exp/
 .vscode/
 *.user
 *.suo
+dist/

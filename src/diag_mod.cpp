@@ -85,7 +85,7 @@ public:
     DiagMod() {
         dlog("C1  ctor 进入");
         ModName = STR("DGLab_IDAC_diag");
-        ModVersion = STR("0.1.0-diag");
+        ModVersion = DGLAB_VERSION_DIAG;  // 版本号只有 CMake 里那一处
         ModDescription = STR("diagnostic build");
         ModAuthors = STR("DGLab_IDAC");
         ModIntendedSDKVersion = STR("3.0.1");
