@@ -71,6 +71,9 @@ _ue4ss_ref/third_party/*
 # 只有换 UE4SS 版本时才需要重新生成它。
 third_party/importlib/*
 !third_party/importlib/UE4SS.def
+# 来源说明(源 DLL 的 SHA-256 / 版本 / 生成命令 / 校验记录)要跟着仓库走,
+# 否则别人 clone 下来只有一堆修饰名, 无从判断它对的是哪个 UE4SS。
+!third_party/importlib/PROVENANCE.md
 
 # ---- UE4SS 发布包(6.9 MB 二进制, 不提交) ----
 # tools\UE4SS_v3.0.1-944-g0196ef29.zip 只是"我们从哪儿取出对齐头文件"的物证,
