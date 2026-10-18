@@ -107,8 +107,8 @@ gain_idle_reset_sec=3.0
 ;          注意 auto_gain=1 时它只在启动瞬间当初始上界, 之后由增益包络接管。
 ; level  : 本通道整体幅度系数。数值 0.0~1.0; 1.0=不衰减。
 ;          只在 strength_source=level 时影响通道强度, 但始终影响脉冲振幅。
-; base_strength : 通道强度, 即设备上的"音量"。数值 0~200 的整数, 再受
-;          [safety] max_strength 二次钳制, 实际生效值不会超过它。
+; base_strength : 本通道的强度, 即设备上的"音量"。数值 0~200 的整数; 它先被
+;          [safety] clamp_strength / max_strength 截断(取三者最小), 再下发给设备。
 ;          0 = 本通道不输出。15 属于很轻的档位。
 ; strength_source : 数值是字符串:
 ;          static 强度恒为 base_strength, 游戏动态全部体现在脉冲振幅上 ← 推荐
@@ -140,11 +140,15 @@ strength_source=static
 strength_margin=0.0
 
 [safety]
-; 四道闸门从内到外: 本段 clamp_strength -> min(clamp_strength, max_strength)
-; -> BLE 层 0~200 钳制 -> 设备侧 BF 软限位(断电保持)。
-; max_strength : 本程序允许的最大通道强度。数值 0~200 的整数。
-;                它同时是发给设备的 BF 软限位, 换设备/重连后会自动重发。
-; clamp_strength : 应用层钳制值, 实际生效上限取它与 max_strength 的较小者。
+; 强度有三层, 别混: 通道自己的 base_strength(想用多少) -> 本段 clamp_strength(软件
+; 自我约束) -> max_strength(设备侧 BF 软限位)。实际下发的通道强度 =
+; min(base_strength 算出的值, clamp_strength, max_strength)。
+; max_strength : ★ 设备侧 ★ 全局最大强度。连接后作为 BF 软限位写进郊狼主机(A、B 都设成
+;                这个值), 设备断电保存; 手拧设备滚轮也突破不了它。数值 0~200 的整数。
+;                两个通道共用这一个值。换设备/重连后会自动重发。
+; clamp_strength : ★ 软件侧 ★ 自我约束上限, 本 mod 算完通道强度后自己截断。
+;                实际生效上限取 min(clamp_strength, max_strength); 配得比
+;                max_strength 还大会打 WARN 并自动降到 max_strength。
 ; slew_per_second : 每秒最多变化多少档强度。数值是整数档/秒;
 ;                40 表示每 100 ms 最多变 4 档, 从 0 爬到 15 约需 375 ms。
 ; watchdog_ms : 看门狗。超过这么多毫秒没有新的帧送到传输层, 就改发静默帧
