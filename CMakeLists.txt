@@ -309,6 +309,7 @@ if(MSVC)
         /EHsc
         /MP
         /wd4100           # 未引用的形参(detour 里刻意占位)
+        /Zi               # 生成 PDB: 崩溃报告(bisect.log)里的地址要能查符号
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE
         NOMINMAX
@@ -363,6 +364,15 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     psapi.lib           # EnumProcessModules / GetModuleBaseNameA (挂不上时倒模块清单)
     shell32.lib         # CommandLineToArgvW / 杂项
 )
+
+if(MSVC)
+    # /DEBUG + /Zi: 让 make_release.cmd 能把 PDB 与 DLL 一起归档。
+    # /Brepro: 不把当前时间写进 PE 头 —— 否则同样的源码每次构建出来的 DLL
+    #   有 4 个字节不同(实测: 文件头 TimeDateStamp 与 CodeView 记录各一处),
+    #   md5 就失去"验证同一份代码"的意义。
+    # /PDBALTPATH: DLL 里只记文件名, 不把构建机路径(D:\INDAC\...)写进发布产物。
+    target_link_options(${PROJECT_NAME} PRIVATE /DEBUG /Brepro "/PDBALTPATH:DGLab_IDAC.pdb")
+endif()
 
 # 输出名: UE4SS 只找 <mod>/dlls/main.dll, 所以交付时改名。
 # 构建产物仍叫 DGLab_IDAC.dll 以免和别的 mod 的 main.dll 混淆。
