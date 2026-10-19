@@ -262,6 +262,7 @@ struct SharedState {
         if (scan_event != nullptr) ::CloseHandle(scan_event);
         if (wake_event != nullptr) ::CloseHandle(wake_event);
         if (startup_event != nullptr) ::CloseHandle(startup_event);
+        if (frame_event != nullptr) ::CloseHandle(frame_event);
     }
 
     SharedState(const SharedState&) = delete;
@@ -274,6 +275,10 @@ struct SharedState {
     // 句柄只在工作线程上使用(回调也可能 SetEvent 醒它)
     HANDLE scan_event = nullptr;
     HANDLE wake_event = nullptr;
+    // T26: submit() 放好新帧后 SetEvent(frame_event), 发送循环因此可以在"有新帧"
+    // 时立刻醒, 而不是靠固定节拍轮询。刻意**不复用** wake_event: 那个还被 stop()、
+    // 重连等待、连接状态回调用来"打断", 混用会让发送循环分不清是哪种唤醒。
+    HANDLE frame_event = nullptr;
     HANDLE startup_event = nullptr;
 
     // start() 与工作线程之间的激活结果握手
@@ -535,7 +540,9 @@ bool BleWinRtTransport::start() {
     st->scan_event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);      // 自动复位
     st->wake_event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);      // 自动复位
     st->startup_event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);   // 自动复位
-    if (st->scan_event == nullptr || st->wake_event == nullptr || st->startup_event == nullptr) {
+    st->frame_event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);     // 自动复位(T26)
+    if (st->scan_event == nullptr || st->wake_event == nullptr ||
+        st->startup_event == nullptr || st->frame_event == nullptr) {
         const std::string e = hresult_hex(HRESULT_FROM_WIN32(::GetLastError()));
         log_error("BLE: 创建事件对象失败 (HRESULT=%s)", e.c_str());
         return false;
@@ -593,6 +600,11 @@ void BleWinRtTransport::stop() {
 
 void BleWinRtTransport::submit(const Frame& f) {
     mailbox_.put(f, steady_now_ms());
+    // T26: 有新帧就叫醒发送线程。没有这一步, 发送节拍只能靠固定定时器,
+    // 与管线的提交相位无关 —— 两边时钟长期不同步时会周期性多出"白等"。
+    if (shared_ != nullptr && shared_->frame_event != nullptr) {
+        ::SetEvent(shared_->frame_event);
+    }
 }
 
 std::string BleWinRtTransport::status() const {
@@ -717,8 +729,19 @@ void BleWinRtTransport::worker_entry() {
             mailbox_.set_consumer_ready(true);
 
             // --- (f) 发送循环 ---
+            //
+            // T26: 节拍由"有新帧"驱动, 不再是固定定时器。
+            //   * 管线 submit() -> SetEvent(frame_event) -> 这里立刻醒;
+            //   * 距上次写入不足 0.6 帧就等够再发(否则一次抖动会连发两帧);
+            //   * 没有新帧就超时退化成"重发上一帧"(看门狗触发后是静默帧),
+            //     保证设备一直收得到 B0 —— B0 一帧只覆盖 4x25 ms, 断供就断刺激。
+            //   超时值取 frame_ms*3/2: 允许相位漂移, 又不至于让设备出现空档;
+            //   一旦取到的是看门狗静默帧, 说明管线确实停了, 之后按 frame_ms 重发。
             {
-                auto next_deadline = std::chrono::steady_clock::now() + frame_dur;
+                auto last_write = std::chrono::steady_clock::now() - frame_dur;
+                const auto min_gap = std::chrono::milliseconds(
+                    static_cast<long long>(frame_ms_cfg) * 6 / 10);
+                DWORD wait_budget_ms = static_cast<DWORD>(frame_ms_cfg * 3 / 2);
 
                 while (running_.load(std::memory_order_acquire)) {
                     if (shared_->link_down.load(std::memory_order_acquire)) {
@@ -726,10 +749,24 @@ void BleWinRtTransport::worker_entry() {
                         break;
                     }
 
+                    // 等"有新帧"或"该重发旧帧了"。wake_event 只负责把我们踢回
+                    // 循环开头重新检查 running_ / link_down, 不直接发帧。
+                    {
+                        HANDLE waiters[2] = {shared_->frame_event, shared_->wake_event};
+                        const DWORD wr =
+                            ::WaitForMultipleObjects(2, waiters, FALSE, wait_budget_ms);
+                        if (wr == WAIT_OBJECT_0 + 1) continue;   // wake_event
+                        // WAIT_OBJECT_0(frame_event) 或 WAIT_TIMEOUT 都要往下走:
+                        // 后者是"没有新帧", 靠重发旧帧维持设备的节拍。
+                    }
+
                     // 取最新一帧。从没提交过、或管线超过 watchdog_ms 没提交,
                     // 信箱内部会自动给静默帧 —— 所以这里拿到的永远是可以安全
                     // 下发的帧, 不需要在这里判空。
                     const MailboxTake tk = mailbox_.take(steady_now_ms(), cfg_.watchdog_ms);
+                    // 看门狗已经在发静默帧: 之后按 frame_ms 重发, 别留 50 ms 空档。
+                    wait_budget_ms = tk.stale ? static_cast<DWORD>(frame_ms_cfg)
+                                              : static_cast<DWORD>(frame_ms_cfg * 3 / 2);
                     const Frame& f = tk.frame;
 
                     const int want_a = clamp_strength(f.a.strength);
@@ -839,6 +876,17 @@ void BleWinRtTransport::worker_entry() {
                         log_info("BLE: 首帧强度 B0 原始字节 = %s", cmd.to_hex().c_str());
                     }
 
+                    // 最小写入间隔: 被 frame_event 连续唤醒时(例如管线一次补两帧)
+                    // 不要挤成一串, 设备按 100 ms 窗口消费, 连发没有意义。
+                    {
+                        const auto since = std::chrono::steady_clock::now() - last_write;
+                        if (since < min_gap) {
+                            const auto remain =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(min_gap - since);
+                            if (remain.count() > 0) wait_ms(static_cast<DWORD>(remain.count()));
+                        }
+                    }
+
                     const DWORD write_timeout = static_cast<DWORD>(frame_ms_cfg * 2);
                     const HRESULT hr = write_bytes(cmd.bytes, static_cast<uint32_t>(kB0Size), write_timeout);
                     if (FAILED(hr)) {
@@ -855,15 +903,7 @@ void BleWinRtTransport::worker_entry() {
                         ++writes_;
                     }
 
-                    next_deadline += frame_dur;
-                    const auto now = std::chrono::steady_clock::now();
-                    if (next_deadline > now) {
-                        auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(next_deadline - now);
-                        wait_ms(static_cast<DWORD>(remain.count()));
-                    } else {
-                        // 落后太多就重新对表, 免得追赶式连发
-                        next_deadline = now + frame_dur;
-                    }
+                    last_write = std::chrono::steady_clock::now();
                 }
             }
 
