@@ -467,6 +467,81 @@ void test_ffb_gap_stats() {
 }
 
 // ---------------------------------------------------------------------------
+// 10b. [ffbhold]: 非零值保持了多久 (T22a)
+//
+// 这份统计的唯一用途是"给保持超时定默认值", 所以它必须能正确回答两个问题:
+//   1) 非零值保持不变时, 这段时长有没有被记下来(包括最后降到 0 的那一段);
+//   2) 长保持具体发生在什么值上 —— 1 和 19 是两回事, 超时设小了会砍掉真手感。
+// 分档边界与 max/open 的语义逐条钉住, 因为默认值就是照这几档读出来的。
+// ---------------------------------------------------------------------------
+void test_hold_stats() {
+    group("[ffbhold]: 非零值保持了多久");
+
+    HoldStats h;
+    h.on_update(10.0, 5);              // 第一个样本, 没有"上一个值"
+    check_eq(static_cast<int>(h.total()), 0, "第一个样本不计保持");
+
+    h.on_update(10.3, 5);              // 值 5 保持了 0.3 s
+    check_eq(static_cast<int>(h.n_lt_05), 1, "0.3 s 进 <0.5 档");
+
+    h.on_update(11.8, 0);              // 值 5 保持了 1.5 s, 这次降到了 0
+    check_eq(static_cast<int>(h.n_1_2), 1, "1.5 s 进 1-2 档 (降到 0 也要记)");
+    check(h.max_hold > 1.49 && h.max_hold < 1.51, "max_hold 记下 1.5 s");
+    check_eq(static_cast<int>(h.max_val), 5, "max_val 记下那一次的值 5");
+
+    h.on_update(20.0, 0);              // 上一个值是 0: 不记
+    check_eq(static_cast<int>(h.total()), 2, "0 值保持不计数");
+
+    h.on_update(20.0, 7);              // 0 -> 非零: 起点, 不记
+    check_eq(static_cast<int>(h.total()), 2, "0 -> 非零是起点, 不计保持");
+
+    // 分档边界: 1.0 / 2.0 / 3.0 / 5.0
+    h.on_update(21.0, 7);              // 1.0 -> 1-2
+    h.on_update(23.0, 7);              // 2.0 -> 2-3
+    h.on_update(26.0, 7);              // 3.0 -> 3-5
+    h.on_update(31.0, 7);              // 5.0 -> >5
+    check_eq(static_cast<int>(h.n_1_2), 2, "边界 1.0 s 进 1-2 档");
+    check_eq(static_cast<int>(h.n_2_3), 1, "边界 2.0 s 进 2-3 档");
+    check_eq(static_cast<int>(h.n_3_5), 1, "边界 3.0 s 进 3-5 档");
+    check_eq(static_cast<int>(h.n_gt_5), 1, "边界 5.0 s 进 >5 档");
+
+    // open: 当前这个非零值已经保持了多久
+    check(h.open_seconds(34.0) > 2.9 && h.open_seconds(34.0) < 3.1,
+          "open 从最后一次回调算起 (3.0 s)");
+    check(h.open_seconds(30.0) == 0.0, "早于最后一次回调的时间不给负 open");
+
+    HoldStats z;
+    z.on_update(1.0, 0);
+    check(z.open_seconds(50.0) == 0.0, "当前值是 0 时 open 恒为 0");
+
+    // 明细: 只留 >=1 s, 且最多 10 条, 超出的计 suppressed
+    HoldStats d;
+    d.on_update(0.0, 9);
+    for (int i = 1; i <= 12; ++i) d.on_update(i * 2.0, 9);   // 每次 2.0 s
+    check_eq(d.long_n, 10, "明细最多 10 条");
+    check_eq(static_cast<int>(d.suppressed), 2, "超出的 2 条计 suppressed");
+    check(d.longs[0].value == 9 && d.longs[0].held > 1.99 && d.longs[0].held < 2.01,
+          "明细记下值与时长");
+    d.on_update(100.0, 0);                                     // 0.5 s 的保持
+    check_eq(d.long_n, 10, "<1 s 的保持不进明细");
+
+    // reset_counts 只清计数, 保留"上一次回调的时刻" —— 跨 60 s 窗口的长保持不能丢
+    HoldStats w;
+    w.on_update(400.0, 19);
+    w.reset_counts();
+    check(w.value() == 19, "reset_counts 保留当前值");
+    check(w.open_seconds(403.0) > 2.9 && w.open_seconds(403.0) < 3.1,
+          "reset_counts 之后 open 继续累积");
+    w.on_update(406.0, 0);                                    // 19 保持了 6.0 s
+    check_eq(static_cast<int>(w.n_gt_5), 1, "跨窗口的 6.0 s 完整落进 >5 档");
+    check(w.long_n == 1 && w.longs[0].value == 19, "跨窗口的明细也在");
+
+    w.reset();
+    check_eq(static_cast<int>(w.total()), 0, "reset 清空计数");
+    check(w.long_n == 0 && w.open_seconds(500.0) == 0.0, "reset 也清明细与 open");
+}
+
+// ---------------------------------------------------------------------------
 // 10. 已知风险源判定 (T11b)
 //
 // 这个函数决定配置加载时要不要打"viscosity 不推荐作为输出源"的告警。名单写错
@@ -663,6 +738,7 @@ int main() {
     test_pipeline_warmup();
     test_ffb_gap_stats();
     test_held_risk_source();
+    test_hold_stats();
     test_effective_watchdog_ms();
     test_effective_frame_ms();
     test_viscosity_hold();
