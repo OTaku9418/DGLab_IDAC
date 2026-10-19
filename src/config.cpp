@@ -238,16 +238,37 @@ int effective_frame_ms(int requested_ms, LinkMode link) {
 }
 
 int effective_viscosity_hold_ms(int requested_ms) {
+    // viscosity 的实测间隔几乎全 <0.5 s, 所以它能承受更严的上限; 用同一个
+    // 通用折算函数, 只是把上限传成 10000。
+    return effective_source_hold_ms(requested_ms, "viscosity_hold_ms", 10000);
+}
+
+int effective_source_hold_ms(int requested_ms, const char* key_name, int hi_ms) {
     // 0 是唯一表示"关闭"的值 —— 这是用户可选的取舍(有人就想要停住的阻尼),
     // 所以不把它当成"配错"抬到下限。
     if (requested_ms == 0) return 0;
     if (requested_ms < 500) {
-        log_warn("[safety] viscosity_hold_ms(%d) < 500, 会把正常行驶中的短暂间隙误判为停更, 已抬到 500",
-                 requested_ms);
+        log_warn("[safety] %s(%d) < 500, 会把正常行驶中的短暂间隙误判为停更, 已抬到 500",
+                 key_name, requested_ms);
         return 500;
     }
+    if (requested_ms > hi_ms) {
+        log_warn("[safety] %s(%d) > %d, 残值会先被感知到才归零, 已降到 %d",
+                 key_name, requested_ms, hi_ms, hi_ms);
+        return hi_ms;
+    }
+    return requested_ms;
+}
+
+int effective_silent_mute_ms(int requested_ms) {
+    if (requested_ms == 0) return 0;   // 关闭
+    if (requested_ms < 200) {
+        log_warn("[safety] silent_mute_ms(%d) < 200, 会被帧节拍抖动误触发, 已抬到 200",
+                 requested_ms);
+        return 200;
+    }
     if (requested_ms > 10000) {
-        log_warn("[safety] viscosity_hold_ms(%d) > 10000, 残值会先被感知到才归零, 已降到 10000",
+        log_warn("[safety] silent_mute_ms(%d) > 10000, 超过它就等于退化成单源超时, 已降到 10000",
                  requested_ms);
         return 10000;
     }
@@ -412,6 +433,12 @@ Config load_config(const std::string& ini_path) {
     cfg.warmup_ms           = read_int(ini_path, "safety", "warmup_ms", cfg.warmup_ms);
     cfg.viscosity_hold_ms   = read_int(ini_path, "safety", "viscosity_hold_ms",
                                         cfg.viscosity_hold_ms);
+    cfg.torque_hold_ms      = read_int(ini_path, "safety", "torque_hold_ms",
+                                        cfg.torque_hold_ms);
+    cfg.vibration_hold_ms   = read_int(ini_path, "safety", "vibration_hold_ms",
+                                        cfg.vibration_hold_ms);
+    cfg.silent_mute_ms      = read_int(ini_path, "safety", "silent_mute_ms",
+                                        cfg.silent_mute_ms);
     const bool has_dry_run_key = has_key(ini_path, "safety", "dry_run");
     cfg.dry_run             = read_bool(ini_path, "safety", "dry_run", cfg.dry_run);
     // dry_run 缺键必须说清楚: 它是"要不要真的通电"的总开关, 静默取默认值
@@ -453,6 +480,13 @@ Config load_config(const std::string& ini_path) {
     cfg.watchdog_ms = effective_watchdog_ms(cfg.watchdog_ms, cfg.frame_ms);
     // T17: 0 = 关闭, 其他值钳到 500..10000(理由见 config.hpp 里那个字段)。
     cfg.viscosity_hold_ms = effective_viscosity_hold_ms(cfg.viscosity_hold_ms);
+    // T22b: torque/vibration 的上限放宽到 20000 —— 实测正常驾驶中 torque 的
+    // 真实保持能到 7 s, 上限 10 s 会逼着用户把保护关掉。
+    cfg.torque_hold_ms    = effective_source_hold_ms(cfg.torque_hold_ms,
+                                                     "torque_hold_ms", 20000);
+    cfg.vibration_hold_ms = effective_source_hold_ms(cfg.vibration_hold_ms,
+                                                     "vibration_hold_ms", 20000);
+    cfg.silent_mute_ms    = effective_silent_mute_ms(cfg.silent_mute_ms);
     // 自动增益: floor 不能超过 ceiling, 否则归一化区间是负的, 会整体归零。
     clamp_int(cfg.gain_floor, 1, 200, "[output] gain_floor");
     clamp_int(cfg.gain_ceiling, 1, 200, "[output] gain_ceiling");
@@ -644,6 +678,15 @@ bool write_default_config(const std::string& ini_path) {
     // viscosity_hold_ms: viscosity 源停更多久就按 0 处理(T17)。0 = 关闭。
     // 副作用: 发车倒计时等原地不动的时段也会被归零 —— 这是它的工作原理, 不是 bug。
     w("safety", "viscosity_hold_ms", "2000");
+    // torque_hold_ms / vibration_hold_ms: 单个源停更多久就按 0 处理(T22b)。
+    // 默认 10 s 而不是 2 s: 实测正常驾驶中"方向盘稳住"会让 torque 停 3~7 s,
+    // 2 s 会在真实过弯里砍掉手感。0 = 关闭。
+    w("safety", "torque_hold_ms", "10000");
+    w("safety", "vibration_hold_ms", "10000");
+    // silent_mute_ms: 三个源"同时"停更超过这个毫秒数, 所有通道的原始值都按 0
+    // 处理(T22b 一级)。它抓的是"游戏不再喂任何力反馈"(退出比赛/匹配打断计时赛),
+    // 实测这类齐停最短 48 s, 所以 1 s 足够快且不会误伤。0 = 关闭。
+    w("safety", "silent_mute_ms", "1000");
     // dry_run=1 是硬开关: 不管 [link] mode 写什么, 一律走空输出, 绝不碰设备。
     // 想真实输出必须显式改成 0 —— 别把"干跑"和"接真机"混在一次改动里。
     w("safety", "dry_run", "1");

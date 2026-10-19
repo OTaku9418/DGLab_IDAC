@@ -107,6 +107,11 @@ Config make_test_config() {
     c.warmup_ms = 0;          // 预热会掩盖其他逻辑, 单独测
     c.auto_gain = false;      // 关掉动态增益, 让映射结果可预测
     c.zero_when_servo_off = true;
+    // T22b: 单测一次只验一个机制, 所以这里把"保持超时"两级都关掉; 要测它们
+    // 的用例自己打开。默认值本身由 T23 的"默认值与模板不漂移"用例钉住。
+    c.torque_hold_ms = 0;
+    c.vibration_hold_ms = 0;
+    c.silent_mute_ms = 0;
 
     c.channel_a.enable = true;
     c.channel_a.source = "torque";
@@ -711,7 +716,8 @@ void test_viscosity_hold() {
     for (int i = 0; i <= 100; ++i) {
         p_vib.tick(1.0 + static_cast<double>(i) * 0.1, v, out);
     }
-    check(out.b.slots[0].pulse_intensity > 0, "vibration 源不做保持超时判定");
+    check(out.b.slots[0].pulse_intensity > 0,
+          "vibration 源在 vibration_hold_ms=0 时不判定(要测它自己的阈值见 T22b 用例)");
 
     // 纯函数折算: 0 关闭, 其余钳到 500..10000
     check_eq(effective_viscosity_hold_ms(0), 0, "0 = 关闭, 原样");
@@ -720,6 +726,177 @@ void test_viscosity_hold() {
     check_eq(effective_viscosity_hold_ms(10000), 10000, "恰好 10000 不动");
     check_eq(effective_viscosity_hold_ms(100), 500, "<500 抬到 500");
     check_eq(effective_viscosity_hold_ms(50000), 10000, ">10000 降到 10000");
+}
+
+// ---------------------------------------------------------------------------
+// 12b. T22b: torque / vibration 的单源保持超时(二级)
+//
+// 这一级唯一的作用是"某个源彻底不更新时兜底", 所以阈值必须大于实测的真实
+// 保持(torque 最长 7.0 s), 默认 10 s。用例同时钉住"只作用于原始值, 强度字节
+// 不动"和"源一更新立刻恢复(不做渐变)"。
+// ---------------------------------------------------------------------------
+void test_source_hold() {
+    group("[T22b] torque/vibration 保持超时");
+
+    Config cfg = make_test_config();
+    cfg.channel_b.enable = false;      // 只测 A; B 的判定由下面的齐停用例覆盖
+    cfg.torque_hold_ms = 2000;
+
+    Pipeline p(cfg);
+    FfbState ffb = make_ffb();
+    ffb.torque_at = 1.0;
+    Frame out;
+    int p19 = -1, p21 = -1, strength_21 = -1;
+    for (int i = 0; i <= 21; ++i) {
+        const double now = 1.0 + static_cast<double>(i) * 0.1;
+        p.tick(now, ffb, out);
+        if (i == 0) check(out.a.slots[0].pulse_intensity > 0, "刚更新过 => A 有脉冲");
+        if (i == 19) p19 = out.a.slots[0].pulse_intensity;
+        if (i == 21) {
+            p21 = out.a.slots[0].pulse_intensity;
+            strength_21 = out.a.strength;
+        }
+    }
+    check(p19 > 0, "停更 1.9 s < 2000 ms => 仍然输出");
+    check_eq(p21, 0, "停更 2.1 s > 2000 ms => 脉冲归零");
+    check_eq(strength_21, 15, "强度字节不动(只作用于原始值)");
+
+    ffb.torque_at = 2.2;
+    p.tick(2.2, ffb, out);
+    check(out.a.slots[0].pulse_intensity > 0, "源一更新 => 下一帧就恢复");
+
+    // vibration 走自己的阈值(默认配置里 B 就是用它的)
+    Config vcfg = make_test_config();
+    vcfg.channel_b.enable = false;
+    vcfg.channel_a.source = "vibration";
+    vcfg.vibration_hold_ms = 2000;     // 实测 vibration 源读 b 参数
+    Pipeline pv(vcfg);
+    FfbState v = make_ffb();
+    v.vibration_b = 40;
+    v.vibration_at = 1.0;
+    int v19 = -1, v21 = -1;
+    for (int i = 0; i <= 21; ++i) {
+        const double now = 1.0 + static_cast<double>(i) * 0.1;
+        pv.tick(now, v, out);
+        if (i == 19) v19 = out.a.slots[0].pulse_intensity;
+        if (i == 21) v21 = out.a.slots[0].pulse_intensity;
+    }
+    check(v19 > 0, "vibration 停更 1.9 s => 仍输出");
+    check_eq(v21, 0, "vibration 停更 2.1 s => 归零");
+
+    // 0 = 关闭
+    Config off = cfg;
+    off.torque_hold_ms = 0;
+    Pipeline po(off);
+    FfbState stale = ffb;
+    stale.torque_at = 1.0;
+    for (int i = 0; i <= 100; ++i) {
+        po.tick(1.0 + static_cast<double>(i) * 0.1, stale, out);
+    }
+    check(out.a.slots[0].pulse_intensity > 0, "torque_hold_ms=0 => 不判定");
+
+    // 单源超时只影响用这个源的通道: B 用 constant 模式, 不受 A 的 torque 超时影响
+    Config mix = cfg;
+    mix.channel_b.enable = true;
+    mix.channel_b.mode = MapMode::Constant;
+    mix.channel_b.level = 1.0;
+    mix.channel_b.source = "viscosity";
+    mix.viscosity_hold_ms = 0;         // 让 B 的源不受二级影响
+    Pipeline pm(mix);
+    FfbState m = make_ffb();
+    m.torque_at = 1.0;
+    for (int i = 0; i <= 25; ++i) {
+        pm.tick(1.0 + static_cast<double>(i) * 0.1, m, out);
+    }
+    check_eq(out.a.slots[0].pulse_intensity, 0, "A 的 torque 停更 2.5 s => 归零");
+    check_eq(out.b.slots[0].pulse_intensity, 100, "B 不受影响(仍满脉冲)");
+
+    // 纯函数折算: 上限由调用方给
+    check_eq(effective_source_hold_ms(0, "torque_hold_ms", 20000), 0, "0 = 关闭, 原样");
+    check_eq(effective_source_hold_ms(10000, "torque_hold_ms", 20000), 10000,
+             "默认值不被改动");
+    check_eq(effective_source_hold_ms(15000, "vibration_hold_ms", 20000), 15000,
+             "20000 上限内不动");
+    check_eq(effective_source_hold_ms(30000, "torque_hold_ms", 20000), 20000,
+             "超上限降到 20000");
+    check_eq(effective_source_hold_ms(100, "torque_hold_ms", 20000), 500, "<500 抬到 500");
+}
+
+// ---------------------------------------------------------------------------
+// 12c. T22b: 全源静默(一级)
+//
+// 这一级的判据是"三个源同时停更", 抓的是"游戏不再喂任何力反馈数据"(退出比赛、
+// 对战匹配打断计时赛)。实测这种齐停最短 48 s, 正常驾驶中 0 次, 所以 1 s 阈值
+// 不会误伤; 而只要有一个源还在动, 就必须解除 —— 否则真实过弯(粘度每秒更新、
+// torque 稳住 7 s)会被误判。
+// ---------------------------------------------------------------------------
+void test_all_sources_silent() {
+    group("[T22b] 全源静默(一级)");
+
+    Config cfg = make_test_config();
+    cfg.silent_mute_ms = 1000;
+    Pipeline p(cfg);                    // A=torque, B=viscosity
+    FfbState ffb = make_ffb();
+    ffb.torque_at = 1.0;
+    ffb.viscosity_at = 1.0;
+    ffb.vibration_at = 0.0;             // 整局没调过 vibration: 不该拖住判定
+    Frame out;
+
+    p.tick(1.9, ffb, out);
+    check(out.a.slots[0].pulse_intensity > 0 && out.b.slots[0].pulse_intensity > 0,
+          "齐停 0.9 s < 1000 ms => 两路都还输出");
+
+    p.tick(2.1, ffb, out);
+    check_eq(out.a.slots[0].pulse_intensity, 0, "齐停 1.1 s => A 脉冲归零");
+    check_eq(out.b.slots[0].pulse_intensity, 0, "齐停 1.1 s => B 脉冲归零");
+    check(out.a.strength > 0 && out.b.strength > 0, "强度字节不变(只作用于原始值)");
+
+    // 只有粘度恢复: 一级立刻解除, 而 torque 才停 1.2 s(远不到二级的 10 s)
+    ffb.viscosity_at = 2.2;
+    p.tick(2.2, ffb, out);
+    check(out.a.slots[0].pulse_intensity > 0, "只要有一个源活着 => 一级解除");
+    check(out.b.slots[0].pulse_intensity > 0, "恢复的那个通道也回来");
+
+    // 恒定输出(map_mode=constant)也受一级影响 —— 齐停时没有任何通道该继续输出
+    Config c2 = cfg;
+    c2.channel_b.source = "viscosity";
+    c2.channel_b.mode = MapMode::Constant;
+    c2.channel_b.level = 1.0;
+    Pipeline pc(c2);
+    FfbState g = make_ffb();
+    g.torque_at = 1.0;
+    g.viscosity_at = 1.0;
+    pc.tick(1.9, g, out);
+    check_eq(out.b.slots[0].pulse_intensity, 100, "Constant 模式平时是满脉冲");
+    pc.tick(2.1, g, out);
+    check_eq(out.b.slots[0].pulse_intensity, 0, "全源静默 => Constant 通道也静音");
+
+    // 0 = 关闭
+    Config off = cfg;
+    off.silent_mute_ms = 0;
+    Pipeline po(off);
+    FfbState s = make_ffb();
+    s.torque_at = 1.0;
+    s.viscosity_at = 1.0;
+    for (int i = 0; i <= 30; ++i) {
+        po.tick(1.0 + static_cast<double>(i) * 0.1, s, out);
+    }
+    check(out.a.slots[0].pulse_intensity > 0, "silent_mute_ms=0 => 不判齐停");
+
+    // 一个样本都没有时这一级不判定(交给 evaluate_safety 的 no_ffb_data_yet)
+    Config early = cfg;
+    Pipeline pe(early);
+    FfbState none;                       // 所有 *_at 都是 0
+    none.servo_on = true;
+    none.ever_updated = false;
+    pe.tick(100.0, none, out);
+    check_eq(out.a.strength, 0, "没有样本时由 no_ffb_data_yet 静音, 不是这一级");
+
+    // 纯函数折算: 0 关闭, 其余钳到 200..10000
+    check_eq(effective_silent_mute_ms(0), 0, "0 = 关闭, 原样");
+    check_eq(effective_silent_mute_ms(1000), 1000, "默认值不被改动");
+    check_eq(effective_silent_mute_ms(100), 200, "<200 抬到 200");
+    check_eq(effective_silent_mute_ms(20000), 10000, ">10000 降到 10000");
 }
 
 }  // namespace
@@ -742,6 +919,8 @@ int main() {
     test_effective_watchdog_ms();
     test_effective_frame_ms();
     test_viscosity_hold();
+    test_source_hold();
+    test_all_sources_silent();
     test_mailbox_consumer_ready();
 
     std::printf("\n-------------------------------------------\n");

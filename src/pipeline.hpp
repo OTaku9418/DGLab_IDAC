@@ -119,10 +119,18 @@ private:
     bool evaluate_safety(double now, const FfbState& ffb, const char*& reason);
     int  clamp_strength(int want) const;
 
-    // T17: 该通道的 viscosity 源是否"保持超时"(超过 viscosity_hold_ms 没有新回调)。
-    // held_ms_out 返回当前已经停更了多久, 供进入/退出时那条日志用。
-    bool viscosity_hold_expired(const ChannelMapping& m, const FfbState& ffb, double now,
-                                double* held_ms_out) const;
+    // T22b: 该通道的源是否"保持超时"(超过它自己的 *_hold_ms 没有新回调)。
+    // held_ms_out 返回当前已经停更了多久; why_out 返回源名(字面量), 供日志用。
+    // 只有 torque/torque_signed、viscosity/viscosity_a、vibration/vibration_a
+    // 三类源参与判定; servo / const / map_mode=constant 永不超时。
+    bool source_hold_expired(const ChannelMapping& m, const FfbState& ffb, double now,
+                             double* held_ms_out, const char** why_out,
+                             int* limit_ms_out) const;
+
+    // T22b 一级: 三个源是否"同时"停更超过 silent_mute_ms。
+    // 这是"游戏不再喂任何力反馈数据"的判定 —— 与单源超时是两件事: 前者一秒
+    // 内生效, 后者只是兜底。held_ms_out 返回最近一次回调距今多久。
+    bool all_sources_silent(const FfbState& ffb, double now, double* held_ms_out) const;
 
     // 本帧该用的归一化上界: auto_gain 关闭时就是 m.in_max
     double effective_in_max(const ChannelMapping& m, const FfbState& ffb) const;
@@ -152,7 +160,7 @@ private:
     bool   started_          = false;
     bool   last_muted_       = false;
 
-    // T17: viscosity 保持超时的边沿状态(只用来决定"进入/退出时各打一条日志")
+    // T17/T22b: 保持超时(含全源静默)的边沿状态, 只用来决定"进入/退出时各打一条日志"
     bool   hold_zero_a_      = false;
     bool   hold_zero_b_      = false;
 

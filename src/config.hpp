@@ -168,6 +168,23 @@ struct Config {
     //   实测 viscosity 在驾驶时间隔几乎全 <0.5 s)。
     // 只影响 source=viscosity / viscosity_a 的通道, 另一通道不受影响。
     int         viscosity_hold_ms   = 2000;
+    // T22b: torque / vibration 源的保持超时(毫秒)。0 = 关闭。
+    //
+    // ★ 默认 10000, 不是 2000 ★
+    // 2026-10-18 那局(100 分钟、5,667 条心跳)里, "方向盘稳住不动"会让 torque
+    // 的回调停 3~7 秒(实测最长 7.0 s), 期间粘度仍在每秒更新 —— 说明车在动、
+    // 这次保持是真实的。2 s 的超时会在这种真实过弯里把力砍掉(约每 1.4 分钟
+    // 一次), 所以把单源超时放到 10 s, 只用来兜"源彻底不更新"的底。
+    int         torque_hold_ms      = 10000;
+    int         vibration_hold_ms   = 10000;
+    // T22b 一级: 三个源"同时"停更超过这么多毫秒, 就把所有已启用通道的原始值
+    // 按 0 处理。0 = 关闭。
+    //
+    // 为什么需要它: *_hold_ms 是"单个源"的兜底, 对"游戏不再喂任何力反馈"这类
+    // 场景反应太慢。而"三源齐停"是个干净的信号 —— 同一局里它只出现 22 次,
+    // 最短 48 s, 正常驾驶中一次都没有。用 1 s 就能把"匹配成功打断计时赛"这类
+    // 场景在一秒内压到 0, 且不会误伤任何真实保持。
+    int         silent_mute_ms      = 1000;
     // 启动后前 N 毫秒强制输出 0, 让用户有时间确认连接
     int         warmup_ms           = 1500;
     // 全局总开关: 设为 false 时只记日志不发数据(干跑模式)
@@ -204,6 +221,20 @@ int effective_frame_ms(int requested_ms, LinkMode link);
 // viscosity 在正常驾驶时间隔几乎全 <0.5 s, 再小会把正常抖动当成"停更";
 // 上限 10 s 的理由是超过它以后残值已经被感知到很久了, 等于没做保护。
 int effective_viscosity_hold_ms(int requested_ms);
+
+// T22b: 单源保持超时的折算(纯函数, 会打 WARN)。
+//
+// 0 = 关闭; 其他值钳到 [500, hi_ms]。下限 500 ms 的理由与 viscosity 那条相同;
+// 上限由调用方给(torque/vibration 20000, viscosity 10000), 因为这两类源的
+// 正常保持长度差了一个数量级(实测 torque 最长 7.0 s, viscosity 几乎全 <0.5 s)。
+int effective_source_hold_ms(int requested_ms, const char* key_name, int hi_ms);
+
+// T22b 一级: 全源静默阈值的折算(纯函数, 会打 WARN)。
+//
+// 0 = 关闭; 其他值钳到 [200, 10000]。下限 200 ms 是"再小就会被自定义帧节拍
+// 抖动误触发"的保守值(实测齐停最短 48 s, 离得极远); 上限 10 s 的理由是
+// 超过它就等于退化成单源超时, 这一级存在与否没有区别。
+int effective_silent_mute_ms(int requested_ms);
 
 // 把 INI 里写的 watchdog_ms 折算成"实际生效值"(纯函数, 但会打 WARN)。
 //
