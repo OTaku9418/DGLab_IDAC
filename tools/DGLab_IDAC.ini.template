@@ -51,10 +51,16 @@ connect_timeout_ms=15000
 ;   ★ BLE 直连时这个值固定 100, 填别的会打一条 WARN 并按 100 处理 ★
 ;   原因: 一帧正好覆盖 4x25ms, 设备也按 100ms 的窗口回执; 改它不会让设备变快,
 ;   只会让管线的提交节拍与设备的消费节拍错位。
-; pulse_freq_base : 脉冲频率基准值。数值 10~240。
-;   注意语义是反的: 数值越大 = 单元时长越长 = 电气频率越低 = 手感越"敦实"。
-; pulse_freq_min / pulse_freq_max : 上面那个值允许的浮动范围。数值 10~240。
-;   想调"实/麻"就改这两个; 想调"强弱"改各通道的 base_strength。
+; 脉冲频率(Pulse frequency value)的语义是反的: 数值越大 = 单元时长越长 =
+;   电气频率越低 = 手感越"敦实"。
+; pulse_freq_base : 保留键, **当前程序不使用**(只读进 Config, 不参与计算)。
+;   写 30 只是为了和旧配置保持兼容。
+; pulse_freq_min : 实际使用的频率值。数值 10~240。
+;   pulse_freq_track 默认 0 => 频率恒定等于 pulse_freq_min, 与信号无关。
+; pulse_freq_max : 只有当 pulse_freq_track > 0 时才起作用(信号越大越靠向它)。
+;   这个键不在本模板里出现, 需要时自己加一行 pulse_freq_track=0.0~1.0。
+; 想调"实/麻"改 pulse_freq_min(必要时加 pulse_freq_track); 想调"强弱"改各通道的
+;   base_strength 与 level, 与频率无关。
 frame_ms=100
 pulse_freq_base=30
 pulse_freq_min=10
@@ -86,7 +92,10 @@ gain_idle_reset_sec=3.0
 ;             可感的值上; 这个回调只在值变化时触发, 停住的值会一直输出, 直到下一次变化。
 ;   vibration 振动/路肩, 只在压路肩/碰撞等判定发生时给一次 —— 实测约 160 次/轮,
 ;             属于"事件型"手感, 大部分时间是安静的
-;   static    恒定输出, 不看游戏数据
+;   servo     游戏伺服的开关状态(0 或 1), 调试用
+;   const     恒为 0(没有实际输出) —— 调试用
+; 想要"恒定输出、不看游戏数据", **不是**把 source 写成 static(那会被当成未知
+;   源, 输出恒为 0); 正确做法是把 map_mode 写成 constant, 此时输出等于 level。
 ; 另有 torque_signed: 试图按 torque 的 direction 参数恢复符号。**当前不要用** ——
 ;   逆向证实那个参数不是"左右", 而是齿轮/档位索引(域 0..255); 它取 -1 只表示
 ;   "算出的扭矩为正", 其余情况装的是档位值。用它恢复符号得不到方向。
@@ -97,11 +106,15 @@ gain_idle_reset_sec=3.0
 [channel_a]
 ; enable : 1=本通道输出, 0=本通道完全不输出。数值 0 或 1。
 ; source : 见上面的可选值表。数值是字符串。
-; map_mode : 原始值怎么变成 0~1。数值是字符串:
-;            abs_linear 取绝对值后线性映射(左右转向都输出) ← 推荐
-;            linear     保留符号线性映射(反向会变成 0)
-;            abs_sqrt   开方映射, 小信号被抬高(轻手感更明显)
-;            sqrt       带符号的开方映射
+; map_mode : 原始值怎么变成 0~1。数值是字符串, 只认下面这几个(别的一律打 WARN
+;            后按 abs_linear 处理):
+;            abs_linear 取绝对值后线性映射(左右转向都输出) ← 推荐; abslinear 同义
+;            linear     保留符号线性映射(负值先被钳到 0, 所以反向=不输出)
+;            sqrt       开方, 小信号被抬高(轻手感更明显); 负值同样先钳到 0
+;            square     平方, 小信号被压低(手感更"沉")
+;            threshold  低于 in_min 直接归零, 之上按 level 线性
+;            constant   忽略 source 与游戏数据, 输出恒为 level
+;            注意: 没有 abs_sqrt 这个值(历史上文档写错过, 程序从来不认)。
 ; in_min : 映射下界, 即"原始值多少对应输出 0"。数值 0~200 的整数。
 ; in_max : 映射上界的静态值, 即"原始值多少算满"。数值 1~200 的整数。
 ;          注意 auto_gain=1 时它只在启动瞬间当初始上界, 之后由增益包络接管。

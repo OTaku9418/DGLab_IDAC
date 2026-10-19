@@ -277,6 +277,10 @@ bool is_held_risk_source(const std::string& src);
 enum class HoldSource { None, Torque, Viscosity, Vibration };
 
 HoldSource hold_source_of(const std::string& src);
+
+// T24: source 名字的允许列表(大小写不敏感)。写错名字不会报错, 只会让该通道
+// "输出恒为 0", 所以加载时必须提醒一声。纯函数, 供 load_config 与离线自检共用。
+bool is_known_source(const std::string& src);
 // 该源在当前配置下的超时值(毫秒); None 返回 0。
 int hold_timeout_of(const Config& cfg, HoldSource s);
 

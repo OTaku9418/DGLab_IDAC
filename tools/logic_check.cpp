@@ -1173,6 +1173,32 @@ void test_default_drift() {
     std::remove(min_path.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// 12b. T24: source 名字的大小写与允许列表
+// ---------------------------------------------------------------------------
+void test_source_names() {
+    group("[T24] source 名字的大小写与允许列表");
+
+    check(is_known_source("torque"), "torque 认识");
+    check(is_known_source("Torque"), "Torque 大小写不敏感");
+    check(is_known_source("VISCOSITY"), "VISCOSITY 认识");
+    check(is_known_source("vibration_a"), "vibration_a 认识");
+    check(is_known_source("servo") && is_known_source("const"), "servo / const 认识");
+    check(!is_known_source("static"),
+          "static 不是 source(恒定输出要用 map_mode=constant)");
+    check(!is_known_source("abs_sqrt"), "abs_sqrt 不是 source");
+    check(!is_known_source(""), "空字符串不是已知源");
+
+    // 从 INI 读进来时统一转小写, 否则 "Torque" 会被当成未知源
+    const std::string p = absolute_path("dglab_src_case.ini");
+    check(write_text_file(p, "[channel_a]\nsource=Torque\nstrength_source=LEVEL\n"),
+          "大小写测试 INI 写出成功");
+    const Config c = load_config(p);
+    check(c.channel_a.source == "torque", "INI 里的 Torque 归一化成 torque");
+    check(c.channel_a.strength_source == "level", "strength_source 也归一化成小写");
+    std::remove(p.c_str());
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1195,6 +1221,7 @@ int main() {
     test_viscosity_hold();
     test_source_hold();
     test_all_sources_silent();
+    test_source_names();
     test_default_drift();
     test_mailbox_consumer_ready();
 

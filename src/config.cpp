@@ -112,6 +112,14 @@ bool ieq(const std::string& a, const char* b) {
     return i == a.size() && b[i] == '\0';
 }
 
+// 转小写(只处理 ASCII)。INI 里的枚举值是自造的 ASCII 字面量, 不用考虑 locale。
+std::string lower_ascii(std::string s) {
+    for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return s;
+}
+
 std::string read_str(const std::string& file, const char* section, const char* key,
                      const std::string& def) {
     char buf[1024]{};
@@ -165,15 +173,22 @@ MapMode parse_map_mode(const std::string& s, MapMode def) {
 void read_channel(const std::string& file, const char* section, ChannelMapping& c) {
     // 段名形如 [channel_a], 键名不带前缀
     c.enable        = read_bool(file, section, "enable", c.enable);
-    c.source        = read_str(file, section, "source", c.source);
+    // 统一转小写: 用户写 "Torque"/"VISCOSITY" 时不该被当成未知源。
+    c.source        = lower_ascii(read_str(file, section, "source", c.source));
     c.mode          = parse_map_mode(read_str(file, section, "map_mode", ""), c.mode);
     c.in_min        = read_int(file, section, "in_min", c.in_min);
     c.in_max        = read_int(file, section, "in_max", c.in_max);
     c.level         = read_double(file, section, "level", c.level);
     c.base_strength = read_int(file, section, "base_strength", c.base_strength);
-    c.strength_source = read_str(file, section, "strength_source", c.strength_source);
+    c.strength_source = lower_ascii(read_str(file, section, "strength_source",
+                                               c.strength_source));
     c.strength_margin = read_double(file, section, "strength_margin", c.strength_margin);
 
+    if (!is_known_source(c.source) && !c.source.empty()) {
+        log_warn("[%s] source=\"%s\" 不是已知的输入源 —— 输出会恒为 0; 可选值: "
+                 "torque / torque_signed / viscosity / viscosity_a / vibration / "
+                 "vibration_a / servo / const", section, c.source.c_str());
+    }
     if (c.strength_source != "static" && c.strength_source != "level") {
         log_warn("[%s] strength_source=\"%s\" 不是 static/level, 按 static 处理",
                  section, c.strength_source.c_str());
@@ -223,6 +238,16 @@ const char* to_string(MapMode m) {
 
 bool is_held_risk_source(const std::string& src) {
     return ieq(src, "viscosity") || ieq(src, "viscosity_a");
+}
+
+bool is_known_source(const std::string& src) {
+    static const char* const kSources[] = {"torque",     "torque_signed", "viscosity",
+                                           "viscosity_a", "vibration",    "vibration_a",
+                                           "servo",      "const"};
+    for (const char* s : kSources) {
+        if (ieq(src, s)) return true;
+    }
+    return false;
 }
 
 HoldSource hold_source_of(const std::string& src) {
@@ -681,11 +706,15 @@ bool write_default_config(const std::string& ini_path) {
     //             一个可感的值上; 这个回调只在值变化时触发, 停住的值会一直输出,
     //             直到下一次变化。
     //   vibration 振动/路肩, 只在事件发生时给一次
-    //   static    恒定输出, 不看游戏数据
+    //   servo     伺服开关状态(0/1), 调试用;  const 恒为 0, 调试用
+    // 想恒定输出**不能**写 source=static(那会被当成未知源, 输出恒为 0):
+    // 正确做法是 map_mode=constant, 此时输出等于 level。
     // 另有 torque_signed(按 direction 恢复符号): 逆向证实该参数是齿轮/档位索引
     // (域 0..255), 不是左右方向, 当前不要用 —— 见 re/indrun_hook_mechanics.md 4.1/5。
     // 建议 A 用 torque。
-    // 字段范围: enable 0/1; map_mode {abs_linear,linear,abs_sqrt,sqrt};
+    // 字段范围: enable 0/1;
+    // map_mode {abs_linear(=abslinear), linear, sqrt, square, threshold, constant}
+    //   (没有 abs_sqrt 这个值 —— 旧文档写错过, 程序从来不认);
     // in_min 0~200; in_max 1~200(auto_gain=1 时只当启动初值);
     // level 0.0~1.0; base_strength 0~200(再受 [safety] max_strength 钳制);
     // strength_source {static,level}; level 模式下 strength_margin 为 0.0~1.0。
