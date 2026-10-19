@@ -456,7 +456,8 @@ set_target_properties(abitest PROPERTIES
 # "不变"。这类错误只有逐位对着协议核对才能发现。
 #
 # 基准是官方文档的例子, 不是我们自己的实现 —— 详见 tools/protocol_check.cpp
-# 顶部。官方文档的逐字节副本在 re/reference/dglab-bluetooth-protocol/。
+# 顶部。官方文档按快照提交号引用, 链接与每份文件的 sha256 记在
+# re/reference/dglab-bluetooth-protocol/PROVENANCE.md (仓库不再包含副本)。
 #
 # 构建:  cmake --build build --config Release --target protocol_check
 # 运行:  build\Release\protocol_check.exe    (全通过返回 0)

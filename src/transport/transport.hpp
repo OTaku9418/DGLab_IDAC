@@ -42,7 +42,7 @@ inline constexpr int kBfSize = 7;
 //
 // ⚠⚠ 这四个值曾经**全部反了**, 2026-10-17 照官方文档
 //    (dungeonlab-open/dglab-bluetooth-protocol, coyote/v3/README.md,
-//     逐字节副本存于 re/reference/dglab-bluetooth-protocol/coyote-v3-README.md)
+//     快照提交 045720d, 链接见 re/reference/dglab-bluetooth-protocol/PROVENANCE.md)
 //    逐个核对后改正:
 //
 //       0b00  不变 —— **忽略本通道的强度字节**, 维持设备当前值

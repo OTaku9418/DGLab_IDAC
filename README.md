@@ -338,6 +338,6 @@ BLE 链路跟着断, 设备判定断连就归零 —— 不是因为我们发了
 | [dglab-bluetooth-protocol](https://github.com/dungeonlab-open/dglab-bluetooth-protocol) | 上游无 LICENSE 文件, 见下方说明 | 只引用文档, 不随包分发 |
 
 > ⚠ 郊狼协议文档对爱好者免费, 但**商用需事先授权**。
-> 上游没有 LICENSE 文件, 所以 `re/reference/dglab-bluetooth-protocol/` 里那四份官方文档的
-> 授权条件**不适用**本仓库根目录的 MIT LICENSE。它们的来源、提交号与 sha256 记在
-> 该目录的 `PROVENANCE.md` 里; `docs/` 下的分析文字则是我们自己写的。
+> 上游没有 LICENSE 文件, 所以本仓库**不再随包分发**它的文档副本; 只按快照提交号
+> `045720d` 引用, 每份文件的直链与 sha256 记在 `re/reference/dglab-bluetooth-protocol/PROVENANCE.md`
+> 里。`docs/` 下的分析文字则是我们自己写的。

@@ -61,6 +61,8 @@ LICENSE        text eol=lf
 #   只写 `-text` 不够: `-text` 关掉的是"按文本归一化", 但上面 `*.md` 规则
 #   设的 `eol=lf` 仍然生效, 检出时照样改写行尾。必须两个一起 unset。
 #   校验和写在 re/reference/dglab-bluetooth-protocol/PROVENANCE.md。
+#   上游文档副本已在 v0.2.1 删除, 目录里只剩我们写的 PROVENANCE.md;
+#   这条规则保留, 免得以后有人再放文档进去时被悄悄改行尾。
 re/reference/dglab-bluetooth-protocol/** -text -eol
 
 # 同理: _ue4ss_ref/ 下提交进仓库的那两份 ABI 对齐头文件也是**上游的逐字节副本**。

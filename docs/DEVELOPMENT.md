@@ -240,7 +240,7 @@ UE4SS **只认 `<mod>\dlls\main.dll`**, 所以部署时改名:
 | 阶段 | 状态 |
 |---|---|
 | 逆向: 定位挂钩点与 ABI | ✅ 完成 (`re/indrun_hook_mechanics.md`) |
-| 逆向: 郊狼协议 | ✅ 完成 (`docs/research-*.md`, 官方文档副本见 `re/reference/dglab-bluetooth-protocol/`) |
+| 逆向: 郊狼协议 | ✅ 完成 (`docs/research-*.md`, 官方文档按快照提交号链接, 见 `re/reference/dglab-bluetooth-protocol/PROVENANCE.md`) |
 | 构建: 编译 + 链接 + 部署 | ✅ 完成 |
 | ABI: 与本机 UE4SS `0196ef29` 对齐 | ✅ 完成 (曾因头文件版本不对而启动即崩) |
 | 阶段 1: 探针 | ✅ 完成 —— 5 个跳板**都有数据** |

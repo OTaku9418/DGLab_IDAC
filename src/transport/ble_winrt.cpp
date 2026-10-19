@@ -850,7 +850,7 @@ void BleWinRtTransport::worker_entry() {
                         if (ma != 0x03 && mb != 0x03) {
                             log_error("BLE: ★ 两条通道都不是绝对设置模式 —— 设备会忽略强度值, "
                                       "强度永远不会变。检查 StrengthMode 的枚举取值是否与 "
-                                      "re/reference/dglab-bluetooth-protocol/coyote-v3-README.md "
+                                      "coyote/v3/README.md (快照 045720d) "
                                       "一致 (跑 protocol_check.exe)");
                         }
                     }
