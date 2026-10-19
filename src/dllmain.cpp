@@ -611,7 +611,8 @@ private:
                         "[hb] t=%.0fs frames=%llu | torque=%llu mag[%d..%d] dir[%d..%d] | "
                         "visc=%llu b[%d..%d] | vib=%llu b[%d..%d] | servo on/off=%llu/%llu=%d | "
                         "%s | %s | now: tq_m=%d visc_b=%d vib_b=%d "
-                        "age(tq/visc/vib)=%.1f/%.1f/%.1fs servo=%d out A=%d/%d B=%d/%d",
+                        "age(tq/visc/vib)=%.1f/%.1f/%.1fs servo=%d out A=%d/%d B=%d/%d "
+                        "hold(A/B)=%llu/%llu",
                         t - start_time,
                         static_cast<unsigned long long>(frames),
                         static_cast<unsigned long long>(s.torque_calls),
@@ -632,7 +633,9 @@ private:
                         pipeline_ ? pipeline_->gain_summary().c_str() : "pipeline=null",
                         s.torque_magnitude, s.viscosity_b, s.vibration_b,
                         age_of(s.torque_at), age_of(s.viscosity_at), age_of(s.vibration_at),
-                        s.servo_on ? 1 : 0, out_a_s, out_a_p, out_b_s, out_b_p);
+                        s.servo_on ? 1 : 0, out_a_s, out_a_p, out_b_s, out_b_p,
+                        static_cast<unsigned long long>(pipeline_ ? pipeline_->hold_trips_a() : 0),
+                        static_cast<unsigned long long>(pipeline_ ? pipeline_->hold_trips_b() : 0));
 
                     // ---- 传输层状态: 每 10 秒一行(不是每秒, 否则日志本身就成了负担) ----
                     // 为什么要单独打这个: 传输层的计数(submitted/repeated/overwritten)

@@ -105,6 +105,10 @@ public:
     // 诊断: 当前各通道的动态增益, 形如 "peakA=18 gainA=24 peakB=40 gainB=40"
     std::string gain_summary() const;
 
+    // T22b: 每个通道"停住的值不是 0"的次数(只给 [hb] 与离线用例看)
+    uint64_t hold_trips_a() const { return hold_trips_a_; }
+    uint64_t hold_trips_b() const { return hold_trips_b_; }
+
 private:
     // 单通道: 把原始信号映射成 0..1
     // raw_zeroed: 源被判定为"保持超时"(T17), 此时原始值按 0 处理 —— 归一化、
@@ -163,6 +167,11 @@ private:
     // T17/T22b: 保持超时(含全源静默)的边沿状态, 只用来决定"进入/退出时各打一条日志"
     bool   hold_zero_a_      = false;
     bool   hold_zero_b_      = false;
+    // T22b: "停住的值不是 0"的进入次数(与日志条件一致)
+    bool     was_hold_a_     = false;
+    bool     was_hold_b_     = false;
+    uint64_t hold_trips_a_   = 0;
+    uint64_t hold_trips_b_   = 0;
 
     // 启动时刻, 用于 warmup
     double boot_time_        = 0.0;

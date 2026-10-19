@@ -178,20 +178,6 @@ double Pipeline::update_gain(GainTracker& t, const ChannelMapping& m,
 // 0 表示关闭对应的那一级。
 // ---------------------------------------------------------------------------
 
-namespace {
-
-// 把 source 名字归到三类"会停更的源"上。名字的拼写与 pick_source() 保持一致。
-enum class SourceKind { Other, Torque, Viscosity, Vibration };
-
-SourceKind source_kind(const std::string& src) {
-    if (src == "torque" || src == "torque_signed") return SourceKind::Torque;
-    if (src == "viscosity" || src == "viscosity_a")  return SourceKind::Viscosity;
-    if (src == "vibration" || src == "vibration_a")  return SourceKind::Vibration;
-    return SourceKind::Other;
-}
-
-}  // namespace
-
 bool Pipeline::source_hold_expired(const ChannelMapping& m, const FfbState& ffb,
                                    double now, double* held_ms_out,
                                    const char** why_out, int* limit_ms_out) const {
@@ -200,19 +186,18 @@ bool Pipeline::source_hold_expired(const ChannelMapping& m, const FfbState& ffb,
     if (limit_ms_out != nullptr) *limit_ms_out = 0;
     if (!m.enable) return false;          // 关掉的通道本来就输出 0
 
-    double  at    = 0.0;
-    int     limit = 0;
+    // source -> (时间戳, 超时值) 的映射与 load_config 的告警同源(T22b)。
+    double at = 0.0;
     const char* name = "";
-    switch (source_kind(m.source)) {
-        case SourceKind::Torque:
-            at = ffb.torque_at;    limit = cfg_.torque_hold_ms;    name = "torque";    break;
-        case SourceKind::Viscosity:
-            at = ffb.viscosity_at; limit = cfg_.viscosity_hold_ms; name = "viscosity"; break;
-        case SourceKind::Vibration:
-            at = ffb.vibration_at; limit = cfg_.vibration_hold_ms; name = "vibration"; break;
-        case SourceKind::Other:
+    const HoldSource hs = hold_source_of(m.source);
+    switch (hs) {
+        case HoldSource::Torque:    at = ffb.torque_at;    name = "torque";    break;
+        case HoldSource::Viscosity: at = ffb.viscosity_at; name = "viscosity"; break;
+        case HoldSource::Vibration: at = ffb.vibration_at; name = "vibration"; break;
+        case HoldSource::None:
             return false;                 // servo / const / 未知: 永不超时
     }
+    const int limit = hold_timeout_of(cfg_, hs);
     if (limit <= 0) return false;         // 0 = 关闭这一级
     // 还没收到过任何样本(游戏还没进比赛): 原始值本来就是 0, 不需要额外处理,
     // 也不该在启动阶段打一条"保持超时"的日志。
@@ -443,29 +428,49 @@ bool Pipeline::tick(double now, const FfbState& ffb, Frame& out) {
     const bool all_silent = all_sources_silent(ffb, now, &silent_ms);
     const bool hold_a = all_silent || src_hold_a;
     const bool hold_b = all_silent || src_hold_b;
+    // 停住的那个值本身 —— 日志只在它 != 0 时才打。否则 vibration 这种大部分
+    // 时间为 0 的源会在每次回菜单时刷一条"归零", 把真正的风险淹掉。
+    auto held_value = [&ffb](const ChannelMapping& m) -> int32_t {
+        bool ok = false;
+        const int32_t v = pick_source(m.source, ffb, ok, false);
+        return (ok && v > 0) ? v : 0;
+    };
+    const int32_t held_val_a = hold_a ? held_value(cfg_.channel_a) : 0;
+    const int32_t held_val_b = hold_b ? held_value(cfg_.channel_b) : 0;
+
     // 只在进入/退出时各打一条 —— 这个状态一次会话里会来回切换几十次(发车、
     // 冲线、菜单), 每 tick 打一条就把日志淹了。
     auto report_hold = [this, all_silent, silent_ms](const char* name, bool now_zero,
                                                      bool& was_zero, bool src_hold,
                                                      const char* why, double held_ms,
-                                                     int limit_ms) {
+                                                     int limit_ms, int32_t held_val) {
         if (now_zero == was_zero) return;
         was_zero = now_zero;
-        if (now_zero) {
-            if (all_silent) {
-                log_info("[channel_%s] 三个力反馈源已同时停更 %.0f ms(全源静默阈值 %d ms), "
-                         "原始值按 0 处理 —— 退出比赛/回菜单时就是这样",
-                         name, silent_ms, cfg_.silent_mute_ms);
-            } else if (src_hold) {
-                log_info("[channel_%s] %s 源已 %.0f ms 没有更新(保持超时 %d ms), "
-                         "原始值按 0 处理, 源一更新就恢复", name, why, held_ms, limit_ms);
-            }
-        } else {
+        if (!now_zero) {
+            // 只有真打过"进入"才打"恢复", 否则两边不配对, 日志更难读。
             log_info("[channel_%s] 力反馈源恢复更新, 输出恢复", name);
+            return;
+        }
+        // 停住的本来就是 0: 输出一样是 0, 没有风险, 不刷日志。
+        if (held_val <= 0) return;
+        if (all_silent) {
+            log_info("[channel_%s] 三个力反馈源已同时停更 %.0f ms(全源静默阈值 %d ms), "
+                     "停住的值 %d 按 0 处理 —— 退出比赛/回菜单时就是这样",
+                     name, silent_ms, cfg_.silent_mute_ms, held_val);
+        } else if (src_hold) {
+            log_info("[channel_%s] %s 已 %.0f ms 没有更新(保持超时 %d ms), "
+                     "停住的值 %d 按 0 处理 —— 源一更新就恢复",
+                     name, why, held_ms, limit_ms, held_val);
         }
     };
-    report_hold("A", hold_a, hold_zero_a_, src_hold_a, why_a, held_a_ms, limit_a);
-    report_hold("B", hold_b, hold_zero_b_, src_hold_b, why_b, held_b_ms, limit_b);
+    report_hold("A", hold_a, hold_zero_a_, src_hold_a, why_a, held_a_ms, limit_a, held_val_a);
+    report_hold("B", hold_b, hold_zero_b_, src_hold_b, why_b, held_b_ms, limit_b, held_val_b);
+
+    // T22b: 只数"停住的值不是 0"的那些次(与日志条件一致), 供 [hb] 观察。
+    if (hold_a && !was_hold_a_ && held_val_a > 0) ++hold_trips_a_;
+    if (hold_b && !was_hold_b_ && held_val_b > 0) ++hold_trips_b_;
+    was_hold_a_ = hold_a;
+    was_hold_b_ = hold_b;
 
     // ---- 自动增益: 每 tick 推进一次包络, 供本帧的 A/B 两路归一化使用 ----
     // 必须在 map_input 之前, 因为 map_input 读的是本帧算出来的增益。

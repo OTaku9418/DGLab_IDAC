@@ -38,14 +38,14 @@ struct ChannelMapping {
 
     // 输入范围(原始整数)
     int32_t     in_min      = 0;
-    int32_t     in_max      = 1000;
+    int32_t     in_max      = 127;    // 与发布包 INI 一致(T23); auto_gain=1 时只当启动初值
 
     // 输出 0..1 域内的缩放与偏置
     double      level       = 1.0;
 
     // 该通道的基础强度(写入 B0 的 channel intensity setting, 0..200)
     // 上限还会被 [safety] max_strength 和 BF 软限位双重压住。
-    int32_t     base_strength = 60;
+    int32_t     base_strength = 15;
 
     // 通道强度的来源:
     //   "static" = 固定用 base_strength, 全部动态走脉冲振幅(默认, 见下)
@@ -138,9 +138,9 @@ struct Config {
     // ---- [safety] ----
     // ★ 用户要的"最大强度"接口 ★
     // 写进 BF 命令的通道软限位(0..200), 设备侧持久生效, 且每次重连后必须重发。
-    int         max_strength        = 40;
+    int         max_strength        = 30;
     // 软件侧再压一道(0..200): 实际写入 B0 的强度不会超过它
-    int         clamp_strength      = 40;
+    int         clamp_strength      = 30;
     // 每秒允许的强度变化量(0 = 不限制)。避免阶跃冲击。
     double      slew_per_second     = 40.0;
     // 看门狗: 管线侧超过这么多毫秒没有提交新帧, 传输层就改发静默帧(强度 0)。
@@ -186,7 +186,7 @@ struct Config {
     // 场景在一秒内压到 0, 且不会误伤任何真实保持。
     int         silent_mute_ms      = 1000;
     // 启动后前 N 毫秒强制输出 0, 让用户有时间确认连接
-    int         warmup_ms           = 1500;
+    int         warmup_ms           = 5000;
     // 全局总开关: 设为 false 时只记日志不发数据(干跑模式)
     // ★ 默认 true ★: INI 里漏写这个键就等于允许真实输出, 与本项目"默认安全"
     // 的设计意图相反 —— 一个字的遗漏不该产生电刺激。要真实输出必须在 INI 里
@@ -263,10 +263,21 @@ const char* to_string(MapMode m);
 //
 // 目前只有 viscosity / viscosity_a: 它的回调是**值变了才回调**(IndRun 内部有
 // 变化缓存), 而强制退出比赛回到菜单时, 游戏会把阻尼停在一个可感的值上却不再
-// 回调 —— 本程序没有"源数据陈旧"判定, 于是那个值会被管线一直输出, 直到下一次
-// 变化。torque/vibration 在回菜单时会被游戏压到接近 0, 所以不在名单里。
+// 回调。T22b 起这种停住的值有保持超时兜底(source_hold_expired, 默认 2000 ms),
+// 所以这里报的是"历史上出过事、值得提醒一次"的类别, 不再等于"没有保护"。
 //
 // 纯函数, 供 load_config 告警与离线自检共用。
 bool is_held_risk_source(const std::string& src);
+
+// ---- T22b: "会停更的源"及其保持超时 ----
+//
+// 把"source 名字 -> (时间戳, 超时键)"的对应关系收成纯函数: load_config 的
+// 告警、pipeline 的判定、离线自检三方必须用同一份映射, 否则改一处就会出现
+// "告警说保护关了、实际还开着"(或反过来)这种自相矛盾的状态。
+enum class HoldSource { None, Torque, Viscosity, Vibration };
+
+HoldSource hold_source_of(const std::string& src);
+// 该源在当前配置下的超时值(毫秒); None 返回 0。
+int hold_timeout_of(const Config& cfg, HoldSource s);
 
 }  // namespace dglab_idac

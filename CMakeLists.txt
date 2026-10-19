@@ -524,3 +524,9 @@ if(MSVC)
         NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
     )
 endif()
+
+# T23: 防漂移测试要读发布包模板。用编译期路径而不是"运行时猜", 这样在别的
+# 机器上也能找到; 文件缺失时测试直接 FAIL, 不许跳过。不依赖 MSVC, 故放外面。
+target_compile_definitions(logic_check PRIVATE
+    "DGLAB_TEMPLATE_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/tools/DGLab_IDAC.ini.template\""
+)

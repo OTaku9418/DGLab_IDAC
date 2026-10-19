@@ -20,10 +20,13 @@
 // 用法: logic_check.exe        全部通过返回 0, 有失败返回 1
 // ---------------------------------------------------------------------------
 
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "config.hpp"
 #include "ffb_gap_stats.hpp"
@@ -54,6 +57,9 @@ void check(bool ok, const char* what) {
         std::printf("  [FAIL] %s   <-- %s\n", what, g_group);
     }
 }
+
+// 拼接出来的说明(防漂移测试要把字段差异打出来)直接传字符串。
+void check(bool ok, const std::string& what) { check(ok, what.c_str()); }
 
 void check_eq(long long got, long long want, const char* what) {
     if (got == want) {
@@ -820,6 +826,50 @@ void test_source_hold() {
     check_eq(effective_source_hold_ms(30000, "torque_hold_ms", 20000), 20000,
              "超上限降到 20000");
     check_eq(effective_source_hold_ms(100, "torque_hold_ms", 20000), 500, "<500 抬到 500");
+    check_eq(effective_source_hold_ms(1, "torque_hold_ms", 20000), 500, "边界 1 抬到 500");
+    check_eq(effective_source_hold_ms(499, "torque_hold_ms", 20000), 500, "边界 499 抬到 500");
+    check_eq(effective_source_hold_ms(500, "torque_hold_ms", 20000), 500, "边界 500 不动");
+    check_eq(effective_source_hold_ms(10001, "torque_hold_ms", 20000), 10001,
+             "10001 仍在 20000 上限内");
+    check_eq(effective_source_hold_ms(-500, "torque_hold_ms", 20000), 500,
+             "负数按 <500 处理, 抬到 500");
+
+    // T22b: hold_trips 只数"停住的值不是 0"的进入次数
+    {
+        Config t = make_test_config();
+        t.channel_b.enable = false;
+        t.torque_hold_ms = 2000;
+        Pipeline pt(t);
+        FfbState f = make_ffb();
+        f.torque_at = 1.0;
+        for (int i = 0; i <= 25; ++i) pt.tick(1.0 + static_cast<double>(i) * 0.1, f, out);
+        check_eq(static_cast<int>(pt.hold_trips_a()), 1,
+                 "停住的值是 64(非 0) => 记一次 hold_trips");
+        check_eq(static_cast<int>(pt.hold_trips_b()), 0, "B 没启用, 不记");
+
+        // 停住的本来就是 0: 不记(否则 vibration 这种源每次都刷一条)
+        Pipeline pz(t);
+        FfbState z = make_ffb();
+        z.torque_magnitude = 0;
+        z.torque_at = 1.0;
+        for (int i = 0; i <= 25; ++i) pz.tick(1.0 + static_cast<double>(i) * 0.1, z, out);
+        check_eq(static_cast<int>(pz.hold_trips_a()), 0,
+                 "停住的值是 0 => 不计 hold_trips");
+
+        // 增益包络也必须看到 0: 归零后按 release 曲线回落到 floor
+        Config g = t;
+        g.auto_gain = true;
+        g.gain_floor = 24;
+        g.gain_ceiling = 127;
+        g.gain_release_sec = 1.0;
+        Pipeline pg(g);
+        FfbState gf = make_ffb();
+        gf.torque_at = 1.0;
+        for (int i = 0; i <= 10; ++i) pg.tick(1.0 + static_cast<double>(i) * 0.1, gf, out);
+        for (int i = 0; i <= 300; ++i) pg.tick(2.0 + static_cast<double>(i) * 0.1, gf, out);
+        check(pg.gain_summary().find("gainA=24") != std::string::npos,
+              "超时期间增益回落到 floor —— 包络看到的也是 0");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -899,6 +949,230 @@ void test_all_sources_silent() {
     check_eq(effective_silent_mute_ms(20000), 10000, ">10000 降到 10000");
 }
 
+// ---------------------------------------------------------------------------
+// 13. T23: 三处默认值防漂移
+//
+// 同一个配置有三份来源: 发布包模板(tools/DGLab_IDAC.ini.template)、
+// INI 缺失时自动生成的 write_default_config()、以及 config.hpp 里"缺键时"
+// 的结构体默认值。三份里任何一份单独改动, 用户看到的行为就会因"INI 在不在"
+// 而不同 —— v0.2.0 就发生过(模板 15/10, 生成 40/30, 缺键 60/60)。
+//
+// 所以这里把三者钉在一起: 模板与生成文件逐字段相同(除两个故意不同的开关),
+// 而"只写两个开关"的极简 INI 必须和模板完全一致 —— 后者检查的是结构体默认值。
+// 找不到模板算失败, 不许跳过: 跳过等于这条防线不存在。
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string read_text_file(const std::string& path, bool* ok) {
+    std::string out;
+    if (ok != nullptr) *ok = false;
+    FILE* f = nullptr;
+    if (::fopen_s(&f, path.c_str(), "rb") != 0 || f == nullptr) return out;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    if (ok != nullptr) *ok = true;
+    return out;
+}
+
+std::string ascii_lower(std::string s) {
+    for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return s;
+}
+
+// 取出所有 "section.key"(小写), 忽略注释与空白。
+std::vector<std::string> ini_keys(const std::string& text) {
+    std::vector<std::string> keys;
+    std::string sec;
+    std::string line;
+    for (size_t i = 0; i <= text.size(); ++i) {
+        if (i < text.size() && text[i] != '\n') {
+            line.push_back(text[i]);
+            continue;
+        }
+        std::string s = line;
+        line.clear();
+        while (!s.empty() && (s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+        const size_t b = s.find_first_not_of(" \t");
+        if (b == std::string::npos) continue;
+        s = s.substr(b);
+        if (s[0] == ';' || s[0] == '#') continue;
+        if (s[0] == '[') {
+            const size_t r = s.find(']');
+            if (r != std::string::npos) sec = ascii_lower(s.substr(1, r - 1));
+            continue;
+        }
+        std::string key = (s.find('=') == std::string::npos) ? s : s.substr(0, s.find('='));
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+        if (!key.empty() && !sec.empty()) keys.push_back(sec + "." + ascii_lower(key));
+    }
+    return keys;
+}
+
+bool has_key(const std::vector<std::string>& keys, const std::string& k) {
+    for (const auto& x : keys) {
+        if (x == k) return true;
+    }
+    return false;
+}
+
+// 逐字段比较。新增配置字段时必须在这里补一行 —— 这是有意的: 让"忘记同步
+// 三处默认值"变成编译期之后的第一道红灯, 而不是用户手感变了才发现。
+std::string diff_configs(const Config& a, const Config& b, bool include_switches) {
+    std::string d;
+    auto I = [&](int x, int y, const char* n) {
+        if (x != y) { d += n; d += "(" + std::to_string(x) + "!=" + std::to_string(y) + ") "; }
+    };
+    auto D = [&](double x, double y, const char* n) {
+        if (!(std::fabs(x - y) < 1e-9)) {
+            d += n; d += "(" + std::to_string(x) + "!=" + std::to_string(y) + ") ";
+        }
+    };
+    auto B = [&](bool x, bool y, const char* n) {
+        if (x != y) { d += n; d += "(" + std::string(x ? "1" : "0") + "!=" + (y ? "1" : "0") + ") "; }
+    };
+    auto S = [&](const std::string& x, const std::string& y, const char* n) {
+        if (x != y) { d += n; d += "(" + x + "!=" + y + ") "; }
+    };
+
+    if (include_switches) {
+        I(static_cast<int>(a.link), static_cast<int>(b.link), "link");
+        B(a.dry_run, b.dry_run, "dry_run");
+    }
+    B(a.enabled, b.enabled, "enabled");
+    B(a.verbose, b.verbose, "verbose");
+    I(static_cast<int>(a.protocol), static_cast<int>(b.protocol), "protocol");
+    S(a.ble_device_name, b.ble_device_name, "ble_device_name");
+    I(a.ble_reconnect_ms, b.ble_reconnect_ms, "ble_reconnect_ms");
+    I(a.ble_connect_timeout_ms, b.ble_connect_timeout_ms, "ble_connect_timeout_ms");
+    I(a.frame_ms, b.frame_ms, "frame_ms");
+    I(a.pulse_freq_base, b.pulse_freq_base, "pulse_freq_base");
+    I(a.pulse_freq_min, b.pulse_freq_min, "pulse_freq_min");
+    I(a.pulse_freq_max, b.pulse_freq_max, "pulse_freq_max");
+    D(a.pulse_freq_track, b.pulse_freq_track, "pulse_freq_track");
+    B(a.auto_gain, b.auto_gain, "auto_gain");
+    D(a.gain_attack_sec, b.gain_attack_sec, "gain_attack_sec");
+    D(a.gain_release_sec, b.gain_release_sec, "gain_release_sec");
+    I(a.gain_floor, b.gain_floor, "gain_floor");
+    I(a.gain_ceiling, b.gain_ceiling, "gain_ceiling");
+    D(a.gain_idle_reset_sec, b.gain_idle_reset_sec, "gain_idle_reset_sec");
+    I(a.max_strength, b.max_strength, "max_strength");
+    I(a.clamp_strength, b.clamp_strength, "clamp_strength");
+    D(a.slew_per_second, b.slew_per_second, "slew_per_second");
+    I(a.watchdog_ms, b.watchdog_ms, "watchdog_ms");
+    B(a.zero_when_servo_off, b.zero_when_servo_off, "zero_when_servo_off");
+    I(a.viscosity_hold_ms, b.viscosity_hold_ms, "viscosity_hold_ms");
+    I(a.torque_hold_ms, b.torque_hold_ms, "torque_hold_ms");
+    I(a.vibration_hold_ms, b.vibration_hold_ms, "vibration_hold_ms");
+    I(a.silent_mute_ms, b.silent_mute_ms, "silent_mute_ms");
+    I(a.warmup_ms, b.warmup_ms, "warmup_ms");
+    B(a.torque_negative_is_positive, b.torque_negative_is_positive,
+      "torque_negative_is_positive");
+    B(a.hook, b.hook, "hook");
+
+    const char* ch[2] = {"a", "b"};
+    const ChannelMapping* ca[2] = {&a.channel_a, &a.channel_b};
+    const ChannelMapping* cb[2] = {&b.channel_a, &b.channel_b};
+    for (int i = 0; i < 2; ++i) {
+        const std::string p = std::string(ch[i]) + ".";
+        B(ca[i]->enable, cb[i]->enable, (p + "enable").c_str());
+        I(static_cast<int>(ca[i]->mode), static_cast<int>(cb[i]->mode), (p + "mode").c_str());
+        I(ca[i]->in_min, cb[i]->in_min, (p + "in_min").c_str());
+        I(ca[i]->in_max, cb[i]->in_max, (p + "in_max").c_str());
+        D(ca[i]->level, cb[i]->level, (p + "level").c_str());
+        I(ca[i]->base_strength, cb[i]->base_strength, (p + "base_strength").c_str());
+        S(ca[i]->strength_source, cb[i]->strength_source, (p + "strength_source").c_str());
+        D(ca[i]->strength_margin, cb[i]->strength_margin, (p + "strength_margin").c_str());
+        S(ca[i]->source, cb[i]->source, (p + "source").c_str());
+    }
+    return d;
+}
+
+bool write_text_file(const std::string& path, const std::string& text) {
+    FILE* f = nullptr;
+    if (::fopen_s(&f, path.c_str(), "wb") != 0 || f == nullptr) return false;
+    const size_t n = std::fwrite(text.data(), 1, text.size(), f);
+    std::fclose(f);
+    return n == text.size();
+}
+
+// ★ 必须用绝对路径 ★
+// WritePrivateProfileString / GetPrivateProfileString 收到**相对路径**时, 会先
+// 去 Windows 目录找同名文件, 而不是相对当前工作目录 —— 测试里用相对路径会
+// 让"写进去"和"读出来"落在两个不同地方, 表现成的假象是"生成文件里一个键都
+// 没有, 而两份配置逐字段相同"。
+std::string absolute_path(const std::string& p) {
+    char buf[4096] = {0};
+    if (::_fullpath(buf, p.c_str(), sizeof buf) == nullptr) return p;
+    return std::string(buf);
+}
+
+}  // namespace
+
+void test_default_drift() {
+    group("[T23] 三处默认值不漂移");
+
+    bool ok = false;
+    const std::string tpl_text = read_text_file(DGLAB_TEMPLATE_FILE, &ok);
+    check(ok, std::string("模板文件必须存在: ") + DGLAB_TEMPLATE_FILE);
+    if (!ok) return;   // 找不到模板就是失败, 不跳过
+
+    // load_config 会就地做 LF->CRLF 归一化, 所以一律读临时副本。
+    const std::string tpl_copy = absolute_path("dglab_drift_tpl.ini");
+    const std::string gen_path = absolute_path("dglab_drift_gen.ini");
+    const std::string min_path = absolute_path("dglab_drift_min.ini");
+    std::remove(tpl_copy.c_str());
+    std::remove(gen_path.c_str());
+    std::remove(min_path.c_str());
+
+    check(write_text_file(tpl_copy, tpl_text), "模板副本写出成功");
+    check(write_default_config(gen_path), "write_default_config 写出文件");
+    check(write_text_file(min_path, "[link]\nmode=ble\n[safety]\ndry_run=0\n"),
+          "极简 INI 写出成功");
+
+    const std::string gen_text = read_text_file(gen_path, &ok);
+    check(ok, "能读回生成的文件");
+
+    // 1) 模板里的每一个键, 生成文件里都要有
+    const std::vector<std::string> tpl_keys = ini_keys(tpl_text);
+    const std::vector<std::string> gen_keys = ini_keys(gen_text);
+    check(tpl_keys.size() > 20, "模板里解析出了键(防止解析器本身失效)");
+    std::string missing;
+    for (const auto& k : tpl_keys) {
+        if (!has_key(gen_keys, k)) { missing += k; missing += " "; }
+    }
+    check(missing.empty(), "生成文件缺少模板里的键: " +
+                               (missing.empty() ? std::string("(无)") : missing));
+
+    // 2) 逐字段比较, 除 link 与 dry_run
+    const Config ct = load_config(tpl_copy);
+    const Config cg = load_config(gen_path);
+    const std::string d = diff_configs(ct, cg, false);
+    check(d.empty(), "模板与生成文件逐字段相同(除 link/dry_run): " +
+                         (d.empty() ? std::string("(无)") : d));
+
+    // 3) 缺键默认值: 只写两个开关, 结果必须与模板完全一致
+    const Config cm = load_config(min_path);
+    const std::string d2 = diff_configs(ct, cm, true);
+    check(d2.empty(), "只写两个开关时, 其余全部来自缺键默认值且与模板一致: " +
+                          (d2.empty() ? std::string("(无)") : d2));
+
+    // 两个开关本身确实是故意不同的(否则上面两条比较会失去意义)
+    check(cg.link == LinkMode::Disabled && ct.link == LinkMode::Ble,
+          "生成文件故意用 link=disabled, 模板是 ble");
+    check(cg.dry_run && !ct.dry_run, "生成文件故意用 dry_run=1, 模板是 0");
+    check(ct.channel_a.base_strength == 15 && ct.channel_b.base_strength == 10,
+          "两路 base_strength 不同(A=15, B=10), 且缺键默认值与之一致");
+    check(std::fabs(ct.channel_b.level - 0.6) < 1e-9, "B 的 level 是 0.6");
+
+    std::remove(tpl_copy.c_str());
+    std::remove(gen_path.c_str());
+    std::remove(min_path.c_str());
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -921,6 +1195,7 @@ int main() {
     test_viscosity_hold();
     test_source_hold();
     test_all_sources_silent();
+    test_default_drift();
     test_mailbox_consumer_ready();
 
     std::printf("\n-------------------------------------------\n");
