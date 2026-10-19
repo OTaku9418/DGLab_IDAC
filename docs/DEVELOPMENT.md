@@ -219,7 +219,7 @@ UE4SS **只认 `<mod>\dlls\main.dll`**, 所以部署时改名:
 `tools\build.cmd -Deploy` 会自动做这件事。
 启用途径有两条, 下表是 E1–E4 四个组合的实测结果 (2026-10-19, UE4SS v3.0.1-944-g0196ef29;
 判据是 `UE4SS.log` 里的 `Starting C++ mod 'DGLab_IDAC'` 与模组日志里
-`==== DGLab_IDAC 0.2.0 启动` 各出现几次):
+`==== DGLab_IDAC 0.2.1 启动` 各出现几次):
 
 | `enabled.txt` | `mods.txt` | 结果 |
 |---|---|---|
