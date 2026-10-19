@@ -20,10 +20,13 @@
 // 用法: logic_check.exe        全部通过返回 0, 有失败返回 1
 // ---------------------------------------------------------------------------
 
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "config.hpp"
 #include "ffb_gap_stats.hpp"
@@ -54,6 +57,9 @@ void check(bool ok, const char* what) {
         std::printf("  [FAIL] %s   <-- %s\n", what, g_group);
     }
 }
+
+// 拼接出来的说明(防漂移测试要把字段差异打出来)直接传字符串。
+void check(bool ok, const std::string& what) { check(ok, what.c_str()); }
 
 void check_eq(long long got, long long want, const char* what) {
     if (got == want) {
@@ -107,6 +113,11 @@ Config make_test_config() {
     c.warmup_ms = 0;          // 预热会掩盖其他逻辑, 单独测
     c.auto_gain = false;      // 关掉动态增益, 让映射结果可预测
     c.zero_when_servo_off = true;
+    // T22b: 单测一次只验一个机制, 所以这里把"保持超时"两级都关掉; 要测它们
+    // 的用例自己打开。默认值本身由 T23 的"默认值与模板不漂移"用例钉住。
+    c.torque_hold_ms = 0;
+    c.vibration_hold_ms = 0;
+    c.silent_mute_ms = 0;
 
     c.channel_a.enable = true;
     c.channel_a.source = "torque";
@@ -467,6 +478,81 @@ void test_ffb_gap_stats() {
 }
 
 // ---------------------------------------------------------------------------
+// 10b. [ffbhold]: 非零值保持了多久 (T22a)
+//
+// 这份统计的唯一用途是"给保持超时定默认值", 所以它必须能正确回答两个问题:
+//   1) 非零值保持不变时, 这段时长有没有被记下来(包括最后降到 0 的那一段);
+//   2) 长保持具体发生在什么值上 —— 1 和 19 是两回事, 超时设小了会砍掉真手感。
+// 分档边界与 max/open 的语义逐条钉住, 因为默认值就是照这几档读出来的。
+// ---------------------------------------------------------------------------
+void test_hold_stats() {
+    group("[ffbhold]: 非零值保持了多久");
+
+    HoldStats h;
+    h.on_update(10.0, 5);              // 第一个样本, 没有"上一个值"
+    check_eq(static_cast<int>(h.total()), 0, "第一个样本不计保持");
+
+    h.on_update(10.3, 5);              // 值 5 保持了 0.3 s
+    check_eq(static_cast<int>(h.n_lt_05), 1, "0.3 s 进 <0.5 档");
+
+    h.on_update(11.8, 0);              // 值 5 保持了 1.5 s, 这次降到了 0
+    check_eq(static_cast<int>(h.n_1_2), 1, "1.5 s 进 1-2 档 (降到 0 也要记)");
+    check(h.max_hold > 1.49 && h.max_hold < 1.51, "max_hold 记下 1.5 s");
+    check_eq(static_cast<int>(h.max_val), 5, "max_val 记下那一次的值 5");
+
+    h.on_update(20.0, 0);              // 上一个值是 0: 不记
+    check_eq(static_cast<int>(h.total()), 2, "0 值保持不计数");
+
+    h.on_update(20.0, 7);              // 0 -> 非零: 起点, 不记
+    check_eq(static_cast<int>(h.total()), 2, "0 -> 非零是起点, 不计保持");
+
+    // 分档边界: 1.0 / 2.0 / 3.0 / 5.0
+    h.on_update(21.0, 7);              // 1.0 -> 1-2
+    h.on_update(23.0, 7);              // 2.0 -> 2-3
+    h.on_update(26.0, 7);              // 3.0 -> 3-5
+    h.on_update(31.0, 7);              // 5.0 -> >5
+    check_eq(static_cast<int>(h.n_1_2), 2, "边界 1.0 s 进 1-2 档");
+    check_eq(static_cast<int>(h.n_2_3), 1, "边界 2.0 s 进 2-3 档");
+    check_eq(static_cast<int>(h.n_3_5), 1, "边界 3.0 s 进 3-5 档");
+    check_eq(static_cast<int>(h.n_gt_5), 1, "边界 5.0 s 进 >5 档");
+
+    // open: 当前这个非零值已经保持了多久
+    check(h.open_seconds(34.0) > 2.9 && h.open_seconds(34.0) < 3.1,
+          "open 从最后一次回调算起 (3.0 s)");
+    check(h.open_seconds(30.0) == 0.0, "早于最后一次回调的时间不给负 open");
+
+    HoldStats z;
+    z.on_update(1.0, 0);
+    check(z.open_seconds(50.0) == 0.0, "当前值是 0 时 open 恒为 0");
+
+    // 明细: 只留 >=1 s, 且最多 10 条, 超出的计 suppressed
+    HoldStats d;
+    d.on_update(0.0, 9);
+    for (int i = 1; i <= 12; ++i) d.on_update(i * 2.0, 9);   // 每次 2.0 s
+    check_eq(d.long_n, 10, "明细最多 10 条");
+    check_eq(static_cast<int>(d.suppressed), 2, "超出的 2 条计 suppressed");
+    check(d.longs[0].value == 9 && d.longs[0].held > 1.99 && d.longs[0].held < 2.01,
+          "明细记下值与时长");
+    d.on_update(100.0, 0);                                     // 0.5 s 的保持
+    check_eq(d.long_n, 10, "<1 s 的保持不进明细");
+
+    // reset_counts 只清计数, 保留"上一次回调的时刻" —— 跨 60 s 窗口的长保持不能丢
+    HoldStats w;
+    w.on_update(400.0, 19);
+    w.reset_counts();
+    check(w.value() == 19, "reset_counts 保留当前值");
+    check(w.open_seconds(403.0) > 2.9 && w.open_seconds(403.0) < 3.1,
+          "reset_counts 之后 open 继续累积");
+    w.on_update(406.0, 0);                                    // 19 保持了 6.0 s
+    check_eq(static_cast<int>(w.n_gt_5), 1, "跨窗口的 6.0 s 完整落进 >5 档");
+    check(w.long_n == 1 && w.longs[0].value == 19, "跨窗口的明细也在");
+
+    w.reset();
+    check_eq(static_cast<int>(w.total()), 0, "reset 清空计数");
+    check(w.long_n == 0 && w.open_seconds(500.0) == 0.0, "reset 也清明细与 open");
+}
+
+// ---------------------------------------------------------------------------
 // 10. 已知风险源判定 (T11b)
 //
 // 这个函数决定配置加载时要不要打"viscosity 不推荐作为输出源"的告警。名单写错
@@ -636,7 +722,8 @@ void test_viscosity_hold() {
     for (int i = 0; i <= 100; ++i) {
         p_vib.tick(1.0 + static_cast<double>(i) * 0.1, v, out);
     }
-    check(out.b.slots[0].pulse_intensity > 0, "vibration 源不做保持超时判定");
+    check(out.b.slots[0].pulse_intensity > 0,
+          "vibration 源在 vibration_hold_ms=0 时不判定(要测它自己的阈值见 T22b 用例)");
 
     // 纯函数折算: 0 关闭, 其余钳到 500..10000
     check_eq(effective_viscosity_hold_ms(0), 0, "0 = 关闭, 原样");
@@ -645,6 +732,471 @@ void test_viscosity_hold() {
     check_eq(effective_viscosity_hold_ms(10000), 10000, "恰好 10000 不动");
     check_eq(effective_viscosity_hold_ms(100), 500, "<500 抬到 500");
     check_eq(effective_viscosity_hold_ms(50000), 10000, ">10000 降到 10000");
+}
+
+// ---------------------------------------------------------------------------
+// 12b. T22b: torque / vibration 的单源保持超时(二级)
+//
+// 这一级唯一的作用是"某个源彻底不更新时兜底", 所以阈值必须大于实测的真实
+// 保持(torque 最长 7.0 s), 默认 10 s。用例同时钉住"只作用于原始值, 强度字节
+// 不动"和"源一更新立刻恢复(不做渐变)"。
+// ---------------------------------------------------------------------------
+void test_source_hold() {
+    group("[T22b] torque/vibration 保持超时");
+
+    Config cfg = make_test_config();
+    cfg.channel_b.enable = false;      // 只测 A; B 的判定由下面的齐停用例覆盖
+    cfg.torque_hold_ms = 2000;
+
+    Pipeline p(cfg);
+    FfbState ffb = make_ffb();
+    ffb.torque_at = 1.0;
+    Frame out;
+    int p19 = -1, p21 = -1, strength_21 = -1;
+    for (int i = 0; i <= 21; ++i) {
+        const double now = 1.0 + static_cast<double>(i) * 0.1;
+        p.tick(now, ffb, out);
+        if (i == 0) check(out.a.slots[0].pulse_intensity > 0, "刚更新过 => A 有脉冲");
+        if (i == 19) p19 = out.a.slots[0].pulse_intensity;
+        if (i == 21) {
+            p21 = out.a.slots[0].pulse_intensity;
+            strength_21 = out.a.strength;
+        }
+    }
+    check(p19 > 0, "停更 1.9 s < 2000 ms => 仍然输出");
+    check_eq(p21, 0, "停更 2.1 s > 2000 ms => 脉冲归零");
+    check_eq(strength_21, 15, "强度字节不动(只作用于原始值)");
+
+    ffb.torque_at = 2.2;
+    p.tick(2.2, ffb, out);
+    check(out.a.slots[0].pulse_intensity > 0, "源一更新 => 下一帧就恢复");
+
+    // vibration 走自己的阈值(默认配置里 B 就是用它的)
+    Config vcfg = make_test_config();
+    vcfg.channel_b.enable = false;
+    vcfg.channel_a.source = "vibration";
+    vcfg.vibration_hold_ms = 2000;     // 实测 vibration 源读 b 参数
+    Pipeline pv(vcfg);
+    FfbState v = make_ffb();
+    v.vibration_b = 40;
+    v.vibration_at = 1.0;
+    int v19 = -1, v21 = -1;
+    for (int i = 0; i <= 21; ++i) {
+        const double now = 1.0 + static_cast<double>(i) * 0.1;
+        pv.tick(now, v, out);
+        if (i == 19) v19 = out.a.slots[0].pulse_intensity;
+        if (i == 21) v21 = out.a.slots[0].pulse_intensity;
+    }
+    check(v19 > 0, "vibration 停更 1.9 s => 仍输出");
+    check_eq(v21, 0, "vibration 停更 2.1 s => 归零");
+
+    // 0 = 关闭
+    Config off = cfg;
+    off.torque_hold_ms = 0;
+    Pipeline po(off);
+    FfbState stale = ffb;
+    stale.torque_at = 1.0;
+    for (int i = 0; i <= 100; ++i) {
+        po.tick(1.0 + static_cast<double>(i) * 0.1, stale, out);
+    }
+    check(out.a.slots[0].pulse_intensity > 0, "torque_hold_ms=0 => 不判定");
+
+    // 单源超时只影响用这个源的通道: B 用 constant 模式, 不受 A 的 torque 超时影响
+    Config mix = cfg;
+    mix.channel_b.enable = true;
+    mix.channel_b.mode = MapMode::Constant;
+    mix.channel_b.level = 1.0;
+    mix.channel_b.source = "viscosity";
+    mix.viscosity_hold_ms = 0;         // 让 B 的源不受二级影响
+    Pipeline pm(mix);
+    FfbState m = make_ffb();
+    m.torque_at = 1.0;
+    for (int i = 0; i <= 25; ++i) {
+        pm.tick(1.0 + static_cast<double>(i) * 0.1, m, out);
+    }
+    check_eq(out.a.slots[0].pulse_intensity, 0, "A 的 torque 停更 2.5 s => 归零");
+    check_eq(out.b.slots[0].pulse_intensity, 100, "B 不受影响(仍满脉冲)");
+
+    // 纯函数折算: 上限由调用方给
+    check_eq(effective_source_hold_ms(0, "torque_hold_ms", 20000), 0, "0 = 关闭, 原样");
+    check_eq(effective_source_hold_ms(10000, "torque_hold_ms", 20000), 10000,
+             "默认值不被改动");
+    check_eq(effective_source_hold_ms(15000, "vibration_hold_ms", 20000), 15000,
+             "20000 上限内不动");
+    check_eq(effective_source_hold_ms(30000, "torque_hold_ms", 20000), 20000,
+             "超上限降到 20000");
+    check_eq(effective_source_hold_ms(100, "torque_hold_ms", 20000), 500, "<500 抬到 500");
+    check_eq(effective_source_hold_ms(1, "torque_hold_ms", 20000), 500, "边界 1 抬到 500");
+    check_eq(effective_source_hold_ms(499, "torque_hold_ms", 20000), 500, "边界 499 抬到 500");
+    check_eq(effective_source_hold_ms(500, "torque_hold_ms", 20000), 500, "边界 500 不动");
+    check_eq(effective_source_hold_ms(10001, "torque_hold_ms", 20000), 10001,
+             "10001 仍在 20000 上限内");
+    check_eq(effective_source_hold_ms(-500, "torque_hold_ms", 20000), 500,
+             "负数按 <500 处理, 抬到 500");
+
+    // T22b: hold_trips 只数"停住的值不是 0"的进入次数
+    {
+        Config t = make_test_config();
+        t.channel_b.enable = false;
+        t.torque_hold_ms = 2000;
+        Pipeline pt(t);
+        FfbState f = make_ffb();
+        f.torque_at = 1.0;
+        for (int i = 0; i <= 25; ++i) pt.tick(1.0 + static_cast<double>(i) * 0.1, f, out);
+        check_eq(static_cast<int>(pt.hold_trips_a()), 1,
+                 "停住的值是 64(非 0) => 记一次 hold_trips");
+        check_eq(static_cast<int>(pt.hold_trips_b()), 0, "B 没启用, 不记");
+
+        // 停住的本来就是 0: 不记(否则 vibration 这种源每次都刷一条)
+        Pipeline pz(t);
+        FfbState z = make_ffb();
+        z.torque_magnitude = 0;
+        z.torque_at = 1.0;
+        for (int i = 0; i <= 25; ++i) pz.tick(1.0 + static_cast<double>(i) * 0.1, z, out);
+        check_eq(static_cast<int>(pz.hold_trips_a()), 0,
+                 "停住的值是 0 => 不计 hold_trips");
+
+        // 增益包络也必须看到 0: 归零后按 release 曲线回落到 floor
+        Config g = t;
+        g.auto_gain = true;
+        g.gain_floor = 24;
+        g.gain_ceiling = 127;
+        g.gain_release_sec = 1.0;
+        Pipeline pg(g);
+        FfbState gf = make_ffb();
+        gf.torque_at = 1.0;
+        for (int i = 0; i <= 10; ++i) pg.tick(1.0 + static_cast<double>(i) * 0.1, gf, out);
+        for (int i = 0; i <= 300; ++i) pg.tick(2.0 + static_cast<double>(i) * 0.1, gf, out);
+        check(pg.gain_summary().find("gainA=24") != std::string::npos,
+              "超时期间增益回落到 floor —— 包络看到的也是 0");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 12c. T22b: 全源静默(一级)
+//
+// 这一级的判据是"三个源同时停更", 抓的是"游戏不再喂任何力反馈数据"(退出比赛、
+// 对战匹配打断计时赛)。实测这种齐停最短 48 s, 正常驾驶中 0 次, 所以 1 s 阈值
+// 不会误伤; 而只要有一个源还在动, 就必须解除 —— 否则真实过弯(粘度每秒更新、
+// torque 稳住 7 s)会被误判。
+// ---------------------------------------------------------------------------
+void test_all_sources_silent() {
+    group("[T22b] 全源静默(一级)");
+
+    Config cfg = make_test_config();
+    cfg.silent_mute_ms = 1000;
+    Pipeline p(cfg);                    // A=torque, B=viscosity
+    FfbState ffb = make_ffb();
+    ffb.torque_at = 1.0;
+    ffb.viscosity_at = 1.0;
+    ffb.vibration_at = 0.0;             // 整局没调过 vibration: 不该拖住判定
+    Frame out;
+
+    p.tick(1.9, ffb, out);
+    check(out.a.slots[0].pulse_intensity > 0 && out.b.slots[0].pulse_intensity > 0,
+          "齐停 0.9 s < 1000 ms => 两路都还输出");
+
+    p.tick(2.1, ffb, out);
+    check_eq(out.a.slots[0].pulse_intensity, 0, "齐停 1.1 s => A 脉冲归零");
+    check_eq(out.b.slots[0].pulse_intensity, 0, "齐停 1.1 s => B 脉冲归零");
+    check(out.a.strength > 0 && out.b.strength > 0, "强度字节不变(只作用于原始值)");
+
+    // 只有粘度恢复: 一级立刻解除, 而 torque 才停 1.2 s(远不到二级的 10 s)
+    ffb.viscosity_at = 2.2;
+    p.tick(2.2, ffb, out);
+    check(out.a.slots[0].pulse_intensity > 0, "只要有一个源活着 => 一级解除");
+    check(out.b.slots[0].pulse_intensity > 0, "恢复的那个通道也回来");
+
+    // 恒定输出(map_mode=constant)也受一级影响 —— 齐停时没有任何通道该继续输出
+    Config c2 = cfg;
+    c2.channel_b.source = "viscosity";
+    c2.channel_b.mode = MapMode::Constant;
+    c2.channel_b.level = 1.0;
+    Pipeline pc(c2);
+    FfbState g = make_ffb();
+    g.torque_at = 1.0;
+    g.viscosity_at = 1.0;
+    pc.tick(1.9, g, out);
+    check_eq(out.b.slots[0].pulse_intensity, 100, "Constant 模式平时是满脉冲");
+    pc.tick(2.1, g, out);
+    check_eq(out.b.slots[0].pulse_intensity, 0, "全源静默 => Constant 通道也静音");
+
+    // 0 = 关闭
+    Config off = cfg;
+    off.silent_mute_ms = 0;
+    Pipeline po(off);
+    FfbState s = make_ffb();
+    s.torque_at = 1.0;
+    s.viscosity_at = 1.0;
+    for (int i = 0; i <= 30; ++i) {
+        po.tick(1.0 + static_cast<double>(i) * 0.1, s, out);
+    }
+    check(out.a.slots[0].pulse_intensity > 0, "silent_mute_ms=0 => 不判齐停");
+
+    // 一个样本都没有时这一级不判定(交给 evaluate_safety 的 no_ffb_data_yet)
+    Config early = cfg;
+    Pipeline pe(early);
+    FfbState none;                       // 所有 *_at 都是 0
+    none.servo_on = true;
+    none.ever_updated = false;
+    pe.tick(100.0, none, out);
+    check_eq(out.a.strength, 0, "没有样本时由 no_ffb_data_yet 静音, 不是这一级");
+
+    // 纯函数折算: 0 关闭, 其余钳到 200..10000
+    check_eq(effective_silent_mute_ms(0), 0, "0 = 关闭, 原样");
+    check_eq(effective_silent_mute_ms(1000), 1000, "默认值不被改动");
+    check_eq(effective_silent_mute_ms(100), 200, "<200 抬到 200");
+    check_eq(effective_silent_mute_ms(20000), 10000, ">10000 降到 10000");
+}
+
+// ---------------------------------------------------------------------------
+// 13. T23: 三处默认值防漂移
+//
+// 同一个配置有三份来源: 发布包模板(tools/DGLab_IDAC.ini.template)、
+// INI 缺失时自动生成的 write_default_config()、以及 config.hpp 里"缺键时"
+// 的结构体默认值。三份里任何一份单独改动, 用户看到的行为就会因"INI 在不在"
+// 而不同 —— v0.2.0 就发生过(模板 15/10, 生成 40/30, 缺键 60/60)。
+//
+// 所以这里把三者钉在一起: 模板与生成文件逐字段相同(除两个故意不同的开关),
+// 而"只写两个开关"的极简 INI 必须和模板完全一致 —— 后者检查的是结构体默认值。
+// 找不到模板算失败, 不许跳过: 跳过等于这条防线不存在。
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string read_text_file(const std::string& path, bool* ok) {
+    std::string out;
+    if (ok != nullptr) *ok = false;
+    FILE* f = nullptr;
+    if (::fopen_s(&f, path.c_str(), "rb") != 0 || f == nullptr) return out;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    if (ok != nullptr) *ok = true;
+    return out;
+}
+
+std::string ascii_lower(std::string s) {
+    for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return s;
+}
+
+// 取出所有 "section.key"(小写), 忽略注释与空白。
+std::vector<std::string> ini_keys(const std::string& text) {
+    std::vector<std::string> keys;
+    std::string sec;
+    std::string line;
+    for (size_t i = 0; i <= text.size(); ++i) {
+        if (i < text.size() && text[i] != '\n') {
+            line.push_back(text[i]);
+            continue;
+        }
+        std::string s = line;
+        line.clear();
+        while (!s.empty() && (s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+        const size_t b = s.find_first_not_of(" \t");
+        if (b == std::string::npos) continue;
+        s = s.substr(b);
+        if (s[0] == ';' || s[0] == '#') continue;
+        if (s[0] == '[') {
+            const size_t r = s.find(']');
+            if (r != std::string::npos) sec = ascii_lower(s.substr(1, r - 1));
+            continue;
+        }
+        std::string key = (s.find('=') == std::string::npos) ? s : s.substr(0, s.find('='));
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+        if (!key.empty() && !sec.empty()) keys.push_back(sec + "." + ascii_lower(key));
+    }
+    return keys;
+}
+
+bool has_key(const std::vector<std::string>& keys, const std::string& k) {
+    for (const auto& x : keys) {
+        if (x == k) return true;
+    }
+    return false;
+}
+
+// 逐字段比较。新增配置字段时必须在这里补一行 —— 这是有意的: 让"忘记同步
+// 三处默认值"变成编译期之后的第一道红灯, 而不是用户手感变了才发现。
+std::string diff_configs(const Config& a, const Config& b, bool include_switches) {
+    std::string d;
+    auto I = [&](int x, int y, const char* n) {
+        if (x != y) { d += n; d += "(" + std::to_string(x) + "!=" + std::to_string(y) + ") "; }
+    };
+    auto D = [&](double x, double y, const char* n) {
+        if (!(std::fabs(x - y) < 1e-9)) {
+            d += n; d += "(" + std::to_string(x) + "!=" + std::to_string(y) + ") ";
+        }
+    };
+    auto B = [&](bool x, bool y, const char* n) {
+        if (x != y) { d += n; d += "(" + std::string(x ? "1" : "0") + "!=" + (y ? "1" : "0") + ") "; }
+    };
+    auto S = [&](const std::string& x, const std::string& y, const char* n) {
+        if (x != y) { d += n; d += "(" + x + "!=" + y + ") "; }
+    };
+
+    if (include_switches) {
+        I(static_cast<int>(a.link), static_cast<int>(b.link), "link");
+        B(a.dry_run, b.dry_run, "dry_run");
+    }
+    B(a.enabled, b.enabled, "enabled");
+    B(a.verbose, b.verbose, "verbose");
+    I(static_cast<int>(a.protocol), static_cast<int>(b.protocol), "protocol");
+    S(a.ble_device_name, b.ble_device_name, "ble_device_name");
+    I(a.ble_reconnect_ms, b.ble_reconnect_ms, "ble_reconnect_ms");
+    I(a.ble_connect_timeout_ms, b.ble_connect_timeout_ms, "ble_connect_timeout_ms");
+    I(a.frame_ms, b.frame_ms, "frame_ms");
+    I(a.pulse_freq_base, b.pulse_freq_base, "pulse_freq_base");
+    I(a.pulse_freq_min, b.pulse_freq_min, "pulse_freq_min");
+    I(a.pulse_freq_max, b.pulse_freq_max, "pulse_freq_max");
+    D(a.pulse_freq_track, b.pulse_freq_track, "pulse_freq_track");
+    B(a.auto_gain, b.auto_gain, "auto_gain");
+    D(a.gain_attack_sec, b.gain_attack_sec, "gain_attack_sec");
+    D(a.gain_release_sec, b.gain_release_sec, "gain_release_sec");
+    I(a.gain_floor, b.gain_floor, "gain_floor");
+    I(a.gain_ceiling, b.gain_ceiling, "gain_ceiling");
+    D(a.gain_idle_reset_sec, b.gain_idle_reset_sec, "gain_idle_reset_sec");
+    I(a.max_strength, b.max_strength, "max_strength");
+    I(a.clamp_strength, b.clamp_strength, "clamp_strength");
+    D(a.slew_per_second, b.slew_per_second, "slew_per_second");
+    I(a.watchdog_ms, b.watchdog_ms, "watchdog_ms");
+    B(a.zero_when_servo_off, b.zero_when_servo_off, "zero_when_servo_off");
+    I(a.viscosity_hold_ms, b.viscosity_hold_ms, "viscosity_hold_ms");
+    I(a.torque_hold_ms, b.torque_hold_ms, "torque_hold_ms");
+    I(a.vibration_hold_ms, b.vibration_hold_ms, "vibration_hold_ms");
+    I(a.silent_mute_ms, b.silent_mute_ms, "silent_mute_ms");
+    I(a.warmup_ms, b.warmup_ms, "warmup_ms");
+    B(a.torque_negative_is_positive, b.torque_negative_is_positive,
+      "torque_negative_is_positive");
+    B(a.hook, b.hook, "hook");
+
+    const char* ch[2] = {"a", "b"};
+    const ChannelMapping* ca[2] = {&a.channel_a, &a.channel_b};
+    const ChannelMapping* cb[2] = {&b.channel_a, &b.channel_b};
+    for (int i = 0; i < 2; ++i) {
+        const std::string p = std::string(ch[i]) + ".";
+        B(ca[i]->enable, cb[i]->enable, (p + "enable").c_str());
+        I(static_cast<int>(ca[i]->mode), static_cast<int>(cb[i]->mode), (p + "mode").c_str());
+        I(ca[i]->in_min, cb[i]->in_min, (p + "in_min").c_str());
+        I(ca[i]->in_max, cb[i]->in_max, (p + "in_max").c_str());
+        D(ca[i]->level, cb[i]->level, (p + "level").c_str());
+        I(ca[i]->base_strength, cb[i]->base_strength, (p + "base_strength").c_str());
+        S(ca[i]->strength_source, cb[i]->strength_source, (p + "strength_source").c_str());
+        D(ca[i]->strength_margin, cb[i]->strength_margin, (p + "strength_margin").c_str());
+        S(ca[i]->source, cb[i]->source, (p + "source").c_str());
+    }
+    return d;
+}
+
+bool write_text_file(const std::string& path, const std::string& text) {
+    FILE* f = nullptr;
+    if (::fopen_s(&f, path.c_str(), "wb") != 0 || f == nullptr) return false;
+    const size_t n = std::fwrite(text.data(), 1, text.size(), f);
+    std::fclose(f);
+    return n == text.size();
+}
+
+// ★ 必须用绝对路径 ★
+// WritePrivateProfileString / GetPrivateProfileString 收到**相对路径**时, 会先
+// 去 Windows 目录找同名文件, 而不是相对当前工作目录 —— 测试里用相对路径会
+// 让"写进去"和"读出来"落在两个不同地方, 表现成的假象是"生成文件里一个键都
+// 没有, 而两份配置逐字段相同"。
+std::string absolute_path(const std::string& p) {
+    char buf[4096] = {0};
+    if (::_fullpath(buf, p.c_str(), sizeof buf) == nullptr) return p;
+    return std::string(buf);
+}
+
+}  // namespace
+
+void test_default_drift() {
+    group("[T23] 三处默认值不漂移");
+
+    bool ok = false;
+    const std::string tpl_text = read_text_file(DGLAB_TEMPLATE_FILE, &ok);
+    check(ok, std::string("模板文件必须存在: ") + DGLAB_TEMPLATE_FILE);
+    if (!ok) return;   // 找不到模板就是失败, 不跳过
+
+    // load_config 会就地做 LF->CRLF 归一化, 所以一律读临时副本。
+    const std::string tpl_copy = absolute_path("dglab_drift_tpl.ini");
+    const std::string gen_path = absolute_path("dglab_drift_gen.ini");
+    const std::string min_path = absolute_path("dglab_drift_min.ini");
+    std::remove(tpl_copy.c_str());
+    std::remove(gen_path.c_str());
+    std::remove(min_path.c_str());
+
+    check(write_text_file(tpl_copy, tpl_text), "模板副本写出成功");
+    check(write_default_config(gen_path), "write_default_config 写出文件");
+    check(write_text_file(min_path, "[link]\nmode=ble\n[safety]\ndry_run=0\n"),
+          "极简 INI 写出成功");
+
+    const std::string gen_text = read_text_file(gen_path, &ok);
+    check(ok, "能读回生成的文件");
+
+    // 1) 模板里的每一个键, 生成文件里都要有
+    const std::vector<std::string> tpl_keys = ini_keys(tpl_text);
+    const std::vector<std::string> gen_keys = ini_keys(gen_text);
+    check(tpl_keys.size() > 20, "模板里解析出了键(防止解析器本身失效)");
+    std::string missing;
+    for (const auto& k : tpl_keys) {
+        if (!has_key(gen_keys, k)) { missing += k; missing += " "; }
+    }
+    check(missing.empty(), "生成文件缺少模板里的键: " +
+                               (missing.empty() ? std::string("(无)") : missing));
+
+    // 2) 逐字段比较, 除 link 与 dry_run
+    const Config ct = load_config(tpl_copy);
+    const Config cg = load_config(gen_path);
+    const std::string d = diff_configs(ct, cg, false);
+    check(d.empty(), "模板与生成文件逐字段相同(除 link/dry_run): " +
+                         (d.empty() ? std::string("(无)") : d));
+
+    // 3) 缺键默认值: 只写两个开关, 结果必须与模板完全一致
+    const Config cm = load_config(min_path);
+    const std::string d2 = diff_configs(ct, cm, true);
+    check(d2.empty(), "只写两个开关时, 其余全部来自缺键默认值且与模板一致: " +
+                          (d2.empty() ? std::string("(无)") : d2));
+
+    // 两个开关本身确实是故意不同的(否则上面两条比较会失去意义)
+    check(cg.link == LinkMode::Disabled && ct.link == LinkMode::Ble,
+          "生成文件故意用 link=disabled, 模板是 ble");
+    check(cg.dry_run && !ct.dry_run, "生成文件故意用 dry_run=1, 模板是 0");
+    check(ct.channel_a.base_strength == 15 && ct.channel_b.base_strength == 10,
+          "两路 base_strength 不同(A=15, B=10), 且缺键默认值与之一致");
+    check(std::fabs(ct.channel_b.level - 0.6) < 1e-9, "B 的 level 是 0.6");
+
+    std::remove(tpl_copy.c_str());
+    std::remove(gen_path.c_str());
+    std::remove(min_path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// 12b. T24: source 名字的大小写与允许列表
+// ---------------------------------------------------------------------------
+void test_source_names() {
+    group("[T24] source 名字的大小写与允许列表");
+
+    check(is_known_source("torque"), "torque 认识");
+    check(is_known_source("Torque"), "Torque 大小写不敏感");
+    check(is_known_source("VISCOSITY"), "VISCOSITY 认识");
+    check(is_known_source("vibration_a"), "vibration_a 认识");
+    check(is_known_source("servo") && is_known_source("const"), "servo / const 认识");
+    check(!is_known_source("static"),
+          "static 不是 source(恒定输出要用 map_mode=constant)");
+    check(!is_known_source("abs_sqrt"), "abs_sqrt 不是 source");
+    check(!is_known_source(""), "空字符串不是已知源");
+
+    // 从 INI 读进来时统一转小写, 否则 "Torque" 会被当成未知源
+    const std::string p = absolute_path("dglab_src_case.ini");
+    check(write_text_file(p, "[channel_a]\nsource=Torque\nstrength_source=LEVEL\n"),
+          "大小写测试 INI 写出成功");
+    const Config c = load_config(p);
+    check(c.channel_a.source == "torque", "INI 里的 Torque 归一化成 torque");
+    check(c.channel_a.strength_source == "level", "strength_source 也归一化成小写");
+    std::remove(p.c_str());
 }
 
 }  // namespace
@@ -663,9 +1215,14 @@ int main() {
     test_pipeline_warmup();
     test_ffb_gap_stats();
     test_held_risk_source();
+    test_hold_stats();
     test_effective_watchdog_ms();
     test_effective_frame_ms();
     test_viscosity_hold();
+    test_source_hold();
+    test_all_sources_silent();
+    test_source_names();
+    test_default_drift();
     test_mailbox_consumer_ready();
 
     std::printf("\n-------------------------------------------\n");

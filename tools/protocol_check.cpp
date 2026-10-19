@@ -10,7 +10,7 @@
 //
 //   所以这个工具的基准不是我们的实现, 而是官方文档里的例子。
 //   权威来源: dungeonlab-open/dglab-bluetooth-protocol, coyote/v3/README.md
-//   存档在 re/dglab_v3_protocol.md。
+//   按快照提交 045720d 引用; 链接与 sha256 在 re/reference/dglab-bluetooth-protocol/PROVENANCE.md。
 //
 // 官方例子里**没有给强度模式的完整十六进制**(那 4 个 mode 例子只有文字
 // 描述), 所以下面用官方表格明确写出的位模式自己构造期望值。这是刻意的:
@@ -85,7 +85,7 @@ int seq_of(const B0& c) { return (c.bytes[1] >> 4) & 0x0F; }
 
 // ---------------------------------------------------------------------------
 int main() {
-    std::printf("protocol_check —— 对照 re/dglab_v3_protocol.md 校验 B0/BF 编码\n");
+    std::printf("protocol_check —— 对照 官方协议(见 PROVENANCE.md) 校验 B0/BF 编码\n");
 
     // -----------------------------------------------------------------------
     group("强度模式: 枚举值必须等于文档写的位模式");
@@ -283,7 +283,7 @@ int main() {
     if (g_fail == 0) {
         std::printf("结论: B0/BF 编码与官方协议一致。\n");
     } else {
-        std::printf("结论: 有 %d 项不符 —— 先对着 re/dglab_v3_protocol.md 复核, 不要改测试去迁就代码。\n",
+        std::printf("结论: 有 %d 项不符 —— 先对着 官方协议(见 PROVENANCE.md) 复核, 不要改测试去迁就代码。\n",
                     g_fail);
     }
     return g_fail == 0 ? 0 : 1;

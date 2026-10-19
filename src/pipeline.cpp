@@ -125,8 +125,8 @@ double Pipeline::update_gain(GainTracker& t, const ChannelMapping& m,
 
     bool ok = false;
     int32_t raw = pick_source(m.source, ffb, ok, cfg_.torque_negative_is_positive);
-    // T17: 源保持超时的值与"这个值是 0"必须对包络和映射一样 —— 否则脉冲归零了,
-    // 包络却还拿旧峰值当标定, 下一段恢复时会莫名变软。
+    // T22b: 保持超时/全源静音的判定结果必须对包络和映射一致 —— 否则脉冲归零
+    // 了, 包络却还拿旧峰值当标定, 下一段恢复时会莫名变软。
     if (raw_zeroed) raw = 0;
     const double v = ok ? static_cast<double>(raw < 0 ? -raw : raw) : 0.0;
 
@@ -158,31 +158,80 @@ double Pipeline::update_gain(GainTracker& t, const ChannelMapping& m,
 }
 
 // ---------------------------------------------------------------------------
-// T17: viscosity 的"保持超时"判定。
+// T17 / T22b: "源不再更新"的两级判定。
 //
-// 为什么只对 viscosity 做: 它的回调是"值变了才回调"(IndRun 侧有变化缓存),
-// 而 torque/vibration 也不会在菜单里刷, 差别在于 —— 退出比赛回菜单时游戏会把
-// 阻尼停在一个非零值上然后不再回调, 于是那个值被当成"当前状态"一直输出。
-// 实测(第二轮 T16): 停住的 visc_b=10 会让脉冲停在 42/100, 人体无感但设备的
-// 电流指示灯亮着; 按默认 25/35 的强度用就会明显可感。
+// 背景: 回调是"值变了才回调"(IndRun 侧有变化缓存)。于是"值保持不变"既可能
+// 是真实驾驶(方向盘稳住, 粘度仍在每秒更新), 也可能是游戏根本没有再喂数据
+// (退出比赛/匹配打断计时赛, 三个源一起停)。两者的区别不在单个源上, 而在
+// "还有没有别的源在动"。
 //
-// 做法: 在"取原始值"这一层把它当 0 —— 不是给输出打补丁, 所以归一化、映射、
+// 一级(全源静默): 三个源同时停更 > silent_mute_ms -> 所有通道原始值按 0。
+//   2026-10-18 那局实测: 这类齐停只出现 22 次, 最短 48 s, 正常驾驶中 0 次,
+//   所以 1 s 阈值不会误伤; 而它能把"匹配成功打断计时赛"从 60~95 s 的残余
+//   输出压到 1 s 以内。
+// 二级(单源超时): 某个源自己停更 > 它的 *_hold_ms -> 该通道原始值按 0。
+//   兜的是"某个源单独卡死"以及"菜单里粘度先恢复、torque 还停着"的尾巴。
+//   阈值必须大于实测最长真实保持(torque 7.0 s), 所以默认 10 s。
+//
+// 做法: 都在"取原始值"这一层把它当 0 —— 不是给输出打补丁, 所以归一化、映射、
 // 增益包络看到的是同一个 0(见 map_input / update_gain 的 raw_zeroed 参数)。
-// 0 表示关闭(viscosity_hold_ms=0), 从不判定。
+// 0 表示关闭对应的那一级。
 // ---------------------------------------------------------------------------
-bool Pipeline::viscosity_hold_expired(const ChannelMapping& m, const FfbState& ffb,
-                                     double now, double* held_ms_out) const {
+
+bool Pipeline::source_hold_expired(const ChannelMapping& m, const FfbState& ffb,
+                                   double now, double* held_ms_out,
+                                   const char** why_out, int* limit_ms_out) const {
     if (held_ms_out != nullptr) *held_ms_out = 0.0;
-    if (cfg_.viscosity_hold_ms <= 0) return false;   // 0 = 关闭
-    if (!m.enable) return false;                     // 关掉的通道本来就输出 0
-    if (!is_held_risk_source(m.source)) return false;  // 只有 viscosity / viscosity_a
+    if (why_out != nullptr) *why_out = "";
+    if (limit_ms_out != nullptr) *limit_ms_out = 0;
+    if (!m.enable) return false;          // 关掉的通道本来就输出 0
+
+    // source -> (时间戳, 超时值) 的映射与 load_config 的告警同源(T22b)。
+    double at = 0.0;
+    const char* name = "";
+    const HoldSource hs = hold_source_of(m.source);
+    switch (hs) {
+        case HoldSource::Torque:    at = ffb.torque_at;    name = "torque";    break;
+        case HoldSource::Viscosity: at = ffb.viscosity_at; name = "viscosity"; break;
+        case HoldSource::Vibration: at = ffb.vibration_at; name = "vibration"; break;
+        case HoldSource::None:
+            return false;                 // servo / const / 未知: 永不超时
+    }
+    const int limit = hold_timeout_of(cfg_, hs);
+    if (limit <= 0) return false;         // 0 = 关闭这一级
     // 还没收到过任何样本(游戏还没进比赛): 原始值本来就是 0, 不需要额外处理,
     // 也不该在启动阶段打一条"保持超时"的日志。
-    if (ffb.viscosity_at <= 0.0) return false;
+    if (at <= 0.0) return false;
 
-    const double held_ms = (now - ffb.viscosity_at) * 1000.0;
+    const double held_ms = (now - at) * 1000.0;
     if (held_ms_out != nullptr) *held_ms_out = held_ms > 0.0 ? held_ms : 0.0;
-    return held_ms > static_cast<double>(cfg_.viscosity_hold_ms);
+    if (held_ms <= static_cast<double>(limit)) return false;
+    if (why_out != nullptr) *why_out = name;
+    if (limit_ms_out != nullptr) *limit_ms_out = limit;
+    return true;
+}
+
+bool Pipeline::all_sources_silent(const FfbState& ffb, double now,
+                                  double* held_ms_out) const {
+    if (held_ms_out != nullptr) *held_ms_out = 0.0;
+    if (cfg_.silent_mute_ms <= 0) return false;   // 0 = 关闭
+
+    // 从未收到过样本的源按"很久以前"算: 游戏可能整局都不调 vibration,
+    // 那它就永远是最老的那一个, 不该拖住判定。
+    const double kNever = 1e9;
+    const double age_torque = (ffb.torque_at    > 0.0) ? (now - ffb.torque_at)    : kNever;
+    const double age_visc   = (ffb.viscosity_at > 0.0) ? (now - ffb.viscosity_at) : kNever;
+    const double age_vib    = (ffb.vibration_at > 0.0) ? (now - ffb.vibration_at) : kNever;
+
+    // 一个样本都还没有(游戏还没进比赛): 交给 evaluate_safety 的
+    // no_ffb_data_yet, 这里不重复判定, 免得启动阶段打一条误导性的日志。
+    if (age_torque >= kNever && age_visc >= kNever && age_vib >= kNever) return false;
+
+    const double min_age = (std::min)({age_torque, age_visc, age_vib});
+    const double min_ms  = (min_age > 0.0 ? min_age : 0.0) * 1000.0;
+    if (min_ms <= static_cast<double>(cfg_.silent_mute_ms)) return false;
+    if (held_ms_out != nullptr) *held_ms_out = min_ms;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +247,10 @@ double Pipeline::effective_in_max(const ChannelMapping& m,
 double Pipeline::map_input(const ChannelMapping& m, const FfbState& ffb,
                            bool raw_zeroed) const {
     if (!m.enable) return 0.0;
+    // T22b: 原始值被判为 0 时, 连 Constant 模式一起静音 —— 一级判定的语义是
+    // "游戏不再喂任何力反馈数据", 这时没有任何通道该继续输出(包括诊断用的
+    // 恒定输出)。二级(单源超时)不会走到这里, 因为 const/servo 不属于会超时的源。
+    if (raw_zeroed) return 0.0;
     if (m.mode == MapMode::Constant) return clamp01(m.level);
 
     bool ok = false;
@@ -206,8 +259,6 @@ double Pipeline::map_input(const ChannelMapping& m, const FfbState& ffb,
         // 每个 tick 都刷屏没意义, 所以这里不打日志 —— 配置解析时就该发现。
         return 0.0;
     }
-    // T17: 见 update_gain 里同一条注释。
-    if (raw_zeroed) raw = 0;
 
     const double span = effective_in_max(m, ffb) - static_cast<double>(m.in_min);
     if (span <= 0.0) return clamp01(m.level);
@@ -327,7 +378,7 @@ bool Pipeline::tick(double now, const FfbState& ffb, Frame& out) {
     // 别的东西占住、断点、机器休眠)。这不是"游戏没给数据"—— 力反馈回调是
     // 边沿触发的, 力不变时不回调完全正常, 拿它做判据会一直误触发。
     //
-    // ★ 这一层能覆盖什么、不能覆盖什么 (实测, 见 README 第 8 节第 1 条) ★
+    // ★ 这一层能覆盖什么、不能覆盖什么 (实测, 见 README 5.3 节) ★
     // 能: 游戏还在跑, 但主线程被占住/管线被饿死 —— 此时 BLE 发送线程还活着,
     //     传输层侧的 FrameMailbox 看门狗也会同时生效, 真的把设备拉回 0。
     // 不能: 整个游戏进程一起卡死(例如拖动控制台滚动条)。本作的物理与渲染
@@ -359,27 +410,67 @@ bool Pipeline::tick(double now, const FfbState& ffb, Frame& out) {
     safety_.watchdog_tripped = stalled;
 
 
-    // ---- T17: viscosity 保持超时 ----
+    // ---- T22b: 两级"源不再更新"判定 ----
     // 必须在 update_gain / map_input 之前, 它们两个都要看这个判定结果。
     double held_a_ms = 0.0;
     double held_b_ms = 0.0;
-    const bool hold_a = viscosity_hold_expired(cfg_.channel_a, ffb, now, &held_a_ms);
-    const bool hold_b = viscosity_hold_expired(cfg_.channel_b, ffb, now, &held_b_ms);
+    const char* why_a = "";
+    const char* why_b = "";
+    int limit_a = 0;
+    int limit_b = 0;
+    const bool src_hold_a = source_hold_expired(cfg_.channel_a, ffb, now, &held_a_ms,
+                                               &why_a, &limit_a);
+    const bool src_hold_b = source_hold_expired(cfg_.channel_b, ffb, now, &held_b_ms,
+                                               &why_b, &limit_b);
+    // 一级: 三源齐停 -> 所有通道(含 const / servo)原始值都按 0。理由见上面
+    // 那段注释: 齐停意味着游戏不再喂任何力反馈数据, 这时没有"恒定输出"可讲。
+    double silent_ms = 0.0;
+    const bool all_silent = all_sources_silent(ffb, now, &silent_ms);
+    const bool hold_a = all_silent || src_hold_a;
+    const bool hold_b = all_silent || src_hold_b;
+    // 停住的那个值本身 —— 日志只在它 != 0 时才打。否则 vibration 这种大部分
+    // 时间为 0 的源会在每次回菜单时刷一条"归零", 把真正的风险淹掉。
+    auto held_value = [&ffb](const ChannelMapping& m) -> int32_t {
+        bool ok = false;
+        const int32_t v = pick_source(m.source, ffb, ok, false);
+        return (ok && v > 0) ? v : 0;
+    };
+    const int32_t held_val_a = hold_a ? held_value(cfg_.channel_a) : 0;
+    const int32_t held_val_b = hold_b ? held_value(cfg_.channel_b) : 0;
+
     // 只在进入/退出时各打一条 —— 这个状态一次会话里会来回切换几十次(发车、
     // 冲线、菜单), 每 tick 打一条就把日志淹了。
-    auto report_hold = [this](const char* name, bool now_zero, bool& was_zero, double held_ms) {
+    auto report_hold = [this, all_silent, silent_ms](const char* name, bool now_zero,
+                                                     bool& was_zero, bool src_hold,
+                                                     const char* why, double held_ms,
+                                                     int limit_ms, int32_t held_val) {
         if (now_zero == was_zero) return;
         was_zero = now_zero;
-        if (now_zero) {
-            log_info("[channel_%s] viscosity 已 %.0f ms 没有更新(保持超时 %d ms), 输出归零 —— "
-                     "原地不动的时段(菜单、发车倒计时)会这样, 源一更新就恢复",
-                     name, held_ms, cfg_.viscosity_hold_ms);
-        } else {
-            log_info("[channel_%s] viscosity 恢复更新, 输出恢复", name);
+        if (!now_zero) {
+            // 只有真打过"进入"才打"恢复", 否则两边不配对, 日志更难读。
+            log_info("[channel_%s] 力反馈源恢复更新, 输出恢复", name);
+            return;
+        }
+        // 停住的本来就是 0: 输出一样是 0, 没有风险, 不刷日志。
+        if (held_val <= 0) return;
+        if (all_silent) {
+            log_info("[channel_%s] 三个力反馈源已同时停更 %.0f ms(全源静默阈值 %d ms), "
+                     "停住的值 %d 按 0 处理 —— 退出比赛/回菜单时就是这样",
+                     name, silent_ms, cfg_.silent_mute_ms, held_val);
+        } else if (src_hold) {
+            log_info("[channel_%s] %s 已 %.0f ms 没有更新(保持超时 %d ms), "
+                     "停住的值 %d 按 0 处理 —— 源一更新就恢复",
+                     name, why, held_ms, limit_ms, held_val);
         }
     };
-    report_hold("A", hold_a, hold_zero_a_, held_a_ms);
-    report_hold("B", hold_b, hold_zero_b_, held_b_ms);
+    report_hold("A", hold_a, hold_zero_a_, src_hold_a, why_a, held_a_ms, limit_a, held_val_a);
+    report_hold("B", hold_b, hold_zero_b_, src_hold_b, why_b, held_b_ms, limit_b, held_val_b);
+
+    // T22b: 只数"停住的值不是 0"的那些次(与日志条件一致), 供 [hb] 观察。
+    if (hold_a && !was_hold_a_ && held_val_a > 0) ++hold_trips_a_;
+    if (hold_b && !was_hold_b_ && held_val_b > 0) ++hold_trips_b_;
+    was_hold_a_ = hold_a;
+    was_hold_b_ = hold_b;
 
     // ---- 自动增益: 每 tick 推进一次包络, 供本帧的 A/B 两路归一化使用 ----
     // 必须在 map_input 之前, 因为 map_input 读的是本帧算出来的增益。

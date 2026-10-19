@@ -16,7 +16,7 @@
 #   tools\build.cmd -Deploy          —— 额外把产物铺到游戏 Mods 目录
 # ---------------------------------------------------------------------------
 cmake_minimum_required(VERSION 3.18)
-project(DGLab_IDAC VERSION 0.2.0 LANGUAGES CXX)
+project(DGLab_IDAC VERSION 0.2.1 LANGUAGES CXX)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "只能构建 x64 —— 游戏是 64 位进程。")
@@ -456,7 +456,8 @@ set_target_properties(abitest PROPERTIES
 # "不变"。这类错误只有逐位对着协议核对才能发现。
 #
 # 基准是官方文档的例子, 不是我们自己的实现 —— 详见 tools/protocol_check.cpp
-# 顶部。官方文档的逐字节副本在 re/reference/dglab-bluetooth-protocol/。
+# 顶部。官方文档按快照提交号引用, 链接与每份文件的 sha256 记在
+# re/reference/dglab-bluetooth-protocol/PROVENANCE.md (仓库不再包含副本)。
 #
 # 构建:  cmake --build build --config Release --target protocol_check
 # 运行:  build\Release\protocol_check.exe    (全通过返回 0)
@@ -524,3 +525,9 @@ if(MSVC)
         NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
     )
 endif()
+
+# T23: 防漂移测试要读发布包模板。用编译期路径而不是"运行时猜", 这样在别的
+# 机器上也能找到; 文件缺失时测试直接 FAIL, 不许跳过。不依赖 MSVC, 故放外面。
+target_compile_definitions(logic_check PRIVATE
+    "DGLAB_TEMPLATE_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/tools/DGLab_IDAC.ini.template\""
+)

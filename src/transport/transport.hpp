@@ -42,7 +42,7 @@ inline constexpr int kBfSize = 7;
 //
 // ⚠⚠ 这四个值曾经**全部反了**, 2026-10-17 照官方文档
 //    (dungeonlab-open/dglab-bluetooth-protocol, coyote/v3/README.md,
-//     逐字节副本存于 re/reference/dglab-bluetooth-protocol/coyote-v3-README.md)
+//     快照提交 045720d, 链接见 re/reference/dglab-bluetooth-protocol/PROVENANCE.md)
 //    逐个核对后改正:
 //
 //       0b00  不变 —— **忽略本通道的强度字节**, 维持设备当前值
@@ -108,7 +108,7 @@ uint8_t hz_to_pulse_value(double hz);
 // 力反馈回调是边沿触发的(值不变就不回调), 方向盘稳定受力时"很久没回调"
 // 完全正常, 按它做看门狗会误静音。
 //
-// ★ 覆盖边界 (实测, 见 README 第 8 节第 1 条) ★
+// ★ 覆盖边界 (实测, 见 README 5.3 节) ★
 // 它能兜住的是"发送线程还在跑、但管线不再出帧"(管线卡住/崩溃/被饿死)。它兜不住
 // 整个进程一起冻结: 那时本类的 take() 自己也不会被调用, 设备保持最后一帧的强度。
 // 421 s 的那局里两次 10.9 s / 14.0 s 的卡顿, trips 全程为 0 就是这个原因。

@@ -475,6 +475,12 @@ private:
         // 实机数据能回答。两份统计各打一行, 用 src= 区分, 分桶口径完全相同。
         dglab_idac::FfbGapStats gap_stats;
         dglab_idac::FfbGapStats visc_gap_stats;
+        // T22a: 三个源的"非零值保持不变了多久"。
+        // FfbGapStats 在值降到 0 时只结束区间, 不记录上一段非零值保持了多久,
+        // 而定"保持超时"的默认值要的正是后者。
+        dglab_idac::HoldStats hold_torque;
+        dglab_idac::HoldStats hold_visc;
+        dglab_idac::HoldStats hold_vib;
         double last_gap_report = now_seconds();
         constexpr double kGapReportSeconds = 60.0;
         // T18: 打完不清"上一次回调的时刻", 只清计数 —— 跨过 60 s 边界的间隔
@@ -491,6 +497,32 @@ private:
                 static_cast<unsigned long long>(g.n_gt_5), g.max_gap,
                 g.open_seconds(t), static_cast<unsigned long long>(g.stops));
             g.reset_counts();
+        };
+
+        // T22a: 打三个源的"非零值保持时长"。摘要一行 + 至多 10 条明细。
+        // 明细只留 >=1 s 的, 因为定超时阈值要看的是"较长的那些发生在什么值上"。
+        auto report_hold = [](const char* src, double t, double start, dglab_idac::HoldStats& h) {
+            dglab_idac::log_info(
+                "[ffbhold] src=%s t=%.0fs n=%llu <0.5=%llu 0.5-1=%llu 1-2=%llu 2-3=%llu "
+                "3-5=%llu >5=%llu max=%.2fs(val=%d) open=%.2fs(val=%d)",
+                src, t - start, static_cast<unsigned long long>(h.total()),
+                static_cast<unsigned long long>(h.n_lt_05),
+                static_cast<unsigned long long>(h.n_05_1),
+                static_cast<unsigned long long>(h.n_1_2),
+                static_cast<unsigned long long>(h.n_2_3),
+                static_cast<unsigned long long>(h.n_3_5),
+                static_cast<unsigned long long>(h.n_gt_5),
+                h.max_hold, h.max_val, h.open_seconds(t), h.value());
+            for (int i = 0; i < h.long_n; ++i) {
+                dglab_idac::log_info("[ffbhold] long src=%s t=%.0fs held=%.2fs val=%d",
+                                     src, h.longs[i].end - start, h.longs[i].held,
+                                     h.longs[i].value);
+            }
+            if (h.suppressed > 0) {
+                dglab_idac::log_info("[ffbhold] long src=%s suppressed=%llu", src,
+                                     static_cast<unsigned long long>(h.suppressed));
+            }
+            h.reset_counts();
         };
 
         while (running_) {
@@ -528,16 +560,24 @@ private:
                 // 采样频率就变成了主循环频率, 统计出来的东西没有意义。
                 if (ffb.torque_calls != prev_torque) {
                     gap_stats.on_torque(t, ffb.torque_magnitude);
+                    hold_torque.on_update(ffb.torque_at, ffb.torque_magnitude);
                 }
                 // viscosity 用 b 参数当"幅值"(a 是符号, 见 ffb_types.hpp):
                 // b>0 才算"在施阻尼", 归 0 时该段区间结束。
                 if (ffb.viscosity_calls != prev_visc) {
                     visc_gap_stats.on_torque(t, ffb.viscosity_b);
+                    hold_visc.on_update(ffb.viscosity_at, ffb.viscosity_b);
+                }
+                if (ffb.vibration_calls != prev_vib) {
+                    hold_vib.on_update(ffb.vibration_at, ffb.vibration_b);
                 }
                 if (t - last_gap_report >= kGapReportSeconds) {
                     last_gap_report = t;
                     report_gap("torque", t, start_time, gap_stats);
                     report_gap("visc", t, start_time, visc_gap_stats);
+                    report_hold("torque", t, start_time, hold_torque);
+                    report_hold("visc", t, start_time, hold_visc);
+                    report_hold("vib", t, start_time, hold_vib);
                 }
 
                 prev_torque = ffb.torque_calls;
@@ -571,7 +611,8 @@ private:
                         "[hb] t=%.0fs frames=%llu | torque=%llu mag[%d..%d] dir[%d..%d] | "
                         "visc=%llu b[%d..%d] | vib=%llu b[%d..%d] | servo on/off=%llu/%llu=%d | "
                         "%s | %s | now: tq_m=%d visc_b=%d vib_b=%d "
-                        "age(tq/visc/vib)=%.1f/%.1f/%.1fs servo=%d out A=%d/%d B=%d/%d",
+                        "age(tq/visc/vib)=%.1f/%.1f/%.1fs servo=%d out A=%d/%d B=%d/%d "
+                        "hold(A/B)=%llu/%llu",
                         t - start_time,
                         static_cast<unsigned long long>(frames),
                         static_cast<unsigned long long>(s.torque_calls),
@@ -592,7 +633,9 @@ private:
                         pipeline_ ? pipeline_->gain_summary().c_str() : "pipeline=null",
                         s.torque_magnitude, s.viscosity_b, s.vibration_b,
                         age_of(s.torque_at), age_of(s.viscosity_at), age_of(s.vibration_at),
-                        s.servo_on ? 1 : 0, out_a_s, out_a_p, out_b_s, out_b_p);
+                        s.servo_on ? 1 : 0, out_a_s, out_a_p, out_b_s, out_b_p,
+                        static_cast<unsigned long long>(pipeline_ ? pipeline_->hold_trips_a() : 0),
+                        static_cast<unsigned long long>(pipeline_ ? pipeline_->hold_trips_b() : 0));
 
                     // ---- 传输层状态: 每 10 秒一行(不是每秒, 否则日志本身就成了负担) ----
                     // 为什么要单独打这个: 传输层的计数(submitted/repeated/overwritten)

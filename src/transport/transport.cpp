@@ -184,8 +184,10 @@ uint8_t hz_to_pulse_value(double hz) {
 // ---------------------------------------------------------------------------
 // B0 编码
 //
-// 模式语义(官方文档原文, 见 re/reference/dglab-bluetooth-protocol/
-// coyote-v3-README.md 的 "Intensity Interpretation Mode" 表):
+// 模式语义(官方文档原文, 见
+// https://github.com/dungeonlab-open/dglab-bluetooth-protocol/blob/045720d5c5ee4879e25b7bad555c962f97ed423f/coyote/v3/README.md
+// 的 "Intensity Interpretation Mode" 表; 链接与校验和见
+// re/reference/dglab-bluetooth-protocol/PROVENANCE.md):
 //   0b00 不变        —— 忽略本通道强度字节, 维持设备当前值
 //   0b01 相对增加
 //   0b10 相对减少

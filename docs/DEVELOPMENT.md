@@ -217,13 +217,21 @@ UE4SS **只认 `<mod>\dlls\main.dll`**, 所以部署时改名:
 ```
 
 `tools\build.cmd -Deploy` 会自动做这件事。
-启用方式二选一 (UE4SS v3.0.1 实测行为):
+启用途径有两条, 下表是 E1–E4 四个组合的实测结果 (2026-10-19, UE4SS v3.0.1-944-g0196ef29;
+判据是 `UE4SS.log` 里的 `Starting C++ mod 'DGLab_IDAC'` 与模组日志里
+`==== DGLab_IDAC 0.2.1 启动` 各出现几次):
 
-1. 往 `Mods\mods.txt` 加一行 `DGLab_IDAC : 1` —— **推荐, 有加载顺序**。
-   位置必须在 `; Built-in keybinds, do not move up!` 上方(即 `Keybinds : 1` 之前);
-   写在文件末尾会排到内置按键绑定后面, 加载顺序就不对了。
-2. 丢一个空的 `enabled.txt` 进 mod 目录 —— 内容从不被读取, 只看文件存不存在。
-   `Mods\LocalRadio\` 就是这么启用的; 启动器重写 `mods.txt` 时这条路不受影响。
+| `enabled.txt` | `mods.txt` | 结果 |
+|---|---|---|
+| 有 | 没有这一行 | 加载一次 |
+| 有 | `DGLab_IDAC : 1` | 加载一次(第二轮扫描跳过已加载的) |
+| 有 | `DGLab_IDAC : 0` | **仍然加载** —— `enabled.txt` 优先于 `0` |
+| 没有 | `DGLab_IDAC : 1` | 加载一次 |
+
+发布包直接带一个空 `enabled.txt`(解压即可用), `mods.txt` 那条路作为可选。
+要停用必须**删 `enabled.txt`**, 光把 `mods.txt` 改成 `0` 是无效的。
+若走 `mods.txt`, 那一行必须在 `; Built-in keybinds, do not move up!` 上方
+(即 `Keybinds : 1` 之前); 写在文件末尾会排到内置按键绑定后面。
 
 **不需要改 `UE4SS-settings.ini`。**
 
@@ -240,7 +248,7 @@ UE4SS **只认 `<mod>\dlls\main.dll`**, 所以部署时改名:
 | 阶段 | 状态 |
 |---|---|
 | 逆向: 定位挂钩点与 ABI | ✅ 完成 (`re/indrun_hook_mechanics.md`) |
-| 逆向: 郊狼协议 | ✅ 完成 (`docs/research-*.md`, 官方文档副本见 `re/reference/dglab-bluetooth-protocol/`) |
+| 逆向: 郊狼协议 | ✅ 完成 (`docs/research-*.md`, 官方文档按快照提交号链接, 见 `re/reference/dglab-bluetooth-protocol/PROVENANCE.md`) |
 | 构建: 编译 + 链接 + 部署 | ✅ 完成 |
 | ABI: 与本机 UE4SS `0196ef29` 对齐 | ✅ 完成 (曾因头文件版本不对而启动即崩) |
 | 阶段 1: 探针 | ✅ 完成 —— 5 个跳板**都有数据** |

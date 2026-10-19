@@ -1,7 +1,7 @@
 # 郊狼主机 (DG-LAB Coyote) 接入调研
 
 来源：官方仓库 [`dungeonlab-open/dglab-bluetooth-protocol`](https://github.com/dungeonlab-open/dglab-bluetooth-protocol)
-（本次分析的原始文件按字节副本存于 `re/reference/dglab-bluetooth-protocol/`，上游提交号与 sha256 见该目录 `PROVENANCE.md`）
+（本次分析基于上游快照提交 `045720d`，逐份链接与 sha256 见 `re/reference/dglab-bluetooth-protocol/PROVENANCE.md`；仓库不再包含副本）
 + 官方/社区实现 `hyperzlib/DG-Lab-Coyote-Game-Hub`、`dungeonlab-open/dglab-kit(-python)`、`Ljzd-PRO/PyDGLab-WS`。
 证据标注：**[L]** = 官方仓库原文事实，**[W]** = 网上确认，**[I]** = 推断/待硬件验证。
 

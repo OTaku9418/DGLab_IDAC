@@ -112,6 +112,14 @@ bool ieq(const std::string& a, const char* b) {
     return i == a.size() && b[i] == '\0';
 }
 
+// 转小写(只处理 ASCII)。INI 里的枚举值是自造的 ASCII 字面量, 不用考虑 locale。
+std::string lower_ascii(std::string s) {
+    for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return s;
+}
+
 std::string read_str(const std::string& file, const char* section, const char* key,
                      const std::string& def) {
     char buf[1024]{};
@@ -165,15 +173,22 @@ MapMode parse_map_mode(const std::string& s, MapMode def) {
 void read_channel(const std::string& file, const char* section, ChannelMapping& c) {
     // 段名形如 [channel_a], 键名不带前缀
     c.enable        = read_bool(file, section, "enable", c.enable);
-    c.source        = read_str(file, section, "source", c.source);
+    // 统一转小写: 用户写 "Torque"/"VISCOSITY" 时不该被当成未知源。
+    c.source        = lower_ascii(read_str(file, section, "source", c.source));
     c.mode          = parse_map_mode(read_str(file, section, "map_mode", ""), c.mode);
     c.in_min        = read_int(file, section, "in_min", c.in_min);
     c.in_max        = read_int(file, section, "in_max", c.in_max);
     c.level         = read_double(file, section, "level", c.level);
     c.base_strength = read_int(file, section, "base_strength", c.base_strength);
-    c.strength_source = read_str(file, section, "strength_source", c.strength_source);
+    c.strength_source = lower_ascii(read_str(file, section, "strength_source",
+                                               c.strength_source));
     c.strength_margin = read_double(file, section, "strength_margin", c.strength_margin);
 
+    if (!is_known_source(c.source) && !c.source.empty()) {
+        log_warn("[%s] source=\"%s\" 不是已知的输入源 —— 输出会恒为 0; 可选值: "
+                 "torque / torque_signed / viscosity / viscosity_a / vibration / "
+                 "vibration_a / servo / const", section, c.source.c_str());
+    }
     if (c.strength_source != "static" && c.strength_source != "level") {
         log_warn("[%s] strength_source=\"%s\" 不是 static/level, 按 static 处理",
                  section, c.strength_source.c_str());
@@ -225,6 +240,33 @@ bool is_held_risk_source(const std::string& src) {
     return ieq(src, "viscosity") || ieq(src, "viscosity_a");
 }
 
+bool is_known_source(const std::string& src) {
+    static const char* const kSources[] = {"torque",     "torque_signed", "viscosity",
+                                           "viscosity_a", "vibration",    "vibration_a",
+                                           "servo",      "const"};
+    for (const char* s : kSources) {
+        if (ieq(src, s)) return true;
+    }
+    return false;
+}
+
+HoldSource hold_source_of(const std::string& src) {
+    if (ieq(src, "torque") || ieq(src, "torque_signed"))   return HoldSource::Torque;
+    if (ieq(src, "viscosity") || ieq(src, "viscosity_a"))  return HoldSource::Viscosity;
+    if (ieq(src, "vibration") || ieq(src, "vibration_a"))  return HoldSource::Vibration;
+    return HoldSource::None;    // servo / const / 未知: 不存在"停住的值"
+}
+
+int hold_timeout_of(const Config& cfg, HoldSource s) {
+    switch (s) {
+        case HoldSource::Torque:    return cfg.torque_hold_ms;
+        case HoldSource::Viscosity: return cfg.viscosity_hold_ms;
+        case HoldSource::Vibration: return cfg.vibration_hold_ms;
+        case HoldSource::None:      break;
+    }
+    return 0;
+}
+
 int effective_frame_ms(int requested_ms, LinkMode link) {
     // 只有 BLE 直连这条链路的节拍是硬的: V3 的 B0 每帧覆盖 4×25 ms = 100 ms,
     // 设备也按这个窗口回 B1。改成 50 不会让设备变快, 只会让"管线提交节拍"
@@ -238,16 +280,37 @@ int effective_frame_ms(int requested_ms, LinkMode link) {
 }
 
 int effective_viscosity_hold_ms(int requested_ms) {
+    // viscosity 的实测间隔几乎全 <0.5 s, 所以它能承受更严的上限; 用同一个
+    // 通用折算函数, 只是把上限传成 10000。
+    return effective_source_hold_ms(requested_ms, "viscosity_hold_ms", 10000);
+}
+
+int effective_source_hold_ms(int requested_ms, const char* key_name, int hi_ms) {
     // 0 是唯一表示"关闭"的值 —— 这是用户可选的取舍(有人就想要停住的阻尼),
     // 所以不把它当成"配错"抬到下限。
     if (requested_ms == 0) return 0;
     if (requested_ms < 500) {
-        log_warn("[safety] viscosity_hold_ms(%d) < 500, 会把正常行驶中的短暂间隙误判为停更, 已抬到 500",
-                 requested_ms);
+        log_warn("[safety] %s(%d) < 500, 会把正常行驶中的短暂间隙误判为停更, 已抬到 500",
+                 key_name, requested_ms);
         return 500;
     }
+    if (requested_ms > hi_ms) {
+        log_warn("[safety] %s(%d) > %d, 残值会先被感知到才归零, 已降到 %d",
+                 key_name, requested_ms, hi_ms, hi_ms);
+        return hi_ms;
+    }
+    return requested_ms;
+}
+
+int effective_silent_mute_ms(int requested_ms) {
+    if (requested_ms == 0) return 0;   // 关闭
+    if (requested_ms < 200) {
+        log_warn("[safety] silent_mute_ms(%d) < 200, 会被帧节拍抖动误触发, 已抬到 200",
+                 requested_ms);
+        return 200;
+    }
     if (requested_ms > 10000) {
-        log_warn("[safety] viscosity_hold_ms(%d) > 10000, 残值会先被感知到才归零, 已降到 10000",
+        log_warn("[safety] silent_mute_ms(%d) > 10000, 超过它就等于退化成单源超时, 已降到 10000",
                  requested_ms);
         return 10000;
     }
@@ -284,8 +347,14 @@ Config load_config(const std::string& ini_path) {
 
     // 默认 channel_a = 扭矩, channel_b = 振动。
     // 这两个赋值必须在读取之前, 因为 read_channel 用它们当默认值。
-    cfg.channel_a.source = "torque";
-    cfg.channel_b.source = "vibration";
+    //
+    // T23: 两路不同的数值必须与发布包 INI 对齐 —— 否则"INI 被删掉"这种意外
+    // 场景会让 B 通道的强度从 10 变成结构体默认值, 手感完全不同。结构体里放
+    // A 的值, B 的差异在这里补齐(base_strength / level)。
+    cfg.channel_a.source       = "torque";
+    cfg.channel_b.source       = "vibration";
+    cfg.channel_b.base_strength = 10;
+    cfg.channel_b.level         = 0.6;
 
     if (ini_path.empty()) {
         log_warn("未找到配置文件, 全部使用内置默认值");
@@ -303,7 +372,7 @@ Config load_config(const std::string& ini_path) {
     //
     // 这不是假设, 是踩过的坑: 部署目录里的 INI 被写成了 LF 行尾, 于是**每一个**
     // 配置项都静默回落到内置默认值。表现是"代码全绿、日志无错、设备却毫无反应",
-    // 而默认值里 base_strength=60 会让强度比配置值高好几倍 —— 既是功能 bug
+    // 而默认值里 base_strength 曾比配置值高好几倍 —— 既是功能 bug
     // 也是安全问题。GetPrivateProfileStringA 对 LF-only 文件返回的与"文件不
     // 存在"完全一致, 所以调用方根本分不出这两种情况。
     //
@@ -386,21 +455,29 @@ Config load_config(const std::string& ini_path) {
     read_channel(ini_path, "channel_a", cfg.channel_a);
     read_channel(ini_path, "channel_b", cfg.channel_b);
 
-    // ★ 已知风险源告警 ★
-    // viscosity 的回调是"值变了才回调", 而强制退出比赛回到菜单时游戏会把阻尼
-    // 停在一个可感的值上却不再回调 —— 本程序没有"源数据陈旧"判定, 那个值会被
-    // 一直输出。默认配置不用它, 但用户有权选, 所以只在"启用 + 真会输出"时提醒
-    // 一次(不阻止)。判定逻辑本身在 is_held_risk_source(), 有离线自检。
-    if (cfg.channel_a.enable && cfg.channel_a.base_strength > 0 &&
-        is_held_risk_source(cfg.channel_a.source)) {
-        log_warn("[channel_a] source=%s: 强制退出比赛回到菜单后阻尼可能停在可感的值上并持续输出, "
-                 "不推荐作为输出源 (见 README 已知风险)", cfg.channel_a.source.c_str());
-    }
-    if (cfg.channel_b.enable && cfg.channel_b.base_strength > 0 &&
-        is_held_risk_source(cfg.channel_b.source)) {
-        log_warn("[channel_b] source=%s: 强制退出比赛回到菜单后阻尼可能停在可感的值上并持续输出, "
-                 "不推荐作为输出源 (见 README 已知风险)", cfg.channel_b.source.c_str());
-    }
+    // ★ 已知风险源 / 保护关闭 的告警 ★
+    // viscosity 的回调是"值变了才回调", 强制退出比赛回菜单时游戏会把阻尼停在
+    // 一个可感的值上却不再回调。T17/T22b 起有保持超时兜底, 但那三个键可以被
+    // 写成 0 —— 那种情况下残值会再次被一直输出, 必须提醒(不阻止)。
+    // 判定映射用 hold_source_of()/hold_timeout_of(), 与 pipeline 的判定同源。
+    auto warn_hold_config = [&cfg](const char* name, const ChannelMapping& c) {
+        if (!c.enable || c.base_strength <= 0) return;
+        if (c.mode == MapMode::Constant) return;   // 恒定模式不读源, 不存在停住的值
+        const HoldSource hs = hold_source_of(c.source);
+        if (hs == HoldSource::None) return;
+        if (hold_timeout_of(cfg, hs) == 0) {
+            log_warn("[%s] source=%s 的保持超时是 0(关闭), 源停更后最后一个值会一直输出 —— "
+                     "见 README 已知风险", name, c.source.c_str());
+            return;
+        }
+        if (is_held_risk_source(c.source)) {
+            log_warn("[%s] source=%s: 强制退出比赛回到菜单后阻尼可能停在可感的值上; "
+                     "已由保持超时(%d ms)兜底, 但仍不推荐作为输出源 (见 README 已知风险)",
+                     name, c.source.c_str(), hold_timeout_of(cfg, hs));
+        }
+    };
+    warn_hold_config("channel_a", cfg.channel_a);
+    warn_hold_config("channel_b", cfg.channel_b);
 
     // ---- [safety] ----
     cfg.max_strength        = read_int(ini_path, "safety", "max_strength", cfg.max_strength);
@@ -412,6 +489,12 @@ Config load_config(const std::string& ini_path) {
     cfg.warmup_ms           = read_int(ini_path, "safety", "warmup_ms", cfg.warmup_ms);
     cfg.viscosity_hold_ms   = read_int(ini_path, "safety", "viscosity_hold_ms",
                                         cfg.viscosity_hold_ms);
+    cfg.torque_hold_ms      = read_int(ini_path, "safety", "torque_hold_ms",
+                                        cfg.torque_hold_ms);
+    cfg.vibration_hold_ms   = read_int(ini_path, "safety", "vibration_hold_ms",
+                                        cfg.vibration_hold_ms);
+    cfg.silent_mute_ms      = read_int(ini_path, "safety", "silent_mute_ms",
+                                        cfg.silent_mute_ms);
     const bool has_dry_run_key = has_key(ini_path, "safety", "dry_run");
     cfg.dry_run             = read_bool(ini_path, "safety", "dry_run", cfg.dry_run);
     // dry_run 缺键必须说清楚: 它是"要不要真的通电"的总开关, 静默取默认值
@@ -453,6 +536,13 @@ Config load_config(const std::string& ini_path) {
     cfg.watchdog_ms = effective_watchdog_ms(cfg.watchdog_ms, cfg.frame_ms);
     // T17: 0 = 关闭, 其他值钳到 500..10000(理由见 config.hpp 里那个字段)。
     cfg.viscosity_hold_ms = effective_viscosity_hold_ms(cfg.viscosity_hold_ms);
+    // T22b: torque/vibration 的上限放宽到 20000 —— 实测正常驾驶中 torque 的
+    // 真实保持能到 7 s, 上限 10 s 会逼着用户把保护关掉。
+    cfg.torque_hold_ms    = effective_source_hold_ms(cfg.torque_hold_ms,
+                                                     "torque_hold_ms", 20000);
+    cfg.vibration_hold_ms = effective_source_hold_ms(cfg.vibration_hold_ms,
+                                                     "vibration_hold_ms", 20000);
+    cfg.silent_mute_ms    = effective_silent_mute_ms(cfg.silent_mute_ms);
     // 自动增益: floor 不能超过 ceiling, 否则归一化区间是负的, 会整体归零。
     clamp_int(cfg.gain_floor, 1, 200, "[output] gain_floor");
     clamp_int(cfg.gain_ceiling, 1, 200, "[output] gain_ceiling");
@@ -576,6 +666,18 @@ bool write_default_config(const std::string& ini_path) {
         ::WritePrivateProfileStringA(sec, key, val, ini_path.c_str());
     };
 
+    // T23: 文件头先写一行 ASCII 注释。WritePrivateProfileStringA 只会逐键
+    // 追加, 不会自己加注释; 而一行行首注释不影响 Win32 解析 INI。
+    // 这行必须能解释"为什么这份自动生成的配置和发布包默认值不一样"。
+    {
+        FILE* f = nullptr;
+        if (::fopen_s(&f, ini_path.c_str(), "wb") == 0 && f != nullptr) {
+            std::fputs("; Auto-generated minimal config: mode=disabled and dry_run=1 on purpose. "
+                       "Factory defaults: ..\\DGLab_IDAC.ini.default\r\n", f);
+            std::fclose(f);
+        }
+    }
+
     w("general", "enable", "1");
     w("general", "verbose", "1");
     w("link", "mode", "disabled");
@@ -604,11 +706,15 @@ bool write_default_config(const std::string& ini_path) {
     //             一个可感的值上; 这个回调只在值变化时触发, 停住的值会一直输出,
     //             直到下一次变化。
     //   vibration 振动/路肩, 只在事件发生时给一次
-    //   static    恒定输出, 不看游戏数据
+    //   servo     伺服开关状态(0/1), 调试用;  const 恒为 0, 调试用
+    // 想恒定输出**不能**写 source=static(那会被当成未知源, 输出恒为 0):
+    // 正确做法是 map_mode=constant, 此时输出等于 level。
     // 另有 torque_signed(按 direction 恢复符号): 逆向证实该参数是齿轮/档位索引
     // (域 0..255), 不是左右方向, 当前不要用 —— 见 re/indrun_hook_mechanics.md 4.1/5。
     // 建议 A 用 torque。
-    // 字段范围: enable 0/1; map_mode {abs_linear,linear,abs_sqrt,sqrt};
+    // 字段范围: enable 0/1;
+    // map_mode {abs_linear(=abslinear), linear, sqrt, square, threshold, constant}
+    //   (没有 abs_sqrt 这个值 —— 旧文档写错过, 程序从来不认);
     // in_min 0~200; in_max 1~200(auto_gain=1 时只当启动初值);
     // level 0.0~1.0; base_strength 0~200(再受 [safety] max_strength 钳制);
     // strength_source {static,level}; level 模式下 strength_margin 为 0.0~1.0。
@@ -618,10 +724,12 @@ bool write_default_config(const std::string& ini_path) {
     w("channel_a", "in_min", "0");
     w("channel_a", "in_max", "127");
     w("channel_a", "level", "1.0");
-    w("channel_a", "base_strength", "40");
+    w("channel_a", "base_strength", "15");
     // static = 强度恒为 base_strength, 游戏动态全部体现在脉冲振幅上(推荐);
     // level  = 强度跟着映射值走(旧行为, 做 A/B 用)。
     w("channel_a", "strength_source", "static");
+    // strength_source=level 时, 信号为 0 也保留的强度比例(0.0~1.0)。
+    w("channel_a", "strength_margin", "0.0");
     w("channel_b", "enable", "1");
     // B 当前接 vibration, 它是事件型信号: 只在压路肩/碰撞等判定发生时给一次
     // 短促输出, 其余时间安静。不建议改成 viscosity(原因见上面的来源表)。
@@ -631,26 +739,40 @@ bool write_default_config(const std::string& ini_path) {
     w("channel_b", "in_min", "0");
     w("channel_b", "in_max", "127");
     w("channel_b", "level", "0.6");
-    w("channel_b", "base_strength", "30");
+    w("channel_b", "base_strength", "10");
     w("channel_b", "strength_source", "static");
-    w("safety", "max_strength", "40");
-    w("safety", "clamp_strength", "40");
+    w("channel_b", "strength_margin", "0.0");
+    w("safety", "max_strength", "30");
+    w("safety", "clamp_strength", "30");
     w("safety", "slew_per_second", "40");
     // watchdog_ms: 管线超过这么多毫秒没提交新帧, 传输层改发静默帧。
     // 判据是"管线有没有在提交帧", 不是"力反馈回调有没有来"(回调是边沿触发的)。
     w("safety", "watchdog_ms", "500");
     w("safety", "zero_when_servo_off", "1");
-    w("safety", "warmup_ms", "1500");
+    w("safety", "warmup_ms", "5000");
     // viscosity_hold_ms: viscosity 源停更多久就按 0 处理(T17)。0 = 关闭。
     // 副作用: 发车倒计时等原地不动的时段也会被归零 —— 这是它的工作原理, 不是 bug。
     w("safety", "viscosity_hold_ms", "2000");
+    // torque_hold_ms / vibration_hold_ms: 单个源停更多久就按 0 处理(T22b)。
+    // 默认 10 s 而不是 2 s: 实测正常驾驶中"方向盘稳住"会让 torque 停 3~7 s,
+    // 2 s 会在真实过弯里砍掉手感。0 = 关闭。
+    w("safety", "torque_hold_ms", "10000");
+    w("safety", "vibration_hold_ms", "10000");
+    // silent_mute_ms: 三个源"同时"停更超过这个毫秒数, 所有通道的原始值都按 0
+    // 处理(T22b 一级)。它抓的是"游戏不再喂任何力反馈"(退出比赛/匹配打断计时赛),
+    // 实测这类齐停最短 48 s, 所以 1 s 足够快且不会误伤。0 = 关闭。
+    w("safety", "silent_mute_ms", "1000");
     // dry_run=1 是硬开关: 不管 [link] mode 写什么, 一律走空输出, 绝不碰设备。
     // 想真实输出必须显式改成 0 —— 别把"干跑"和"接真机"混在一次改动里。
     w("safety", "dry_run", "1");
     // [debug] hook=0 是排障开关: 关掉 IndRun.dll 挂钩, 只留日志与管线。
     // 崩溃时先试这个 —— 不崩就说明问题在挂钩, 还崩就说明在别处。
     w("debug", "hook", "1");
-    log_info("已写出默认配置: %s", ini_path.c_str());
+    // T23: 自动生成是一种"意外状态"(INI 被删/放错目录), 这时不能通电。
+    log_warn("已写出最小默认配置: %s —— [link] mode=disabled 且 dry_run=1: "
+             "既不会连设备, 也不会输出", ini_path.c_str());
+    log_warn("要按发布包配置运行, 用 DGLab_IDAC.ini.default 覆盖它, "
+             "再把 dry_run 改成 0(见 README 第 4 节)");
     return true;
 }
 

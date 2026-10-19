@@ -38,14 +38,14 @@ struct ChannelMapping {
 
     // 输入范围(原始整数)
     int32_t     in_min      = 0;
-    int32_t     in_max      = 1000;
+    int32_t     in_max      = 127;    // 与发布包 INI 一致(T23); auto_gain=1 时只当启动初值
 
     // 输出 0..1 域内的缩放与偏置
     double      level       = 1.0;
 
     // 该通道的基础强度(写入 B0 的 channel intensity setting, 0..200)
     // 上限还会被 [safety] max_strength 和 BF 软限位双重压住。
-    int32_t     base_strength = 60;
+    int32_t     base_strength = 15;
 
     // 通道强度的来源:
     //   "static" = 固定用 base_strength, 全部动态走脉冲振幅(默认, 见下)
@@ -138,9 +138,9 @@ struct Config {
     // ---- [safety] ----
     // ★ 用户要的"最大强度"接口 ★
     // 写进 BF 命令的通道软限位(0..200), 设备侧持久生效, 且每次重连后必须重发。
-    int         max_strength        = 40;
+    int         max_strength        = 30;
     // 软件侧再压一道(0..200): 实际写入 B0 的强度不会超过它
-    int         clamp_strength      = 40;
+    int         clamp_strength      = 30;
     // 每秒允许的强度变化量(0 = 不限制)。避免阶跃冲击。
     double      slew_per_second     = 40.0;
     // 看门狗: 管线侧超过这么多毫秒没有提交新帧, 传输层就改发静默帧(强度 0)。
@@ -168,8 +168,25 @@ struct Config {
     //   实测 viscosity 在驾驶时间隔几乎全 <0.5 s)。
     // 只影响 source=viscosity / viscosity_a 的通道, 另一通道不受影响。
     int         viscosity_hold_ms   = 2000;
+    // T22b: torque / vibration 源的保持超时(毫秒)。0 = 关闭。
+    //
+    // ★ 默认 10000, 不是 2000 ★
+    // 2026-10-18 那局(100 分钟、5,667 条心跳)里, "方向盘稳住不动"会让 torque
+    // 的回调停 3~7 秒(实测最长 7.0 s), 期间粘度仍在每秒更新 —— 说明车在动、
+    // 这次保持是真实的。2 s 的超时会在这种真实过弯里把力砍掉(约每 1.4 分钟
+    // 一次), 所以把单源超时放到 10 s, 只用来兜"源彻底不更新"的底。
+    int         torque_hold_ms      = 10000;
+    int         vibration_hold_ms   = 10000;
+    // T22b 一级: 三个源"同时"停更超过这么多毫秒, 就把所有已启用通道的原始值
+    // 按 0 处理。0 = 关闭。
+    //
+    // 为什么需要它: *_hold_ms 是"单个源"的兜底, 对"游戏不再喂任何力反馈"这类
+    // 场景反应太慢。而"三源齐停"是个干净的信号 —— 同一局里它只出现 22 次,
+    // 最短 48 s, 正常驾驶中一次都没有。用 1 s 就能把"匹配成功打断计时赛"这类
+    // 场景在一秒内压到 0, 且不会误伤任何真实保持。
+    int         silent_mute_ms      = 1000;
     // 启动后前 N 毫秒强制输出 0, 让用户有时间确认连接
-    int         warmup_ms           = 1500;
+    int         warmup_ms           = 5000;
     // 全局总开关: 设为 false 时只记日志不发数据(干跑模式)
     // ★ 默认 true ★: INI 里漏写这个键就等于允许真实输出, 与本项目"默认安全"
     // 的设计意图相反 —— 一个字的遗漏不该产生电刺激。要真实输出必须在 INI 里
@@ -205,6 +222,20 @@ int effective_frame_ms(int requested_ms, LinkMode link);
 // 上限 10 s 的理由是超过它以后残值已经被感知到很久了, 等于没做保护。
 int effective_viscosity_hold_ms(int requested_ms);
 
+// T22b: 单源保持超时的折算(纯函数, 会打 WARN)。
+//
+// 0 = 关闭; 其他值钳到 [500, hi_ms]。下限 500 ms 的理由与 viscosity 那条相同;
+// 上限由调用方给(torque/vibration 20000, viscosity 10000), 因为这两类源的
+// 正常保持长度差了一个数量级(实测 torque 最长 7.0 s, viscosity 几乎全 <0.5 s)。
+int effective_source_hold_ms(int requested_ms, const char* key_name, int hi_ms);
+
+// T22b 一级: 全源静默阈值的折算(纯函数, 会打 WARN)。
+//
+// 0 = 关闭; 其他值钳到 [200, 10000]。下限 200 ms 是"再小就会被自定义帧节拍
+// 抖动误触发"的保守值(实测齐停最短 48 s, 离得极远); 上限 10 s 的理由是
+// 超过它就等于退化成单源超时, 这一级存在与否没有区别。
+int effective_silent_mute_ms(int requested_ms);
+
 // 把 INI 里写的 watchdog_ms 折算成"实际生效值"(纯函数, 但会打 WARN)。
 //
 // 三条约束, 都与帧周期绑定:
@@ -232,10 +263,25 @@ const char* to_string(MapMode m);
 //
 // 目前只有 viscosity / viscosity_a: 它的回调是**值变了才回调**(IndRun 内部有
 // 变化缓存), 而强制退出比赛回到菜单时, 游戏会把阻尼停在一个可感的值上却不再
-// 回调 —— 本程序没有"源数据陈旧"判定, 于是那个值会被管线一直输出, 直到下一次
-// 变化。torque/vibration 在回菜单时会被游戏压到接近 0, 所以不在名单里。
+// 回调。T22b 起这种停住的值有保持超时兜底(source_hold_expired, 默认 2000 ms),
+// 所以这里报的是"历史上出过事、值得提醒一次"的类别, 不再等于"没有保护"。
 //
 // 纯函数, 供 load_config 告警与离线自检共用。
 bool is_held_risk_source(const std::string& src);
+
+// ---- T22b: "会停更的源"及其保持超时 ----
+//
+// 把"source 名字 -> (时间戳, 超时键)"的对应关系收成纯函数: load_config 的
+// 告警、pipeline 的判定、离线自检三方必须用同一份映射, 否则改一处就会出现
+// "告警说保护关了、实际还开着"(或反过来)这种自相矛盾的状态。
+enum class HoldSource { None, Torque, Viscosity, Vibration };
+
+HoldSource hold_source_of(const std::string& src);
+
+// T24: source 名字的允许列表(大小写不敏感)。写错名字不会报错, 只会让该通道
+// "输出恒为 0", 所以加载时必须提醒一声。纯函数, 供 load_config 与离线自检共用。
+bool is_known_source(const std::string& src);
+// 该源在当前配置下的超时值(毫秒); None 返回 0。
+int hold_timeout_of(const Config& cfg, HoldSource s);
 
 }  // namespace dglab_idac

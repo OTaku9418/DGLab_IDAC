@@ -30,9 +30,10 @@ Where each one ends up
   hunks are recorded in that directory's PROVENANCE.md.
 
 * The Coyote (DG-LAB) protocol documents referenced by the source tree are
-  not part of this archive. They are published by the vendor for hobbyist
-  use and are not covered by the MIT license above; see the repository's
-  README section 9.
+  not part of this archive or of the repository. They are published by the
+  vendor for hobbyist use and are not covered by the MIT license above.
+  The repository only records the upstream URL, the snapshot commit id and
+  per-file sha256 sums, in re/reference/dglab-bluetooth-protocol/PROVENANCE.md.
 
 
 ===============================================================================

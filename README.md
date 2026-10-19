@@ -52,42 +52,50 @@
    ```
    Mods\DGLab_IDAC\dlls\main.dll
    Mods\DGLab_IDAC\dlls\DGLab_IDAC.ini
+   Mods\DGLab_IDAC\enabled.txt
+   Mods\DGLab_IDAC\DGLab_IDAC.ini.default
    Mods\DGLab_IDAC\README.md
    Mods\DGLab_IDAC\LICENSE
+   Mods\DGLab_IDAC\THIRD_PARTY_NOTICES.txt
    ```
 
-3. **激活 mod**。下面两种方式选一种即可, 效果相同。
+3. **启动游戏** —— 就这样, 不用改任何文件。包里带的空文件 `enabled.txt` 就是启用标记,
+   UE4SS 认它。
 
-   **方式 B: 放一个 `enabled.txt`(推荐)**
+   第一次运行会在 `Mods\DGLab_IDAC\dlls\` 下生成 `DGLab_IDAC.log`。
 
-   在 `Mods\DGLab_IDAC\` 目录下新建一个**空文件** `enabled.txt`(文件名就这十个字母,
-   内容可以是空的)。这是 UE4SS 认的另一种启用标记, 资源包内置的 `LocalRadio` 模组就是
-   这么做的。放了这个文件之后, `mods.txt` 里**完全不用写**本 mod。
+### 如果你想手动控制启用/停用
 
-   之所以推荐这一种: **启动器重写 `mods.txt` 时它不受影响**, 不用每次更新后重新加行。
-   发布前实测过: `mods.txt` 里没有本 mod 的任何一行、只放 `enabled.txt`,
-   日志里 `==== DGLab_IDAC 0.2.0 启动` / `特征码校验通过: 5/5` / `hooks=OK` /
-   `BLE: 链路就绪` 四样都正常出现。
+`enabled.txt` 和 `mods.txt` 是 UE4SS 的两条启用途径, 发布前把四种组合都实测过:
 
-   **方式 A: 写 `mods.txt`**
+| `enabled.txt` | `mods.txt` 里的行 | 结果 |
+|---|---|---|
+| 有 | 没有这一行 | **加载, 一次**(出厂就是这个状态) |
+| 有 | `DGLab_IDAC : 1` | 加载, **仍然只有一次**(UE4SS 会跳过重复) |
+| 有 | `DGLab_IDAC : 0` | **加载** —— `enabled.txt` 优先, `0` 管不住它 |
+| 没有 | `DGLab_IDAC : 1` | 加载, 一次 |
 
-   用记事本打开 `Mods\mods.txt`, 在 **`; Built-in keybinds, do not move up!` 这一行的上方**
-   插入一行:
+- **停用**: 删掉 `Mods\DGLab_IDAC\enabled.txt`; 如果你以前在 `mods.txt` 里加过本 mod
+  那一行, 把它改成 `0` 或整行删掉。**只改 `mods.txt` 的 `0` 是不够的**, 见上表第三行。
+- **改用 `mods.txt`**(可选): 删掉 `enabled.txt`, 用记事本打开 `Mods\mods.txt`, 在
+  **`; Built-in keybinds, do not move up!` 这一行的上方**插入一行:
 
-   ```
-   DGLab_IDAC : 1
-   ```
+  ```
+  DGLab_IDAC : 1
+  ```
 
-   冒号前后各有一个空格, `1` 表示启用。注意**不要加在文件末尾** —— `Keybinds : 1` 那一行
-   之后的位置是留给内置按键绑定的, 下面的内容有相应的加载顺序要求。
+  冒号前后各有一个空格。不要加在文件末尾 —— `Keybinds : 1` 之后的位置留给内置按键绑定。
+- 两条途径同时开也没问题(只加载一次), 但**建议只留一条**, 出问题时好判断是哪条生效。
+- **卸载**: 删掉 `Mods\DGLab_IDAC\` 整个目录, 再按上面的"停用"把 `mods.txt` 清理干净。
 
-   > 两种方式**不要同时用**, 也不要为了"保险"两个都加 —— 只留一种, 出问题时才好判断
-   > 是哪一条生效了。
+### 升级(从旧版本覆盖安装)
 
-4. 启动游戏。第一次运行会在 `Mods\DGLab_IDAC\dlls\` 下生成 `DGLab_IDAC.log`。
-
-> 卸载: 删掉 `Mods\DGLab_IDAC\` 整个目录(连带 `enabled.txt`), 再把 `mods.txt` 里那一行
-> 删掉(如果你用的是方式 A)。
+- 解压会**覆盖** `dlls\DGLab_IDAC.ini`, 你调过的强度会没。**先备份这个文件**, 或者解压时
+  跳过它。
+- 旧版 INI 里没有两个新的超时键(`torque_hold_ms` / `vibration_hold_ms`), 缺键时按 10000 ms
+  处理 —— 也就是说**默认是开着的**, 不用手动加。
+- 想回到出厂配置: 用包里的 `DGLab_IDAC.ini.default` 覆盖 `dlls\DGLab_IDAC.ini`(两份内容
+  逐字节相同), 再把 `[safety] dry_run` 改成 `0`。
 
 ---
 
@@ -97,7 +105,7 @@
 
 | 日志里应该出现 | 含义 |
 |---|---|
-| `==== DGLab_IDAC 0.2.0 启动` | mod 被 UE4SS 加载了(看不到这行 = `mods.txt` 没生效或层级放错) |
+| `==== DGLab_IDAC 0.2.1 启动` | mod 被 UE4SS 加载了(看不到这行 = 既没有 `enabled.txt`, `mods.txt` 里也没有这一行; 或者层级放错) |
 | `特征码校验通过: 5/5` | 挂钩点与当前游戏版本对得上 |
 | `hooks=OK` | 5 个跳板都挂上了 |
 | `BLE: 链路就绪 (A/B 期望强度上限 30)` | 连上郊狼主机了 |
@@ -153,12 +161,12 @@
 一句话记法: **`max_strength` 是给设备的"物理限位", `clamp_strength` 是给自己的"自我约束",
 `base_strength` 是"这个通道想用多少"**。
 
-> ⚠ **如果把 `DGLab_IDAC.ini` 删了**, 程序下次启动会自动生成一份"能跑起来"的最小配置。
-> 那份配置的**数值与本节不同**: 它是 `link=disabled` + `dry_run=1`(既不连设备也不输出),
-> 强度是 `max_strength=40` / `clamp_strength=40` / A `base_strength=40` / B `30`,
-> `warmup_ms=1500`。想把配置恢复到本节这套出厂组合(`ble` / `dry_run=0` /
-> `max=clamp=30` / A 15 / B 10 / `warmup_ms=5000`), 请从自己的备份拷回一份, 或者照本节
-> 的数值逐项改 —— 发布包里不含带注释的模板。
+> ⚠ **如果把 `DGLab_IDAC.ini` 删了**, 程序下次启动会自动生成一份最小配置。
+> 数值与本节**完全一致**, 只有两个开关是故意不同的: `[link] mode=disabled` 和
+> `[safety] dry_run=1` —— 既不连设备也不输出。理由是"配置文件消失"本身就是一次
+> 意外, 意外状态不该通电。
+> 想按本节这套配置运行: 用包里的 `Mods\DGLab_IDAC\DGLab_IDAC.ini.default` 覆盖那份
+> 自动生成的文件(它与本节逐项一致), 再把 `dry_run` 改成 `0`。
 
 > 改完配置**必须重启游戏**(`main.dll` 在进程生命周期内保持映射, 热重载对 C++ mod 无效)。
 
@@ -188,6 +196,30 @@
 
 默认配置仍然用 `torque` + `vibration`，不碰 `viscosity`；如果你手动改，
 `load_config` 会打一条 WARN 提醒（判定函数 `is_held_risk_source()` 有离线用例覆盖）。
+
+### 5.1.1 `torque` / `vibration` 的保持超时, 以及"三源齐停"
+
+`torque` 和 `vibration` 也有同样的机理，但阈值不一样 —— 因为实测数据完全不同
+（2026-10-18 那局，100 分钟、5667 条心跳）：
+
+- **只有 `torque` 停、粘度还在跳**：73 段，最长 **7.0 秒**。这是**真实的过弯**：
+  方向盘稳住不动，车还在走，粘度每秒更新几十次。所以 `[safety] torque_hold_ms`
+  默认 **10000**（0 = 关闭）—— 用 2000 会在这种真实保持里把力砍掉，约每 1.4 分钟一次。
+- **三个源同时停**：22 段，最短 **48 秒**，正常驾驶中**零次**。这是"游戏不再喂
+  力反馈数据"的干净信号（退出比赛、对战匹配成功打断计时赛）。所以
+  `[safety] silent_mute_ms` 默认 **1000**（0 = 关闭）：三源齐停超过 1 秒，所有已
+  启用通道的原始值都按 0 处理。
+- `vibration_hold_ms` 同样默认 10000。副作用：**连续压路肩、连续蹭墙超过 10 秒**
+  时，振动会被提前切掉。
+
+三个键的共同副作用与 5.1 一样：原地不动的时段会被归零。区别只是"多久算停更"
+以及"是某一个源还是全部"。全源静默那一级连 `map_mode=constant` 的诊断通道也会
+一起静音（它表达的是"游戏不给数据了"，与具体通道无关）；单源超时只影响用那个源
+的通道。
+
+`[hb]` 行末的 `hold(A/B)=n/m` 是这道保护的计数器：只在"停住的值不是 0"时 +1，
+所以正常情况下它应该很少增长。`age(tq/visc/vib)` 三个数同时变大且 `hold` 跟着
+增长，就是这条保护在起作用。
 
 ### 5.2 退出方式只有杀进程, 所以没有"归零帧"这道保险
 
@@ -240,6 +272,9 @@ BLE 链路跟着断, 设备判定断连就归零 —— 不是因为我们发了
 
 ## 6. 安全
 
+**顺序**: 先按第 3 节把链路和强度都确认一遍(**电极还不贴**), 再把电极贴到身上 ——
+开头那句"先确认链路, 再贴电极"就是这个意思。
+
 ⚠ **无论游戏请求什么, 自己再设一道硬上限。** 出厂 `max_strength=30` (郊狼上限 200)。
 
 - 电极**绝不能跨过心脏/胸部或越过身体中线**
@@ -277,7 +312,7 @@ BLE 链路跟着断, 设备判定断连就归零 —— 不是因为我们发了
 
 | 现象 | 先看这里 |
 |---|---|
-| 完全没有日志文件 | `mods.txt` 那行没生效, 或层级不对(必须是 `Mods\DGLab_IDAC\dlls\main.dll`) |
+| 完全没有日志文件 | 既没有 `enabled.txt`, `mods.txt` 里也没有这一行; 或层级不对(必须是 `Mods\DGLab_IDAC\dlls\main.dll`) |
 | 有日志但没有任何 `BLE:` 行 | `[link] mode` 不是 `ble`, 或者 `dry_run=1` |
 | BLE 连不上 | 主机没开机、电量低、已被手机 APP 占用、距离太远; 日志里搜 `BLE:` |
 | 有输出但没什么感觉 | `base_strength` 太低; 或者方向盘停住不动(回调是边沿触发, 力不变就不回调) |
@@ -314,6 +349,6 @@ BLE 链路跟着断, 设备判定断连就归零 —— 不是因为我们发了
 | [dglab-bluetooth-protocol](https://github.com/dungeonlab-open/dglab-bluetooth-protocol) | 上游无 LICENSE 文件, 见下方说明 | 只引用文档, 不随包分发 |
 
 > ⚠ 郊狼协议文档对爱好者免费, 但**商用需事先授权**。
-> 上游没有 LICENSE 文件, 所以 `re/reference/dglab-bluetooth-protocol/` 里那四份官方文档的
-> 授权条件**不适用**本仓库根目录的 MIT LICENSE。它们的来源、提交号与 sha256 记在
-> 该目录的 `PROVENANCE.md` 里; `docs/` 下的分析文字则是我们自己写的。
+> 上游没有 LICENSE 文件, 所以本仓库**不再随包分发**它的文档副本; 只按快照提交号
+> `045720d` 引用, 每份文件的直链与 sha256 记在 `re/reference/dglab-bluetooth-protocol/PROVENANCE.md`
+> 里。`docs/` 下的分析文字则是我们自己写的。

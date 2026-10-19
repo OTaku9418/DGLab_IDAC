@@ -88,6 +88,13 @@ call :copy README.md                         "%MODDIR%\README.md"
 call :copy LICENSE                           "%MODDIR%\LICENSE"
 call :copy THIRD_PARTY_NOTICES.txt           "%MODDIR%\THIRD_PARTY_NOTICES.txt"
 
+rem enabled.txt: E1-E4 tests (2026-10-19) showed UE4SS loads a mod either
+rem from mods.txt or from enabled.txt, never twice, and enabled.txt wins over
+rem 'DGLab_IDAC : 0' in mods.txt. Shipping it means "unzip into Mods\ and it
+rem just works", no mods.txt edit.
+type nul > "%MODDIR%\enabled.txt"
+if not exist "%MODDIR%\enabled.txt" (echo [x] cannot create enabled.txt & popd & exit /b 1)
+
 rem The shipped INI must be CRLF. The mod normalises it on first load, but a
 rem release should not depend on that: the first run would rewrite a file the
 rem user just unpacked. The repo template is LF (*.template eol=lf), so the
@@ -95,6 +102,17 @@ rem conversion happens here - and then gets verified, because this step has
 rem silently produced LF before.
 powershell -NoProfile -ExecutionPolicy Bypass -File "tools/normalize_crlf.ps1" -Path "%MODDIR%\dlls\DGLab_IDAC.ini" >nul || (echo [x] INI line-ending fix failed & popd & exit /b 1)
 findstr /c:"[safety]" "%MODDIR%\dlls\DGLab_IDAC.ini" >nul || (echo [x] staged INI looks empty & popd & exit /b 1)
+rem DGLab_IDAC.ini.default: the factory config, kept next to dlls\ so a user
+rem can restore it after we overwrite their tuned dlls\DGLab_IDAC.ini on
+rem upgrade. Must be byte-identical to the shipped INI (checked below).
+copy /y "%MODDIR%\dlls\DGLab_IDAC.ini" "%MODDIR%\DGLab_IDAC.ini.default" >nul
+if errorlevel 1 (echo [x] cannot create DGLab_IDAC.ini.default & popd & exit /b 1)
+set "HINI="
+set "HDEF="
+for /f "usebackq tokens=*" %%A in (`powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath '%MODDIR%\dlls\DGLab_IDAC.ini').Hash"`) do set "HINI=%%A"
+for /f "usebackq tokens=*" %%A in (`powershell -NoProfile -Command "(Get-FileHash -Algorithm SHA256 -LiteralPath '%MODDIR%\DGLab_IDAC.ini.default').Hash"`) do set "HDEF=%%A"
+if not defined HINI (echo [x] cannot hash the staged INI & popd & exit /b 1)
+if /i not "%HINI%"=="%HDEF%" (echo [x] DGLab_IDAC.ini.default differs from dlls\DGLab_IDAC.ini & popd & exit /b 1)
 
 rem ---- zip + pdb -------------------------------------------------------
 if not exist "dist" mkdir "dist"
@@ -122,6 +140,8 @@ call :hash "%MODDIR%\dlls\DGLab_IDAC.ini"
 call :hash "%MODDIR%\README.md"
 call :hash "%MODDIR%\LICENSE"
 call :hash "%MODDIR%\THIRD_PARTY_NOTICES.txt"
+call :hash "%MODDIR%\enabled.txt"
+call :hash "%MODDIR%\DGLab_IDAC.ini.default"
 echo.
 echo  archive / symbols (not all of these are inside the zip):
 call :hash "%ZIP%"

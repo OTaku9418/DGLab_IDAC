@@ -2,9 +2,9 @@
 
 **Scope.** Everything below is extracted from the official protocol repository,
 [`dungeonlab-open/dglab-bluetooth-protocol`](https://github.com/dungeonlab-open/dglab-bluetooth-protocol).
-The exact files this analysis was performed on are vendored byte-for-byte under
-`re/reference/dglab-bluetooth-protocol/` (with upstream commit hash and sha256 sums recorded in the
-`PROVENANCE.md` next to them), so every `path#Lnnn` citation below can be resolved offline.
+This analysis was performed on upstream commit `045720d`; per-file links and sha256 sums are in
+`re/reference/dglab-bluetooth-protocol/PROVENANCE.md` (the repository no longer vendors copies).
+Every `path#Lnnn` citation below is relative to that snapshot.
 No web search was used for the protocol facts themselves. Where a fact is not in the upstream files,
 it says so.
 
